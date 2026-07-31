@@ -6,6 +6,9 @@ requires-python = "==3.12.*"
 dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
+    # Core, not optional: sentinel_ai.adapters.serialization.event_codec imports
+    # it to validate every outbound event against contracts/events/.
+    "jsonschema>=4.23",
 ]
 
 [project.optional-dependencies]
@@ -16,7 +19,6 @@ runtime = [
     "numpy>=1.26,<2.2",
     "aio-pika>=9.4",
     "minio>=7.2",
-    "jsonschema>=4.23",
 ]
 gpu = [
     "torch>=2.5",
