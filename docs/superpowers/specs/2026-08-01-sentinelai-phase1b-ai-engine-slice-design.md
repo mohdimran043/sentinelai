@@ -122,6 +122,7 @@ class EncodedPacket:
     data: bytes
     pts: float          # seconds, monotonic, same clock as FrameData.timestamp
     is_keyframe: bool
+    codec: str          # "h264", "hevc" — a plain str, so no codec library enters ports
 
 
 class ClipWriter(ABC):
@@ -144,9 +145,11 @@ Peak memory becomes the pre-roll buffer plus one packet. `abort()` exists becaus
 shutdown mid-clip must not leak a temp file or a half-written MinIO object.
 
 **Fallback.** Remuxing requires an MP4-compatible codec. H.264 and H.265 cover RTSP cameras
-and everything mediamtx emits, so this holds for every source in scope. If a source ever
-supplies something else, the adapter re-encodes from decoded frames — slower and lossy, but
-the port signature does not change, because `EncodedPacket` is what the writer consumes
+and everything mediamtx emits, so this holds for every source in scope. The writer dispatches
+on `EncodedPacket.codec` and raises on a codec it cannot remux, rather than silently emitting
+an empty clip — a clip writer that fails quietly is worse than one that fails. If a source
+ever supplies something else, the adapter re-encodes from decoded frames — slower and lossy,
+but the port signature does not change, because `EncodedPacket` is what the writer consumes
 either way.
 
 ### 4.2 `FrameSource` also emits packets
@@ -293,8 +296,11 @@ FastAPI, thin, delegating to `orchestrator/service.py`:
 |---|---|
 | `GET /health` | Liveness plus per-model lifecycle state |
 | `GET /cameras` | Configured cameras and their status |
-| `GET /cameras/{id}/telemetry` | FPS, dropped frames, VRAM, last escalation |
+| `GET /cameras/{id}/telemetry` | FPS, dropped frames, discontinuities, last escalation |
 | `POST /cameras/{id}/describe` | `USER_REQUESTED` — bypasses the governors via `force()` |
+
+VRAM is reported on `/health`, not on the per-camera telemetry endpoint: it is a property of a
+model, and one GPU serves every camera, so per-camera attribution would be a fiction.
 
 No WebSocket in this phase; the Go backend owns the WS hub in 1C.
 
