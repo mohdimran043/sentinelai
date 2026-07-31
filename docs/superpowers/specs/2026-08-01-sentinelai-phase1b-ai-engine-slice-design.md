@@ -48,9 +48,25 @@ Probed on the target machine rather than assumed:
 | torch | not installed | The `gpu` extra has never been pulled in — hence the spike in §7. |
 
 The spec's §4.3 VRAM table budgets ~7.6 GB of 8 GB. Phase 1A's CPU-decode deviation frees the
-~0.3 GB that table assigned to NVDEC surfaces, so the real figure is **~7.3 GB accounted of
-8.0 GB usable**, leaving ~0.9 GB unallocated *on top of* the 2.0 GB reserve already inside
-that 7.3. Workable, and the residency planner already handles eviction when it is not.
+~0.3 GB that table assigned to NVDEC surfaces, so the projected figure was **~7.3 GB accounted
+of 8.0 GB usable**, leaving ~0.9 GB unallocated *on top of* the 2.0 GB reserve already inside
+that 7.3.
+
+**Measured, after the Task 1 spike.** The VLM turned out cheaper than budgeted. bitsandbytes
+NF4 peaks at 3517 MiB total with the desktop session running — 694 MiB of that is the
+compositor, so the model itself costs ~2.8 GB against the 4.4 GB the table assigned it:
+
+| Component | Budgeted | Actual |
+|---|---|---|
+| Desktop compositor | not modelled | ~0.7 GB |
+| YOLO11s | ~0.9 GB | not yet measured (Task 11) |
+| Qwen2.5-VL-3B | ~4.4 GB (AWQ) | **~2.8 GB (NF4)** |
+| Reserved headroom | ~2.0 GB | ~2.0 GB |
+
+Roughly 1.6 GB better off than planned, which absorbs the compositor overhead the original
+table never accounted for and still leaves the residency planner room to keep both models
+resident. The planner's behaviour is unchanged — it reads these numbers from
+`Capabilities.vram_mib`, so the improvement arrives as data, not code.
 
 One caveat the table does not capture: on a laptop, the desktop compositor holds VRAM too.
 The spike in §7 must measure free VRAM under the actual desktop session, not on an idle GPU.
@@ -321,6 +337,19 @@ failure.**
 
 ## 7. The autoawq risk and its fallback
 
+> **RESOLVED 2026-08-01 by the Task 1 spike — Branch B.** AutoAWQ installed and its model
+> loaded into VRAM, but inference failed inside autoawq's own bundled Triton GEMM kernel
+> against Triton 3.7.1, surviving three cheap fixes (transformers 4.49.0, transformers 4.51.3,
+> explicit `torch_dtype=float16`). Task 13 therefore loads the **unquantised**
+> `Qwen/Qwen2.5-VL-3B-Instruct` checkpoint with `BitsAndBytesConfig(load_in_4bit=True,
+> bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=float16)`. Measured with the desktop
+> session running: 694 MiB baseline → 3359 MiB loaded → **3517 MiB peak during inference**.
+> That is ~2.8 GB for the VLM against the 4.4 GB this design budgeted — see §2.1. Full record:
+> `docs/superpowers/plans/phase1b-spike-result.md`.
+>
+> The section below is retained as written because it is why the spike existed and why the
+> outcome cost a config change rather than a redesign.
+
 The spec mandates `transformers` + `autoawq`. AutoAWQ was deprecated by its maintainer in 2025
 and is fragile against torch ≥ 2.5 / transformers ≥ 4.49 — the versions pinned in
 `pyproject.toml`. `torch` is not currently installed on the target machine, so this is unproven.
@@ -382,7 +411,7 @@ being debugged simultaneously with everything else.
 
 | # | Task | GPU |
 |---|---|---|
-| 1 | autoawq spike — decide the VLM loading path | yes |
+| 1 | ~~autoawq spike~~ — **done**, resolved to bitsandbytes NF4 | yes |
 | 2 | Compose core services + mediamtx config | no |
 | 3 | `ClipWriter` port change + fake update | no |
 | 4 | `FileSource` + `PreRollBuffer` + synthetic clip | no |
@@ -403,9 +432,9 @@ Tasks 1–10 are CI-green on CPU. Tasks 11–14 are where the GPU and the real w
 
 | Risk | Mitigation |
 |---|---|
-| autoawq will not install | §7 fallback; spike runs first so it is discovered in minutes, not mid-plan |
+| ~~autoawq will not install~~ | **Materialised.** The spike caught it before any adapter code existed; cost was a `pyproject.toml` line, not a redesign. Retired as a risk. |
 | 15 GB RAM with ~7 GB free | Encoded pre-roll and streaming clip encode keep peak RAM low; compose services can run selectively |
-| VRAM margin is ~0.7 GB | Residency planner already evicts; the 600 s idle-unload reclaims 4.4 GB between events |
+| VRAM margin | Measured better than budgeted: the VLM costs ~2.8 GB, not 4.4 GB (§2.1). The 600 s idle-unload reclaims it between events, and the planner evicts if a future model tightens things again. |
 | Qwen latency exceeds the escalation rate | Bounded queue with counted drops; the cooldown widens the gap between calls |
 | Pre-roll quantised to GOP boundary | Documented; errs toward more context, never less |
 | RTSP timing bugs surface late (task 14) | `FileSource` shares the `PreRollBuffer` and decode path, so only reconnect logic is genuinely new |
