@@ -28,9 +28,11 @@ From the Phase 0+1 design and Phase 1A, unchanged and binding:
   outer-layer imports. Phase 1B must not weaken it.
 - Development Mode is the default. The in-process transport binds by default; gRPC is
   Production Mode and is **not** built in this phase.
-- Default VLM is `Qwen/Qwen2.5-VL-3B-Instruct-AWQ`. The 7B model is never a default.
+- Default VLM is Qwen2.5-VL-**3B**. The 7B model is never a default. The checkpoint is the
+  unquantised `Qwen/Qwen2.5-VL-3B-Instruct` loaded 4-bit NF4, not the `-AWQ` build — see §7.
 - VRAM ceiling 8192 MiB, reserved headroom 2048 MiB.
-- Every GPU-requiring test is marked `@pytest.mark.gpu`; CI runs `-m "not gpu"`.
+- Every GPU-requiring test is marked `@pytest.mark.gpu` and every docker-dependent test
+  `@pytest.mark.integration`; CI runs `-m "not gpu and not integration"`.
 - Events carry no model identity.
 - Clip pre-roll is 3.0 s.
 - All domain timestamps are float seconds from a monotonic clock, passed in explicitly.
@@ -45,7 +47,7 @@ Probed on the target machine rather than assumed:
 | CPU | 20 cores | Ample for PyAV CPU decode; vindicates the Phase 1A deviation away from NVDEC. |
 | System RAM | 15 GB total, **~7 GB free** | The binding constraint. Drives the clip-writer design in §5.5. |
 | Docker | 29.1.3 / Compose 2.40.3 | Present. |
-| torch | not installed | The `gpu` extra has never been pulled in — hence the spike in §7. |
+| torch | installed by the Task 1 spike | 2.13 with Triton 3.7.1 — the combination autoawq could not work against. |
 
 The spec's §4.3 VRAM table budgets ~7.6 GB of 8 GB. Phase 1A's CPU-decode deviation frees the
 ~0.3 GB that table assigned to NVDEC surfaces, so the projected figure was **~7.3 GB accounted
@@ -68,8 +70,6 @@ table never accounted for and still leaves the residency planner room to keep bo
 resident. The planner's behaviour is unchanged — it reads these numbers from
 `Capabilities.vram_mib`, so the improvement arrives as data, not code.
 
-One caveat the table does not capture: on a laptop, the desktop compositor holds VRAM too.
-The spike in §7 must measure free VRAM under the actual desktop session, not on an idle GPU.
 
 ## 3. Scope
 
@@ -82,7 +82,7 @@ The spike in §7 must measure free VRAM under the actual desktop session, not on
 | Pipeline | Per-camera async runner, stages 1–5 |
 | Detectors | YOLO11s via Ultralytics |
 | Trackers | ByteTrack via supervision |
-| Vision | Qwen2.5-VL-3B-AWQ (with a fallback path, §7) |
+| Vision | Qwen2.5-VL-3B, 4-bit NF4 (§7 — the AWQ path was tried and rejected) |
 | Orchestrator | Registry, resident set, scheduler, global admission gate, service |
 | Publishers | `inmemory.py`, disk-buffered `rabbitmq.py` |
 | Storage | MinIO clip writer |
