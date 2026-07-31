@@ -79,7 +79,9 @@ def test_model_runtime_exposes_the_seven_spec_section_10_methods() -> None:
         "version",
         "capabilities",
     }
-    assert required <= set(ModelRuntime.__abstractmethods__)
+    # Equality, not a subset: an eighth abstract method added to the §10
+    # interface must be a deliberate, visible change to this test.
+    assert required == set(ModelRuntime.__abstractmethods__)
 
 
 def test_lifecycle_states_cover_all_eight_from_spec_section_5() -> None:
@@ -190,10 +192,27 @@ class TestFakeTracker:
         assert far[0].track_id != first[0].track_id
 
     def test_reset_clears_all_state(self) -> None:
-        tracker = FakeTracker()
-        tracker.update((Detection("person", 0.9, BOX),), timestamp=0.0)
+        """Re-sight the object after the reset — an empty update proves nothing.
+
+        `tracker.update((), ...) == ()` holds for any implementation, including
+        one whose `reset` does nothing at all, because an empty detection tuple
+        always yields an empty result.
+        """
+        tracker = FakeTracker(match_radius_px=10.0)
+        near = Detection("person", 0.9, BOX)
+        far = Detection("person", 0.9, BBox(500.0, 500.0, 510.0, 510.0))
+
+        tracker.update((near,), timestamp=0.0)
+        before = tracker.update((near, far), timestamp=0.1)
+        far_id = before[1].track_id
+        assert far_id != 1, "the id counter has advanced past its starting value"
+
         tracker.reset()
-        assert tracker.update((), timestamp=1.0) == ()
+        after = tracker.update((far,), timestamp=1.0)
+
+        assert after[0].track_id != far_id, "the association must be forgotten"
+        assert after[0].track_id == 1, "the id counter must be rewound"
+        assert after[0].age_frames == 1, "a re-sighted object is new, not aged"
 
 
 class TestFakeSource:

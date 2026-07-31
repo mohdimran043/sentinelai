@@ -18,6 +18,17 @@ def running_track(track_id: int = 1) -> Track:
     )
 
 
+def standing_track(track_id: int = 1, cx: float = 100.0, cy: float = 100.0) -> Track:
+    """Old enough to be salient, slow enough not to trip speed_anomaly."""
+    return Track(
+        track_id=track_id,
+        label="person",
+        box=BBox(cx - 10.0, cy - 10.0, cx + 10.0, cy + 10.0),
+        age_frames=20,
+        speed_px_s=0.0,
+    )
+
+
 def scene(
     *,
     timestamp: float,
@@ -207,6 +218,111 @@ class TestSceneDeltaStreak:
         assert changed.state.scene_delta_streak == 1
         settled = decide(scene(timestamp=2.0, signature=(0.0, 1.0)), PROFILE, changed.state)
         assert settled.state.scene_delta_streak == 0
+
+
+class TestEveryReasonIsReachableThroughTheGate:
+    """The composition, not the predicates.
+
+    `test_triggers.py` proves each predicate in isolation. What only a
+    gate-level test can prove is that `decide` threads `dwell_anchors` and
+    `scene_delta_streak` out of `GateState` and into `TriggerContext` correctly
+    across frames — so every reason is actually reachable end to end.
+
+    Every frame here is spaced clear of the post-call cooldown, and every scene
+    that is expected to escalate carries a signature dedup cannot match against
+    the last escalated one. Otherwise these tests would pass for the wrong
+    reason: a suppressed decision still reports its trigger.
+    """
+
+    CHANGED_SIGNATURE = (0.0, 1.0)
+
+    def test_an_aged_salient_track_escalates_as_new_salient_track(self) -> None:
+        outcome = decide(
+            scene(
+                timestamp=10.0,
+                tracks=(standing_track(),),
+                signature=self.CHANGED_SIGNATURE,
+            ),
+            PROFILE,
+            settled_state(),
+        )
+        assert outcome.decision.should_escalate is True
+        assert outcome.decision.reason is EscalationReason.NEW_SALIENT_TRACK
+
+    def test_a_crowd_escalates_as_track_count_spike(self) -> None:
+        crowd = tuple(
+            standing_track(track_id=index, cx=200.0 * index, cy=200.0 * index)
+            for index in range(1, PROFILE.track_count_baseline + 2)
+        )
+        assert len(crowd) > PROFILE.track_count_baseline
+
+        outcome = decide(
+            scene(timestamp=10.0, tracks=crowd, signature=self.CHANGED_SIGNATURE),
+            PROFILE,
+            settled_state(),
+        )
+        assert outcome.decision.should_escalate is True
+        assert outcome.decision.reason is EscalationReason.TRACK_COUNT_SPIKE
+
+    def test_sustained_signature_change_escalates_as_scene_change(self) -> None:
+        """The streak must survive the round trip through GateState.
+
+        The gate fires on the frame whose incoming streak reaches
+        `scene_delta_frames - 1`, i.e. the fifth consecutive changing frame.
+        Signatures alternate, so that frame must be one whose signature differs
+        from the last escalated one — otherwise dedup suppresses it.
+        """
+        state = settled_state()
+        reasons = []
+        for index in range(5):
+            outcome = decide(
+                scene(timestamp=2.0 * (index + 1), tracks=(), signature=alternating(index + 1)),
+                PROFILE,
+                state,
+            )
+            state = outcome.state
+            reasons.append(outcome.decision.reason)
+
+        assert reasons[:4] == [None, None, None, None], "four frames is not yet sustained"
+        assert outcome.decision.should_escalate is True
+        assert outcome.decision.reason is EscalationReason.SCENE_CHANGE
+        assert state.scene_delta_streak == 5
+
+    def test_a_stationary_track_escalates_as_dwell_exceeded(self) -> None:
+        """Anchors come from the previous frame while the current one advances them.
+
+        During the wait the signature is held constant and equal to the one
+        already escalated, so dedup suppresses the NEW_SALIENT_TRACK that fires
+        every frame and the budget survives intact. The final frame changes the
+        signature so the dwell escalation is actually observable.
+        """
+        state = settled_state()
+        parked = standing_track()
+        for second in range(1, int(PROFILE.dwell_seconds) + 1):
+            outcome = decide(
+                scene(timestamp=float(second), tracks=(parked,), signature=QUIET_SIGNATURE),
+                PROFILE,
+                state,
+            )
+            assert outcome.decision.reason is not EscalationReason.DWELL_EXCEEDED, (
+                f"dwell must not fire {second}s in — the window is "
+                f"{PROFILE.dwell_seconds}s from the anchor"
+            )
+            state = outcome.state
+
+        # The anchor was laid on the first frame of the walk (t=1.0), so the
+        # window closes at t = 1.0 + dwell_seconds.
+        outcome = decide(
+            scene(
+                timestamp=1.0 + PROFILE.dwell_seconds,
+                tracks=(parked,),
+                signature=self.CHANGED_SIGNATURE,
+            ),
+            PROFILE,
+            state,
+        )
+        assert outcome.decision.should_escalate is True
+        assert outcome.decision.reason is EscalationReason.DWELL_EXCEEDED
 
 
 class TestSignatureLengthChange:
