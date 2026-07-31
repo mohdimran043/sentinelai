@@ -438,6 +438,7 @@ was decided, not overlooked.
 | R5 | Task 14's `RtspSource` signals reconnect by resetting `frame_index`, assuming the runner watches for the regression — written before Task 6 existed | **Task 6 implements exactly that**, plus a second trigger (scene-signature length change). Both reset tracker, motion, pre-roll and `GateState`. The contract is now stated explicitly in Task 6 and both signals are tested. |
 | R6 | `supervision` sat in the `gpu` extra, but ByteTrack is numpy/scipy with no torch dependency — Task 12's "runs in CI" claim was false | **Moved to the `runtime` extra**, pinned `>=0.24,<0.28`: `sv.ByteTrack` is deprecated from 0.28 and its `DeprecationWarning` would break the suite's `-W error` requirement. Migrating to the `trackers` package is Phase 2. |
 | R7 | Tasks 1, 3, 11 and 12 all edit `pyproject.toml` | Their edits touch disjoint regions — Task 1 the `gpu` extra, Task 3 `[project]` settings, Task 11 the mypy overrides, Task 12 the `runtime` extra. Each task's Files block names `pyproject.toml` so the conflict is visible to whoever executes them out of order. |
+| R8 | S7–S9 (`EscalationRequest`, `AdmissionGate`, `VlmScheduler`) were attributed to Task 7, but Task 6's runner takes a `VlmScheduler` in its constructor — and every task's verify step re-runs the whole suite, so Task 6 could not reach a green commit against a type that did not exist | **S7–S9 are implemented in Task 6**; Task 7 consumes them and adds `ModelRegistry`, `ResidentSet` and `EngineService`. The interfaces are unchanged — only which task creates the file moved. An earlier draft tried a stub instead and produced a Task 6 that imported a `VlmScheduler` its own stub never defined. |
 
 ### Open deviation requiring sign-off
 
@@ -2866,310 +2867,178 @@ touches; `domain/` and `ports/` stay numpy-free, enforced by `tests/test_archite
 
 ---
 
-### Task 6: `CameraRunner` — the pipeline, end-to-end with fakes
+### Task 6: `CameraRunner` — end-to-end with fakes
+
+Implements S11. Also implements S7 (`EscalationRequest`), S8 (`AdmissionGate`) and S9
+(`VlmScheduler`, including the full S14 event-assembly worker) — see Reconciliation Log R8 for why those three land here instead of Task 7: `CameraRunner`'s
+constructor takes a `scheduler: VlmScheduler` (S11) and its keystone test is a full
+`source → gate → scheduler → publisher` trace, so a working scheduler must exist first. Task 7
+consumes `VlmScheduler`/`AdmissionGate`/`EscalationRequest` from this task unchanged and adds
+`registry.py`, `resident_set.py`, `service.py`, plus the S14 error-path tests.
 
 **Files:**
-- Create: `ai-engine/sentinel_ai/pipeline/__init__.py`
-- Create: `ai-engine/sentinel_ai/pipeline/runner.py`
+- Modify: `ai-engine/tests/fakes/io.py` — `FakeSource` gains a synthetic `packets()` stream
+  (S2/S3); `FakeClipWriter`/`FakeClipHandle` replace the old `write()` shape with S4's
+  open/append/finish/abort.
+- Create: `ai-engine/sentinel_ai/orchestrator/__init__.py`
+- Create: `ai-engine/sentinel_ai/orchestrator/admission.py` — `AdmissionGate` (S8).
+- Create: `ai-engine/sentinel_ai/orchestrator/scheduler.py` — `EscalationRequest` (S7),
+  `VlmScheduler` (S9), the S14 worker.
+- Create: `ai-engine/sentinel_ai/pipeline/runner.py` — `CameraTelemetry`, `CameraRunner` (S11).
+  (`sentinel_ai/pipeline/__init__.py` and `pipeline/stages/motion.py` already exist from Task 5.)
+- Create: `ai-engine/tests/orchestrator/__init__.py`
+- Test: `ai-engine/tests/orchestrator/test_admission.py`
+- Test: `ai-engine/tests/orchestrator/test_scheduler.py`
 - Create: `ai-engine/tests/pipeline/__init__.py`
 - Test: `ai-engine/tests/pipeline/test_runner.py`
 
 **Interfaces:**
-- Consumes: `FrameSource` / `EncodedPacket` / `FrameData` (Task 3); `PreRollBuffer` (Task 4); `MotionAnalyzer`, `MotionSignals` (Task 5); `VlmScheduler.submit`, `EscalationRequest` (Task 7 — see the forward-reference note below); `ObjectDetector`, `Tracker`, `ClipWriter`, `ClipHandle` (ports); `decide`, `force`, `GateState`, `GateOutcome` (`sentinel_ai.domain.policy.escalation`); `SceneState`, `EscalationReason` (`sentinel_ai.domain.entities`); `CameraProfile`
-- Produces: `CameraTelemetry`, `StreamDiscontinuity`, `CameraRunner` (exact shapes in S11 and below)
+- Consumes: `EncodedPacket`/`FrameSource`/`FrameData` (S2/S3), `ClipWriter`/`ClipHandle` (S4),
+  `PreRollBuffer` (S5), `MotionSignals`/`MotionAnalyzer` (S6), `GateState`/`GateOutcome`/
+  `decide`/`force` (`sentinel_ai.domain.policy.escalation`), `CameraProfile`, `SceneState`,
+  `Event`, `EscalationReason`, `ThreatScore` (`sentinel_ai.domain.entities`),
+  `VisionLanguageModel`/`VisionRequest` (`sentinel_ai.ports.vision_llm`), `EventPublisher`.
+- Produces: `EscalationRequest` (S7), `AdmissionGate` (S8), `VlmScheduler` (S9),
+  `CameraTelemetry`/`CameraRunner` (S11) — all used verbatim by Task 7 and later by
+  `orchestrator/service.py`.
 
-**Forward reference to Task 7.** This task imports `EscalationRequest` and `VlmScheduler` from
-`sentinel_ai.orchestrator.scheduler`, which Task 7 creates. Implement this task by writing that
-module's two names first as the minimal stubs shown in Step 3b — Task 7 then replaces the stub
-bodies with the real implementation. This keeps each task independently committable and
-testable, which is the point of the ordering. Do not reorder the tasks to avoid the stub: the
-runner is the thing worth getting right first, and a stub scheduler is the cheapest way to test
-it in isolation.
+- [ ] **Step 1: Extend the fakes for packets and clip handles**
 
-**The discontinuity contract.** A source can hand the runner a stream that is no longer
-continuous with what came before — an RTSP reconnect (Task 14), or a resolution renegotiation
-that changes the scene-signature length. Everything derived from frame-to-frame history is then
-invalid: the tracker's IDs, the motion analyzer's previous frame, the gate's dwell anchors and
-delta streak, and the pre-roll buffer's packets. The runner detects two independent signals and
-treats them identically:
-
-1. **`frame_index` regression** — a source restarting its own counter. Task 14's `RtspSource`
-   signals reconnect exactly this way.
-2. **Scene-signature length change** — a resolution change mid-stream.
-
-The Phase 1A whole-branch review found that signal 2 used to crash `decide()`. The domain now
-returns a `0.0` delta instead of raising, but resetting the derived state is the caller's job,
-and this is the caller. Both signals must be tested.
-
-- [ ] **Step 1: Write the failing test**
+`FakeSource` needs a packet stream so the pre-roll/clip path is testable without real media;
+`FakeClipWriter` needs to satisfy S4's handle shape instead of the old single-shot `write()`.
 
 ```python
-# ai-engine/tests/pipeline/test_runner.py
-"""Tests for CameraRunner (Task 6) — the whole slice, on CPU, with no GPU and no sleeping."""
+# ai-engine/tests/fakes/io.py
+"""I/O fakes: frame sources, publishers, clip writers."""
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
 
-import pytest
-
-from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import BBox, Detection, EscalationReason
-from sentinel_ai.pipeline.runner import CameraRunner, CameraTelemetry
-from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
-from sentinel_ai.adapters.sources.preroll import PreRollBuffer
-from tests.fakes.io import FakeClipWriter, FakeSource
-from tests.fakes.models import FakeDetector, FakeTracker
-
-BOX = BBox(0.0, 0.0, 20.0, 20.0)
-PERSON = (Detection("person", 0.95, BOX),)
+from sentinel_ai.domain.entities import Event
+from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
+from sentinel_ai.ports.event_publisher import EventPublisher
+from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 
 
-class StubScheduler:
-    """Stands in for Task 7's VlmScheduler: records submissions, can refuse."""
+class FakeSource(FrameSource):
+    def __init__(
+        self,
+        frames: Sequence[FrameData],
+        packets: Sequence[EncodedPacket] = (),
+    ) -> None:
+        self._frames = list(frames)
+        self._packets = list(packets)
+        self.closed = False
 
-    def __init__(self, *, accept: bool = True) -> None:
-        self.accept = accept
-        self.submitted: list[object] = []
+    @staticmethod
+    def make_frame(camera_id: str, frame_index: int, timestamp: float, value: int = 0) -> FrameData:
+        return FrameData(
+            camera_id=camera_id,
+            frame_index=frame_index,
+            timestamp=timestamp,
+            width=4,
+            height=4,
+            pixels=[[value] * 4 for _ in range(4)],
+        )
 
-    def submit(self, request: object) -> bool:
-        if not self.accept:
-            return False
-        self.submitted.append(request)
-        return True
+    @staticmethod
+    def make_packet(
+        camera_id: str, pts: float, is_keyframe: bool = False, data: bytes = b"\x00"
+    ) -> EncodedPacket:
+        return EncodedPacket(
+            camera_id=camera_id, data=data, pts=pts, is_keyframe=is_keyframe, codec="h264"
+        )
 
+    @classmethod
+    def constant(cls, camera_id: str, count: int, fps: float = 10.0, value: int = 0) -> FakeSource:
+        return cls([cls.make_frame(camera_id, index, index / fps, value) for index in range(count)])
 
-class ManualClock:
-    def __init__(self) -> None:
-        self.now = 0.0
+    @classmethod
+    def with_packets(
+        cls,
+        camera_id: str,
+        count: int,
+        fps: float = 10.0,
+        keyframe_every: int = 5,
+        value: int = 0,
+    ) -> FakeSource:
+        """A source whose packet stream mirrors its frames one-for-one.
 
-    def __call__(self) -> float:
-        return self.now
-
-
-def build_runner(
-    *,
-    source: FakeSource,
-    scheduler: StubScheduler,
-    clock: ManualClock,
-    detector: FakeDetector | None = None,
-    clip_writer: FakeClipWriter | None = None,
-    detect_every_n_frames: int = 1,
-) -> CameraRunner:
-    return CameraRunner(
-        camera_id="cam-1",
-        camera_label="Front Door",
-        source=source,
-        detector=detector or FakeDetector(script=[PERSON]),
-        tracker=FakeTracker(),
-        motion=MotionAnalyzer(),
-        profile=CameraProfile(camera_id="cam-1"),
-        scheduler=scheduler,  # type: ignore[arg-type]
-        clip_writer=clip_writer,
-        preroll=PreRollBuffer(preroll_seconds=3.0),
-        clock=clock,
-        detect_every_n_frames=detect_every_n_frames,
-    )
-
-
-class TestEndToEnd:
-    async def test_a_salient_track_reaches_the_scheduler(self) -> None:
-        """The keystone test of Phase 1B: source -> detect -> track -> motion -> gate
-        -> scheduler, entirely on CPU, with no GPU, no broker and no sleeping.
+        Every `keyframe_every`-th packet is a keyframe, matching a realistic GOP so
+        `PreRollBuffer.flush()` (which walks back to a keyframe boundary) has one to find.
         """
-        clock = ManualClock()
-        scheduler = StubScheduler()
-        # 12 frames at 10 fps: past min_track_frames=8, so NewSalientTrack fires.
-        source = FakeSource.constant("cam-1", count=12, fps=10.0)
-        runner = build_runner(source=source, scheduler=scheduler, clock=clock)
+        frames = [cls.make_frame(camera_id, index, index / fps, value) for index in range(count)]
+        packets = [
+            cls.make_packet(camera_id, index / fps, is_keyframe=(index % keyframe_every == 0))
+            for index in range(count)
+        ]
+        return cls(frames, packets)
 
-        await runner.run()
+    def __aiter__(self) -> AsyncIterator[FrameData]:
+        """Sync, matching the port and the async-iterator protocol.
 
-        assert scheduler.submitted, "no escalation reached the scheduler"
-        request = scheduler.submitted[0]
-        assert request.camera_id == "cam-1"  # type: ignore[attr-defined]
-        assert isinstance(request.event_id, UUID)  # type: ignore[attr-defined]
-        assert request.reason in set(EscalationReason)  # type: ignore[attr-defined]
+        `async for` calls `__aiter__()` without awaiting it, so the method must
+        return the iterator directly. Writing it as `async def` happened to work
+        only because an `async def` containing `yield` is an async *generator*
+        function — remove the yield and it breaks. The port's shape is the
+        correct one, so the fake follows it.
+        """
 
-    async def test_telemetry_counts_what_actually_happened(self) -> None:
-        clock = ManualClock()
-        source = FakeSource.constant("cam-1", count=12, fps=10.0)
-        runner = build_runner(source=source, scheduler=StubScheduler(), clock=clock)
+        async def frames() -> AsyncIterator[FrameData]:
+            for frame in self._frames:
+                yield frame
 
-        await runner.run()
-        telemetry = runner.telemetry()
+        return frames()
 
-        assert isinstance(telemetry, CameraTelemetry)
-        assert telemetry.frames_seen == 12
-        assert telemetry.detections_run == 12
-        assert telemetry.escalations >= 1
-        assert telemetry.last_frame_at is not None
+    def packets(self) -> AsyncIterator[EncodedPacket]:
+        async def stream() -> AsyncIterator[EncodedPacket]:
+            for packet in self._packets:
+                yield packet
 
-    async def test_detect_every_n_frames_skips_detection_without_skipping_frames(self) -> None:
-        clock = ManualClock()
-        source = FakeSource.constant("cam-1", count=10, fps=10.0)
-        runner = build_runner(
-            source=source, scheduler=StubScheduler(), clock=clock, detect_every_n_frames=5
-        )
+        return stream()
 
-        await runner.run()
-        telemetry = runner.telemetry()
-
-        assert telemetry.frames_seen == 10
-        assert telemetry.detections_run == 2, "detection should run on frames 0 and 5 only"
+    async def close(self) -> None:
+        self.closed = True
 
 
-class TestSchedulerBackpressure:
-    async def test_a_refused_submission_is_counted_and_does_not_raise(self) -> None:
-        """A full VLM queue must degrade to metadata-only, never crash the camera."""
-        clock = ManualClock()
-        scheduler = StubScheduler(accept=False)
-        source = FakeSource.constant("cam-1", count=12, fps=10.0)
-        runner = build_runner(source=source, scheduler=scheduler, clock=clock)
+class FakePublisher(EventPublisher):
+    def __init__(self, error: Exception | None = None) -> None:
+        self.events: list[Event] = []
+        self.closed = False
+        self._error = error
 
-        await runner.run()
-        telemetry = runner.telemetry()
+    async def publish(self, event: Event) -> None:
+        if self._error is not None:
+            raise self._error
+        self.events.append(event)
 
-        assert scheduler.submitted == []
-        assert telemetry.escalations_dropped >= 1
-        assert telemetry.escalations == 0
-
-
-class TestDiscontinuity:
-    async def test_a_frame_index_regression_resets_derived_state(self) -> None:
-        """An RTSP reconnect restarts frame_index; tracker ids must not carry over."""
-        clock = ManualClock()
-        frames = [
-            FakeSource.make_frame("cam-1", index, index / 10.0) for index in range(6)
-        ] + [FakeSource.make_frame("cam-1", index, 0.6 + index / 10.0) for index in range(6)]
-        runner = build_runner(
-            source=FakeSource(frames), scheduler=StubScheduler(), clock=clock
-        )
-
-        await runner.run()
-
-        assert runner.telemetry().discontinuities == 1
-
-    async def test_a_signature_length_change_does_not_crash_the_pipeline(self) -> None:
-        """Phase 1A review B1: this used to raise ValueError out of decide()."""
-        clock = ManualClock()
-        source = FakeSource.constant("cam-1", count=6, fps=10.0)
-        runner = build_runner(source=source, scheduler=StubScheduler(), clock=clock)
-        # Swap the analyzer mid-run for one with a different bin count by resetting
-        # the runner's recorded signature length to something incompatible.
-        runner._last_signature_length = 99  # noqa: SLF001
-
-        await runner.run()  # must not raise
-
-        assert runner.telemetry().discontinuities >= 1
+    async def close(self) -> None:
+        self.closed = True
 
 
-class TestClipLifecycle:
-    async def test_an_escalation_opens_a_clip_and_flushes_the_preroll(self) -> None:
-        clock = ManualClock()
-        scheduler = StubScheduler()
-        writer = FakeClipWriter()
-        source = FakeSource.constant("cam-1", count=12, fps=10.0)
-        runner = build_runner(
-            source=source, scheduler=scheduler, clock=clock, clip_writer=writer
-        )
-
-        await runner.run()
-
-        assert writer.handles, "no clip was opened"
-        handle = writer.handles[0]
-        assert handle.appended, "pre-roll was not flushed into the clip"
-        assert scheduler.submitted[0].clip is handle  # type: ignore[attr-defined]
-
-    async def test_a_second_escalation_extends_the_open_clip(self) -> None:
-        """Overlapping clips would double-write the same seconds to MinIO."""
-        clock = ManualClock()
-        scheduler = StubScheduler()
-        writer = FakeClipWriter()
-        source = FakeSource.constant("cam-1", count=40, fps=10.0)
-        runner = build_runner(
-            source=source, scheduler=scheduler, clock=clock, clip_writer=writer
-        )
-
-        await runner.run()
-
-        assert len(writer.handles) == 1, "a second overlapping clip was opened"
-
-    async def test_escalations_carry_no_clip_when_no_writer_is_configured(self) -> None:
-        clock = ManualClock()
-        scheduler = StubScheduler()
-        source = FakeSource.constant("cam-1", count=12, fps=10.0)
-        runner = build_runner(
-            source=source, scheduler=scheduler, clock=clock, clip_writer=None
-        )
-
-        await runner.run()
-
-        assert scheduler.submitted[0].clip is None  # type: ignore[attr-defined]
-
-
-class TestDescribeNow:
-    async def test_it_bypasses_the_governors_and_returns_an_event_id(self) -> None:
-        clock = ManualClock()
-        scheduler = StubScheduler()
-        source = FakeSource.constant("cam-1", count=2, fps=10.0)
-        runner = build_runner(source=source, scheduler=scheduler, clock=clock)
-        await runner.run()
-        before = len(scheduler.submitted)
-
-        event_id = await runner.describe_now()
-
-        assert isinstance(event_id, UUID)
-        assert len(scheduler.submitted) == before + 1
-        assert (
-            scheduler.submitted[-1].reason is EscalationReason.USER_REQUESTED  # type: ignore[attr-defined]
-        )
-
-
-class TestShutdown:
-    async def test_cancelling_the_run_closes_the_source_and_aborts_a_partial_clip(self) -> None:
-        clock = ManualClock()
-        writer = FakeClipWriter()
-        source = FakeSource.constant("cam-1", count=10_000, fps=10.0)
-        runner = build_runner(
-            source=source, scheduler=StubScheduler(), clock=clock, clip_writer=writer
-        )
-
-        task = asyncio.create_task(runner.run())
-        await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-        assert source.closed is True
-        assert all(h.finished or h.aborted for h in writer.handles)
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/pipeline/test_runner.py -v`
-Expected: FAIL at collection — `ModuleNotFoundError: No module named 'sentinel_ai.pipeline.runner'`.
-
-- [ ] **Step 3a: Extend `FakeClipWriter` so clip assertions are possible**
-
-`FakeClipWriter` from Task 3 returns a handle but records nothing useful for these tests.
-Replace it in `ai-engine/tests/fakes/io.py`:
-
-```python
 class FakeClipHandle(ClipHandle):
-    def __init__(self, camera_id: str, event_id: UUID, fps: float) -> None:
+    def __init__(
+        self,
+        camera_id: str,
+        event_id: UUID,
+        *,
+        finish_error: Exception | None = None,
+    ) -> None:
         self.camera_id = camera_id
         self.event_id = event_id
-        self.fps = fps
         self.appended: list[EncodedPacket] = []
         self.finished = False
         self.aborted = False
+        self._finish_error = finish_error
 
     async def append(self, packet: EncodedPacket) -> None:
         self.appended.append(packet)
 
     async def finish(self) -> str:
+        if self._finish_error is not None:
+            raise self._finish_error
         self.finished = True
         return f"s3://sentinel-clips/{self.camera_id}/{self.event_id}.mp4"
 
@@ -3178,41 +3047,375 @@ class FakeClipHandle(ClipHandle):
 
 
 class FakeClipWriter(ClipWriter):
-    def __init__(self) -> None:
+    """Records every handle it opens so tests can inspect what was appended.
+
+    `finish_error`, when set, is attached to every handle opened afterwards —
+    enough to exercise the S14 "clip failure must not lose the event" path
+    (Task 7) without needing per-handle configuration.
+    """
+
+    def __init__(self, finish_error: Exception | None = None) -> None:
         self.handles: list[FakeClipHandle] = []
+        self._finish_error = finish_error
 
     async def open(self, camera_id: str, event_id: UUID, fps: float) -> ClipHandle:
-        handle = FakeClipHandle(camera_id, event_id, fps)
+        handle = FakeClipHandle(camera_id, event_id, finish_error=self._finish_error)
         self.handles.append(handle)
         return handle
 ```
 
-- [ ] **Step 3b: Create the minimal scheduler seam Task 7 will fill in**
+- [ ] **Step 2: Run the fake tests to confirm they still type-check and pass**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/fakes -q && mypy tests/fakes`
+Expected: PASS (no test file targets `tests/fakes` directly, so this simply proves the module
+imports and mypy accepts it before anything downstream depends on it).
+
+- [ ] **Step 3: Write the failing test for `AdmissionGate`**
+
+```python
+# ai-engine/tests/orchestrator/test_admission.py
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from sentinel_ai.orchestrator import admission as admission_module
+from sentinel_ai.orchestrator.admission import AdmissionGate
+
+
+def test_construction_rejects_bad_arguments() -> None:
+    with pytest.raises(ValueError, match="concurrency"):
+        AdmissionGate(concurrency=0, min_interval_seconds=0.0)
+    with pytest.raises(ValueError, match="min_interval_seconds"):
+        AdmissionGate(concurrency=1, min_interval_seconds=-1.0)
+
+
+async def test_in_flight_tracks_acquire_and_release() -> None:
+    gate = AdmissionGate(concurrency=2, min_interval_seconds=0.0)
+    await gate.acquire(now=0.0)
+    assert gate.in_flight == 1
+    await gate.acquire(now=0.0)
+    assert gate.in_flight == 2
+    gate.release(now=0.0)
+    assert gate.in_flight == 1
+
+
+async def test_two_concurrent_acquires_are_serialised_at_concurrency_one() -> None:
+    """The keystone claim for S8: N per-camera governors cannot bound a global GPU,
+    so a single global slot must make a second caller wait for the first to finish."""
+    gate = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+    order: list[str] = []
+    release_first = asyncio.Event()
+
+    async def first() -> None:
+        await gate.acquire(now=0.0)
+        order.append("first-acquired")
+        await release_first.wait()
+        gate.release(now=0.0)
+        order.append("first-released")
+
+    async def second() -> None:
+        # Give `first` a tick to acquire before this one even tries — asyncio.sleep(0)
+        # only yields to the event loop once, it waits zero wall-clock time.
+        await asyncio.sleep(0)
+        assert gate.in_flight == 1, "first must already hold the only slot"
+        await gate.acquire(now=0.0)
+        order.append("second-acquired")
+
+    first_task = asyncio.create_task(first())
+    second_task = asyncio.create_task(second())
+    await asyncio.sleep(0)
+    assert not second_task.done(), "second must block on the semaphore, not run to completion"
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+    assert order == ["first-acquired", "first-released", "second-acquired"]
+
+
+async def test_min_interval_computes_the_correct_deficit_without_real_sleeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`asyncio.sleep` is replaced with a recorder: this proves the deficit math is
+    right (spec: "block until ... min_interval has elapsed") without CI ever waiting."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(admission_module, "_sleep", fake_sleep)
+    gate = AdmissionGate(concurrency=5, min_interval_seconds=2.0)
+
+    await gate.acquire(now=0.0)
+    gate.release(now=0.0)
+    await gate.acquire(now=0.5)  # only 0.5s later: 1.5s deficit against a 2.0s floor
+    assert slept == pytest.approx([1.5])
+
+
+async def test_ample_spacing_never_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(admission_module, "_sleep", fake_sleep)
+    gate = AdmissionGate(concurrency=5, min_interval_seconds=2.0)
+
+    await gate.acquire(now=0.0)
+    gate.release(now=0.0)
+    await gate.acquire(now=5.0)
+    assert slept == []
+```
+
+- [ ] **Step 4: Run it to verify it fails**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_admission.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator'`
+
+- [ ] **Step 5: Implement `AdmissionGate`**
 
 ```python
 # ai-engine/sentinel_ai/orchestrator/__init__.py
-"""Model lifecycle, VLM admission, and the engine entry point."""
+"""Model lifecycle, VLM admission and scheduling, and the engine entry point."""
 ```
 
 ```python
-# ai-engine/sentinel_ai/orchestrator/scheduler.py
-"""VLM work queue (spec §5.4). Task 7 implements the worker; Task 6 needs the
-request shape and the submit() seam to build against."""
+# ai-engine/sentinel_ai/orchestrator/admission.py
+"""Process-wide GPU admission gate (spec §5.4) — new in Phase 1B, not in the original layout.
+
+Phase 1A's governors — the token bucket, cooldown, dedup — are all per camera, but the
+GPU they protect is global. With one camera the two are equivalent, so this is not a
+bug today; with N cameras, N independently-permitting buckets could each legitimately
+allow a call and collectively saturate the GPU. Building this seam now, while it is
+trivially testable with a single camera, avoids retrofitting a global limiter into the
+hot path once a second camera exists.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from asyncio import sleep as _sleep
+
+
+class AdmissionGate:
+    def __init__(self, concurrency: int, min_interval_seconds: float) -> None:
+        if concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+        if min_interval_seconds < 0:
+            raise ValueError(f"min_interval_seconds must be >= 0, got {min_interval_seconds}")
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self._min_interval_seconds = min_interval_seconds
+        self._last_acquired_at: float | None = None
+        self._in_flight = 0
+
+    async def acquire(self, now: float) -> None:
+        """Block until a global slot is free AND min_interval has elapsed."""
+        await self._semaphore.acquire()
+        self._in_flight += 1
+        if self._last_acquired_at is not None:
+            deficit = self._min_interval_seconds - (now - self._last_acquired_at)
+            if deficit > 0:
+                await _sleep(deficit)
+        self._last_acquired_at = now
+
+    def release(self, now: float) -> None:
+        del now  # no release-side interval policy today; kept for symmetry with acquire
+        self._in_flight -= 1
+        self._semaphore.release()
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+```
+
+- [ ] **Step 6: Verify**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_admission.py -v`
+Expected: all PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add ai-engine/sentinel_ai/orchestrator/__init__.py ai-engine/sentinel_ai/orchestrator/admission.py ai-engine/tests/orchestrator/__init__.py ai-engine/tests/orchestrator/test_admission.py
+git commit -m "feat(orchestrator): add the process-wide VLM admission gate
+
+Per-camera governors cannot bound a shared GPU once a second camera exists;
+this seam is cheap to build and test now, with one camera, than to retrofit
+into the hot path later."
+```
+
+- [ ] **Step 8: Write the failing test for `EscalationRequest` + `VlmScheduler`**
+
+Covers the happy path and drop-on-full; the S14 error paths (VLM timeout, clip-finish
+failure) are Task 7's job, against this same implementation.
+
+```python
+# ai-engine/tests/orchestrator/test_scheduler.py
+from __future__ import annotations
+
+import asyncio
+from uuid import uuid4
+
+import pytest
+
+from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, SceneState
+from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
+from sentinel_ai.ports.vision_llm import SceneDescription
+from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.models import FakeVisionLLM
+
+CLOCK = iter([0.0] * 1000)
+
+
+def clock() -> float:
+    return next(CLOCK)
+
+
+def a_request(clip=None) -> EscalationRequest:
+    frame = FakeSource.make_frame("cam-1", 0, 0.0)
+    scene = SceneState(
+        camera_id="cam-1",
+        frame_index=0,
+        timestamp=0.0,
+        detections=(Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0)),),
+        tracks=(),
+        motion_energy=0.1,
+        scene_signature=(1.0,),
+    )
+    return EscalationRequest(
+        camera_id="cam-1",
+        event_id=uuid4(),
+        reason=EscalationReason.PERIODIC_SUMMARY,
+        detail="initial scene summary",
+        scene=scene,
+        keyframe=frame,
+        profile=CameraProfile(camera_id="cam-1"),
+        camera_label="Front Door",
+        history=(),
+        clip=clip,
+    )
+
+
+def new_scheduler(
+    vlm: FakeVisionLLM | None = None,
+    publisher: FakePublisher | None = None,
+    maxsize: int = 4,
+) -> tuple[VlmScheduler, FakeVisionLLM, FakePublisher]:
+    vlm = vlm or FakeVisionLLM(
+        response=SceneDescription(
+            description="A person is standing near the door.",
+            threat_value=0.3,
+            suggested_action="Monitor.",
+        )
+    )
+    publisher = publisher or FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=vlm,
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        maxsize=maxsize,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    return scheduler, vlm, publisher
+
+
+async def test_a_submitted_escalation_is_described_and_published() -> None:
+    scheduler, vlm, publisher = new_scheduler()
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        assert scheduler.submit(a_request()) is True
+        await scheduler.drain()
+        assert len(publisher.events) == 1
+        event = publisher.events[0]
+        assert event.description == "A person is standing near the door."
+        assert event.threat.value == pytest.approx(0.3)
+        assert event.description_unavailable is False
+        assert vlm.call_count == 1
+    finally:
+        worker.cancel()
+
+
+async def test_a_clip_is_finished_and_its_uri_attached() -> None:
+    writer = FakeClipWriter()
+    handle = await writer.open("cam-1", uuid4(), fps=10.0)
+    scheduler, _vlm, publisher = new_scheduler()
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request(clip=handle))
+        await scheduler.drain()
+        assert publisher.events[0].clip_uri == f"s3://sentinel-clips/cam-1/{handle.event_id}.mp4"
+        assert handle.finished is True
+    finally:
+        worker.cancel()
+
+
+async def test_no_clip_leaves_clip_uri_none() -> None:
+    scheduler, _vlm, publisher = new_scheduler()
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request(clip=None))
+        await scheduler.drain()
+        assert publisher.events[0].clip_uri is None
+    finally:
+        worker.cancel()
+
+
+async def test_a_full_queue_drops_and_counts_without_raising() -> None:
+    scheduler, _vlm, _publisher = new_scheduler(maxsize=1)
+    # No worker running: nothing drains the queue, so the second submit finds it full.
+    assert scheduler.submit(a_request()) is True
+    assert scheduler.submit(a_request()) is False
+    assert scheduler.dropped == 1
+```
+
+- [ ] **Step 9: Run it to verify it fails**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_scheduler.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator.scheduler'`
+
+- [ ] **Step 10: Implement `EscalationRequest` and `VlmScheduler`**
+
+```python
+# ai-engine/sentinel_ai/orchestrator/scheduler.py
+"""The VLM escalation queue (spec §5.4) and the S14 event-assembly worker (spec §6, §9).
+
+Exactly one worker processes escalations: there is one GPU and one set of resident
+VLM weights, so concurrent `describe()` calls would contend for the same VRAM.
+Drop-on-full is safe because the token bucket and the cooldown already bound the
+camera-side arrival rate (spec §4.1) — a full queue should be rare in practice, and
+when it happens the drop is counted, never raised.
+
+Event assembly happens here and only here (S14): this is the one place in the system
+that constructs an `Event`. Every error path below still produces one — spec §9's
+governing rule is that an anomaly event is never lost to an infrastructure failure.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import EscalationReason, SceneState
+from sentinel_ai.domain.entities import Event, EscalationReason, SceneState, ThreatScore
+from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.ports.clip_writer import ClipHandle
+from sentinel_ai.ports.event_publisher import EventPublisher
 from sentinel_ai.ports.frame_source import FrameData
+from sentinel_ai.ports.vision_llm import VisionLanguageModel, VisionRequest
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class EscalationRequest:
-    """Everything the VLM worker needs, so it never reaches back into the pipeline."""
+    """What the runner hands the scheduler. Carries everything the VLM and the event
+    need, so the worker never reaches back into the pipeline for anything."""
 
     camera_id: str
     event_id: UUID
@@ -3224,39 +3427,493 @@ class EscalationRequest:
     camera_label: str
     history: tuple[str, ...]
     clip: ClipHandle | None
+
+
+_UNAVAILABLE_THREAT_VALUE = 0.5
+"""A conservative mid-range placeholder: severity truly is unknown without a
+description, and 0.5 neither over- nor under-states it for downstream triage."""
+
+
+def _labels_and_tracks(scene: SceneState) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    labels = tuple(sorted({track.label for track in scene.tracks}))
+    track_ids = tuple(track.track_id for track in scene.tracks)
+    return labels, track_ids
+
+
+def _metadata_description(request: EscalationRequest) -> str:
+    """Fallback description built from cheap signals alone — no VLM call required."""
+    labels, _ = _labels_and_tracks(request.scene)
+    what = ", ".join(labels) if labels else "motion"
+    return f"{request.reason.value}: {what} ({request.detail})"
+
+
+class VlmScheduler:
+    def __init__(
+        self,
+        vlm: VisionLanguageModel,
+        publisher: EventPublisher,
+        admission: AdmissionGate,
+        *,
+        maxsize: int,
+        timeout_seconds: float,
+        clock: Callable[[], float],
+    ) -> None:
+        self._vlm = vlm
+        self._publisher = publisher
+        self._admission = admission
+        self._timeout_seconds = timeout_seconds
+        self._clock = clock
+        self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
+        self._dropped = 0
+
+    def submit(self, request: EscalationRequest) -> bool:
+        """Non-blocking. Returns False and counts a drop when the queue is full."""
+        try:
+            self._queue.put_nowait(request)
+        except asyncio.QueueFull:
+            self._dropped += 1
+            logger.warning("vlm queue full: dropping escalation for camera %s", request.camera_id)
+            return False
+        return True
+
+    async def run(self) -> None:
+        """The single worker loop. Cancel to stop."""
+        while True:
+            request = await self._queue.get()
+            try:
+                await self._process(request)
+            finally:
+                self._queue.task_done()
+
+    async def drain(self) -> None:
+        """Await completion of queued work — tests only."""
+        await self._queue.join()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    async def _process(self, request: EscalationRequest) -> None:
+        now = self._clock()
+        await self._admission.acquire(now)
+        try:
+            event = await self._describe(request)
+            event = await self._attach_clip(event, request)
+            await self._publisher.publish(event)
+        finally:
+            self._admission.release(self._clock())
+
+    async def _describe(self, request: EscalationRequest) -> Event:
+        labels, track_ids = _labels_and_tracks(request.scene)
+        vlm_request = VisionRequest(
+            keyframe=request.keyframe,
+            scene=request.scene,
+            history=request.history,
+            camera_label=request.camera_label,
+            reason_detail=request.detail,
+        )
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                description = await self._vlm.describe(vlm_request)
+        except Exception as error:  # noqa: BLE001 -- S14 step 4: never lose the event
+            logger.warning(
+                "vlm describe failed for camera %s event %s: %s",
+                request.camera_id,
+                request.event_id,
+                error,
+            )
+            return Event(
+                event_id=request.event_id,
+                camera_id=request.camera_id,
+                occurred_at=request.scene.timestamp,
+                reason=request.reason,
+                threat=ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE),
+                description=_metadata_description(request),
+                suggested_action="Review the clip when available.",
+                labels=labels,
+                track_ids=track_ids,
+                description_unavailable=True,
+            )
+        return Event(
+            event_id=request.event_id,
+            camera_id=request.camera_id,
+            occurred_at=request.scene.timestamp,
+            reason=request.reason,
+            threat=ThreatScore.from_value(description.threat_value),
+            description=description.description,
+            suggested_action=description.suggested_action,
+            labels=labels,
+            track_ids=track_ids,
+            description_unavailable=False,
+        )
+
+    async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:
+        if request.clip is None:
+            return event
+        try:
+            clip_uri = await request.clip.finish()
+        except Exception as error:  # noqa: BLE001 -- S14 step 5: never lose the event
+            logger.warning(
+                "clip finish failed for camera %s event %s: %s",
+                request.camera_id,
+                request.event_id,
+                error,
+            )
+            return event
+        return replace(event, clip_uri=clip_uri)
 ```
 
-- [ ] **Step 3c: Implement the runner**
+`asyncio.CancelledError` is a `BaseException`, not an `Exception`, so `except Exception` above
+never swallows the worker's own cancellation — `run()` still stops cleanly.
+
+- [ ] **Step 11: Verify**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_scheduler.py -v && ruff check ai-engine/sentinel_ai/orchestrator && mypy`
+Expected: all PASS, ruff clean, mypy `Success`.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add ai-engine/sentinel_ai/orchestrator/scheduler.py ai-engine/tests/orchestrator/test_scheduler.py
+git commit -m "feat(orchestrator): add the bounded VLM scheduler and S14 event assembly
+
+One worker because there is one GPU; every error path still publishes an
+event, per spec §9's governing rule."
+```
+
+- [ ] **Step 13: Write the failing test for `CameraRunner`**
+
+One file, four behaviours: backpressure actually drops (fails against a naive
+sequential implementation), the keystone end-to-end trace, discontinuity reset, and the
+clip open/extend/postroll lifecycle including `describe_now`.
+
+```python
+# ai-engine/tests/pipeline/test_runner.py
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from uuid import UUID
+
+import pytest
+
+from sentinel_ai.config import Settings
+from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.entities import BBox, Detection
+from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.scheduler import VlmScheduler
+from sentinel_ai.pipeline import runner as runner_module
+from sentinel_ai.pipeline.runner import CameraRunner
+from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
+from sentinel_ai.adapters.sources.preroll import PreRollBuffer
+from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.models import FakeDetector, FakeTracker, FakeVisionLLM
+
+
+def patch_postroll(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """`CameraRunner` reads `clip_postroll_seconds` from settings (S11's fixed
+    constructor has no such parameter); tests pin it small and explicit."""
+    monkeypatch.setattr(
+        runner_module, "get_settings", lambda: Settings(clip_postroll_seconds=seconds)
+    )
+
+
+def clock_from(sequence: list[float]) -> Callable[[], float]:
+    it = iter(sequence)
+
+    def clock() -> float:
+        try:
+            return next(it)
+        except StopIteration:
+            return sequence[-1]
+
+    return clock
+
+
+def make_runner(
+    *,
+    frames_and_packets: FakeSource,
+    detector: FakeDetector,
+    scheduler: VlmScheduler,
+    clip_writer: FakeClipWriter | None,
+    profile: CameraProfile | None = None,
+    detect_every_n_frames: int = 1,
+) -> CameraRunner:
+    return CameraRunner(
+        camera_id="cam-1",
+        camera_label="Front Door",
+        source=frames_and_packets,
+        detector=detector,
+        tracker=FakeTracker(),
+        motion=MotionAnalyzer(),
+        profile=profile or CameraProfile(camera_id="cam-1"),
+        scheduler=scheduler,
+        clip_writer=clip_writer,
+        preroll=PreRollBuffer(preroll_seconds=3.0),
+        clock=clock_from([0.0]),
+        detect_every_n_frames=detect_every_n_frames,
+    )
+
+
+def new_scheduler(vlm: FakeVisionLLM, publisher: FakePublisher) -> VlmScheduler:
+    return VlmScheduler(
+        vlm=vlm,
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock_from([0.0]),
+    )
+
+
+class TestKeystoneTrace:
+    async def test_source_to_gate_to_scheduler_to_publisher_on_cpu_with_no_sleeping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The phase's keystone test: proves the whole slice composes without a GPU."""
+        patch_postroll(monkeypatch, seconds=0.0)
+        source = FakeSource.with_packets("cam-1", count=3, fps=10.0)
+        detector = FakeDetector(script=[()])  # empty detections: PERIODIC_SUMMARY still fires
+        publisher = FakePublisher()
+        vlm = FakeVisionLLM()
+        scheduler = new_scheduler(vlm, publisher)
+        runner = make_runner(
+            frames_and_packets=source, detector=detector, scheduler=scheduler, clip_writer=None
+        )
+
+        worker = asyncio.create_task(scheduler.run())
+        try:
+            await runner.run()
+            await scheduler.drain()
+        finally:
+            worker.cancel()
+
+        telemetry = runner.telemetry()
+        assert telemetry.frames_seen == 3
+        assert telemetry.detections_run == 3
+        assert telemetry.escalations == 1  # PERIODIC_SUMMARY fires on the first scene
+        assert len(publisher.events) == 1
+        assert publisher.events[0].reason.value == "periodic_summary"
+
+
+class TestBackpressure:
+    async def test_a_slow_detector_causes_frame_drops_not_a_full_queue_of_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Must fail against a naive `async for frame in source: await detector.detect(frame)`
+        sequential implementation, because that implementation never drops anything —
+        it just processes every frame, however late."""
+        patch_postroll(monkeypatch, seconds=5.0)
+        source = FakeSource.with_packets("cam-1", count=50, fps=100.0)
+        gate = asyncio.Event()
+
+        class SlowDetector(FakeDetector):
+            async def detect(self, frame):  # type: ignore[override]
+                if self.call_count == 0:
+                    await gate.wait()  # first call blocks; the source races ahead meanwhile
+                return await super().detect(frame)
+
+        detector = SlowDetector(script=[()])
+        publisher = FakePublisher()
+        scheduler = new_scheduler(FakeVisionLLM(), publisher)
+        runner = make_runner(
+            frames_and_packets=source, detector=detector, scheduler=scheduler, clip_writer=None
+        )
+
+        run_task = asyncio.create_task(runner.run())
+        await asyncio.sleep(0)  # let the producer task race ahead of the gated detector
+        await asyncio.sleep(0)
+        gate.set()
+        await run_task
+
+        telemetry = runner.telemetry()
+        assert telemetry.frames_seen == 50
+        assert telemetry.frames_dropped > 0, "the producer must have outrun the gated detector"
+        assert telemetry.detections_run < telemetry.frames_seen
+
+
+class TestDiscontinuity:
+    async def test_a_signature_length_change_resets_tracker_motion_and_gate_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=5.0)
+
+        class VariableBinMotion(MotionAnalyzer):
+            """A test double: the real `MotionAnalyzer` never changes bin count for a
+            fixed instance, but the review's B1 crash was exactly a length mismatch, so
+            this proves the runner's own defence independent of whether it can occur
+            naturally today."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._script = iter([(0.1, (0.5, 0.5)), (0.2, (0.3, 0.3, 0.4))])
+
+            def analyze(self, frame):  # type: ignore[override]
+                energy, signature = next(self._script)
+                return MotionSignals(motion_energy=energy, scene_signature=signature)
+
+        source = FakeSource.constant("cam-1", count=2, fps=10.0)
+        near = Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0))
+        detector = FakeDetector(script=[(near,), (near,)])
+        publisher = FakePublisher()
+        scheduler = new_scheduler(FakeVisionLLM(), publisher)
+        runner = CameraRunner(
+            camera_id="cam-1",
+            camera_label="Front Door",
+            source=source,
+            detector=detector,
+            tracker=FakeTracker(),
+            motion=VariableBinMotion(),
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=1),
+            scheduler=scheduler,
+            clip_writer=None,
+            preroll=PreRollBuffer(preroll_seconds=3.0),
+            clock=clock_from([0.0]),
+        )
+
+        await runner.run()
+
+        # A gate that stayed wedged in state built from an incomparable signature
+        # would not escalate cleanly on the second, discontinuous frame; a reset one
+        # does, and `last_escalation_at` reflects that second frame's own timestamp.
+        assert runner.telemetry().last_escalation_at == pytest.approx(0.1)
+
+
+class TestClipLifecycle:
+    async def test_a_second_escalation_while_recording_extends_the_postroll_instead_of_opening_a_new_clip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=1.0)
+        # PERIODIC_SUMMARY fires on frame 0; NEW_SALIENT_TRACK fires again once the
+        # track has aged past min_track_frames, both while the clip is still open.
+        source = FakeSource.with_packets("cam-1", count=15, fps=10.0, keyframe_every=3)
+        near = Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0))
+        detector = FakeDetector(script=[(near,)])
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(FakeVisionLLM(), publisher)
+        runner = make_runner(
+            frames_and_packets=source,
+            detector=detector,
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=2),
+        )
+
+        worker = asyncio.create_task(scheduler.run())
+        try:
+            await runner.run()
+            await scheduler.drain()
+        finally:
+            worker.cancel()
+
+        assert len(writer.handles) == 1, "the second escalation must not open a second clip"
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert sum(event.clip_uri is not None for event in publisher.events) == 1, (
+            "only the clip-owning escalation's event carries the uri"
+        )
+
+    async def test_describe_now_uses_force_and_bypasses_the_governors(self) -> None:
+        source = FakeSource.constant("cam-1", count=1, fps=10.0)
+        detector = FakeDetector(script=[()])
+        publisher = FakePublisher()
+        scheduler = new_scheduler(FakeVisionLLM(), publisher)
+        profile = CameraProfile(camera_id="cam-1", vlm_enabled=False)  # governors would refuse
+        runner = make_runner(
+            frames_and_packets=source,
+            detector=detector,
+            scheduler=scheduler,
+            clip_writer=None,
+            profile=profile,
+        )
+
+        worker = asyncio.create_task(scheduler.run())
+        try:
+            await runner.run()  # observes the one frame, vlm_enabled=False so nothing escalates
+            assert runner.telemetry().escalations == 0
+
+            event_id = await runner.describe_now()
+            await scheduler.drain()
+        finally:
+            worker.cancel()
+
+        assert isinstance(event_id, UUID)
+        assert len(publisher.events) == 1
+        assert publisher.events[0].reason.value == "user_requested"
+
+    async def test_describe_now_before_any_frame_raises(self) -> None:
+        source = FakeSource.constant("cam-1", count=0)
+        detector = FakeDetector(script=[()])
+        scheduler = new_scheduler(FakeVisionLLM(), FakePublisher())
+        runner = make_runner(
+            frames_and_packets=source, detector=detector, scheduler=scheduler, clip_writer=None
+        )
+        with pytest.raises(RuntimeError, match="has not processed a frame"):
+            await runner.describe_now()
+```
+
+- [ ] **Step 14: Run it to verify it fails**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/pipeline/test_runner.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.pipeline.runner'`
+
+- [ ] **Step 15: Implement `CameraRunner`**
 
 ```python
 # ai-engine/sentinel_ai/pipeline/runner.py
-"""One async task per camera: decode -> detect -> track -> motion -> gate (spec §5.3).
+"""One asyncio task per camera (spec §5.3): decode → detect → track → motion → gate.
 
-The runner never awaits the VLM. A positive gate decision is handed to the
-scheduler and the loop continues, because Qwen takes seconds and a camera that
-stops seeing while it describes is a camera that misses the next event.
+Threading: `FrameSource.__aiter__`/`.packets()` and `ObjectDetector.detect` are async
+by contract precisely because PyAV decode and YOLO inference are blocking C-extension
+calls. The adapters that perform them (`FileSource`/`RtspSource`, `Yolo11Detector`) hide
+the offload behind that `async def`, e.g. `return await asyncio.to_thread(self._predict, frame)`
+— the runner's obligation is only to `await` these calls and never add a second,
+redundant executor hop around an already-async port method. `Tracker.update` and
+`MotionAnalyzer.analyze` are cheap, pure CPU (spec explicitly keeps them synchronous)
+and the escalation gate is a pure function, so all three run inline on the loop.
+
+Backpressure: a `_LatestSlot` mailbox decouples frame *arrival* from frame
+*processing*. A `_produce` task drains the source eagerly and always overwrites the
+slot with the newest frame; an overwrite before the consumer collects the previous
+one is a drop, counted in `CameraTelemetry.frames_dropped`. This is what makes
+"drop the stale frame, process the newest" real: a naive `async for frame in source:
+await detector.detect(frame)` loop never drops anything, because it only ever asks
+the source for a new frame once the previous one is fully processed.
+
+Clip lifecycle: only the escalation that *opens* a clip ever carries its `ClipHandle`
+on an `EscalationRequest`. A later escalation while the clip is still recording only
+extends `_ActiveClip.deadline` — submitting its own request with `clip=None` — because
+finishing a shared handle twice, or before its (possibly extended) post-roll window has
+actually closed, is undefined. The clip-owning request is queued lazily, from the
+packet loop, the moment `packet.pts` first reaches the (possibly-extended) deadline —
+never from the frame loop, so escalation submission is always non-blocking and
+immediate for every *other* request.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
 
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
+from sentinel_ai.config import get_settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, SceneState
 from sentinel_ai.domain.policy.escalation import GateState, decide, force
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
-from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
+from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.frame_source import FrameData, FrameSource
 from sentinel_ai.ports.tracker import Tracker
 
-_HISTORY_LIMIT = 5
+_DEFAULT_FPS = 10.0
+_HISTORY_MAXLEN = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -3270,6 +3927,49 @@ class CameraTelemetry:
     discontinuities: int
     last_frame_at: float | None
     last_escalation_at: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveClip:
+    handle: ClipHandle
+    deadline: float
+    request: EscalationRequest
+
+
+class _LatestSlot:
+    """Single-slot mailbox: only the newest unconsumed frame survives.
+
+    An overwrite before the consumer collects the previous frame is exactly the
+    backpressure drop spec §5.3 requires — surveillance wants current reality, not
+    a delayed complete record. `close()` lets the producer signal end-of-stream so
+    the consumer can stop instead of waiting forever.
+    """
+
+    def __init__(self) -> None:
+        self._frame: FrameData | None = None
+        self._closed = False
+        self._event = asyncio.Event()
+        self.dropped = 0
+
+    def put(self, frame: FrameData) -> None:
+        if self._frame is not None:
+            self.dropped += 1
+        self._frame = frame
+        self._event.set()
+
+    def close(self) -> None:
+        self._closed = True
+        self._event.set()
+
+    async def get(self) -> FrameData | None:
+        while True:
+            if self._frame is not None:
+                frame, self._frame = self._frame, None
+                return frame
+            if self._closed:
+                return None
+            self._event.clear()
+            await self._event.wait()
 
 
 class CameraRunner:
@@ -3300,20 +4000,26 @@ class CameraRunner:
         self._clip_writer = clip_writer
         self._preroll = preroll
         self._clock = clock
-        self._detect_every_n = detect_every_n_frames
+        self._detect_every_n_frames = detect_every_n_frames
 
-        self._gate = GateState.initial(profile, clock())
+        # `clip_postroll_seconds` has no S11 constructor slot: it is a process-wide
+        # tuning value (S1), read once here rather than threaded through every
+        # `CameraRunner` construction site.
+        self._clip_postroll_seconds = get_settings().clip_postroll_seconds
+
+        self._gate_state = GateState.initial(profile, clock())
+        self._history: deque[str] = deque(maxlen=_HISTORY_MAXLEN)
+        self._active_clip: _ActiveClip | None = None
+        self._clip_lock = asyncio.Lock()
+        self._slot: _LatestSlot | None = None
+
         self._last_scene: SceneState | None = None
-        self._last_frame: FrameData | None = None
-        self._last_frame_index: int | None = None
-        self._last_signature_length: int | None = None
-        self._history: tuple[str, ...] = ()
-
-        self._clip: ClipHandle | None = None
-        self._clip_until: float | None = None
+        self._last_keyframe: FrameData | None = None
+        self._last_signature_len: int | None = None
+        self._last_processed_timestamp: float | None = None
+        self._last_two_timestamps: tuple[float, float] | None = None
 
         self._frames_seen = 0
-        self._frames_dropped = 0
         self._detections_run = 0
         self._escalations = 0
         self._escalations_dropped = 0
@@ -3322,53 +4028,92 @@ class CameraRunner:
         self._last_escalation_at: float | None = None
 
     async def run(self) -> None:
-        packet_pump = asyncio.create_task(self._pump_packets())
+        self._slot = _LatestSlot()
+        produce_task = asyncio.create_task(self._produce())
+        packets_task = asyncio.create_task(self._packet_loop())
         try:
-            async for frame in self._source:
-                await self._on_frame(frame)
-        except asyncio.CancelledError:
-            raise
+            await self._consume()
         finally:
-            packet_pump.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await packet_pump
-            await self._close_clip(abort=True)
+            for task in (produce_task, packets_task):
+                task.cancel()
+            for task in (produce_task, packets_task):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if self._active_clip is not None:
+                pending = self._active_clip
+                self._active_clip = None
+                await pending.handle.abort()
+                self._submit(replace(pending.request, clip=None))
             await self._source.close()
 
-    async def _pump_packets(self) -> None:
-        """Feed every encoded packet to the pre-roll ring and any open clip."""
-        async for packet in self._source.packets():
-            self._preroll.append(packet)
-            if self._clip is not None:
-                await self._clip.append(packet)
+    async def describe_now(self) -> UUID:
+        """USER_REQUESTED path — uses domain `force()`; returns the event id."""
+        if self._last_scene is None or self._last_keyframe is None:
+            raise RuntimeError(f"camera {self._camera_id!r} has not processed a frame yet")
+        now = self._clock()
+        outcome = force(EscalationReason.USER_REQUESTED, self._gate_state, now)
+        self._gate_state = outcome.state
+        assert outcome.decision.reason is not None
+        return await self._escalate(
+            self._last_scene,
+            self._last_keyframe,
+            outcome.decision.reason,
+            outcome.decision.detail,
+            now,
+        )
 
-    async def _on_frame(self, frame: FrameData) -> None:
-        self._frames_seen += 1
-        self._last_frame = frame
-        self._last_frame_at = frame.timestamp
+    def telemetry(self) -> CameraTelemetry:
+        return CameraTelemetry(
+            camera_id=self._camera_id,
+            frames_seen=self._frames_seen,
+            frames_dropped=self._slot.dropped if self._slot is not None else 0,
+            detections_run=self._detections_run,
+            escalations=self._escalations,
+            escalations_dropped=self._escalations_dropped,
+            discontinuities=self._discontinuities,
+            last_frame_at=self._last_frame_at,
+            last_escalation_at=self._last_escalation_at,
+        )
 
-        if self._is_discontinuous(frame):
-            self._reset_derived_state(frame.timestamp)
+    # -- stages 1-2: frame arrival, with backpressure -------------------------------
 
-        self._last_frame_index = frame.frame_index
+    async def _produce(self) -> None:
+        assert self._slot is not None
+        try:
+            async for frame in self._source:
+                self._frames_seen += 1
+                self._last_frame_at = frame.timestamp
+                if frame.frame_index % self._detect_every_n_frames == 0:
+                    self._slot.put(frame)
+        finally:
+            self._slot.close()
 
-        await self._maybe_close_clip(frame.timestamp)
+    async def _consume(self) -> None:
+        assert self._slot is not None
+        while True:
+            frame = await self._slot.get()
+            if frame is None:
+                return
+            await self._process_frame(frame)
 
-        if (self._frames_seen - 1) % self._detect_every_n != 0:
-            return
+    # -- stages 2-5: detect, track, motion, gate ------------------------------------
 
+    async def _process_frame(self, frame: FrameData) -> None:
         detections = await self._detector.detect(frame)
         self._detections_run += 1
-
-        tracks = self._tracker.update(detections, timestamp=frame.timestamp)
+        tracks = self._tracker.update(detections, frame.timestamp)
         signals = self._motion.analyze(frame)
 
-        if (
-            self._last_signature_length is not None
-            and len(signals.scene_signature) != self._last_signature_length
-        ):
-            self._reset_derived_state(frame.timestamp)
-        self._last_signature_length = len(signals.scene_signature)
+        if self._is_discontinuous(frame, signals):
+            self._discontinuities += 1
+            self._tracker.reset()
+            self._motion.reset()
+            self._gate_state = GateState.initial(self._profile, frame.timestamp)
+
+        self._last_signature_len = len(signals.scene_signature)
+        if self._last_processed_timestamp is not None:
+            self._last_two_timestamps = (self._last_processed_timestamp, frame.timestamp)
+        self._last_processed_timestamp = frame.timestamp
 
         scene = SceneState(
             camera_id=self._camera_id,
@@ -3380,564 +4125,325 @@ class CameraRunner:
             scene_signature=signals.scene_signature,
         )
         self._last_scene = scene
+        self._last_keyframe = frame
 
-        outcome = decide(scene, self._profile, self._gate)
-        self._gate = outcome.state
-        if outcome.decision.should_escalate:
-            assert outcome.decision.reason is not None
+        outcome = decide(scene, self._profile, self._gate_state)
+        self._gate_state = outcome.state
+        if outcome.decision.should_escalate and outcome.decision.reason is not None:
             await self._escalate(
-                scene, frame, outcome.decision.reason, outcome.decision.detail
+                scene, frame, outcome.decision.reason, outcome.decision.detail, frame.timestamp
             )
 
-    def _is_discontinuous(self, frame: FrameData) -> bool:
+    def _is_discontinuous(self, frame: FrameData, signals: MotionSignals) -> bool:
+        """Spec §5.2/§6: a signature-length change or a source reconnect (observed as
+        a timestamp regression) is a stream discontinuity, not a `SceneState` the
+        domain can compare against what came before. The domain already returns
+        0.0/None rather than raising (review finding B1); resetting the streak/state
+        so the next frame starts clean is the caller's job."""
+        if (
+            self._last_processed_timestamp is not None
+            and frame.timestamp < self._last_processed_timestamp
+        ):
+            return True
         return (
-            self._last_frame_index is not None
-            and frame.frame_index < self._last_frame_index
+            self._last_signature_len is not None
+            and len(signals.scene_signature) != self._last_signature_len
         )
 
-    def _reset_derived_state(self, now: float) -> None:
-        """Everything derived from frame-to-frame history is invalid after a break."""
-        self._discontinuities += 1
-        self._tracker.reset()
-        self._motion.reset()
-        self._preroll.clear()
-        self._gate = GateState.initial(self._profile, now)
-        self._last_signature_length = None
+    # -- escalation, clip lifecycle, scheduler submission ---------------------------
 
     async def _escalate(
-        self, scene: SceneState, frame: FrameData, reason: EscalationReason, detail: str
-    ) -> None:
+        self,
+        scene: SceneState,
+        keyframe: FrameData,
+        reason: EscalationReason,
+        detail: str,
+        now: float,
+    ) -> UUID:
         event_id = uuid4()
-        clip = await self._open_or_extend_clip(event_id, scene.timestamp)
-        request = EscalationRequest(
-            camera_id=self._camera_id,
-            event_id=event_id,
-            reason=reason,
-            detail=detail,
-            scene=scene,
-            keyframe=frame,
-            profile=self._profile,
-            camera_label=self._camera_label,
-            history=self._history,
-            clip=clip,
-        )
-        if self._scheduler.submit(request):
-            self._escalations += 1
-            self._last_escalation_at = scene.timestamp
-            self._history = (*self._history, detail)[-_HISTORY_LIMIT:]
-        else:
-            self._escalations_dropped += 1
+        history = tuple(self._history)
+        self._history.append(detail)
+        self._last_escalation_at = now
 
-    async def _open_or_extend_clip(self, event_id: UUID, now: float) -> ClipHandle | None:
-        """A second escalation extends the open clip rather than overlapping a new one."""
+        base = {
+            "camera_id": self._camera_id,
+            "event_id": event_id,
+            "reason": reason,
+            "detail": detail,
+            "scene": scene,
+            "keyframe": keyframe,
+            "profile": self._profile,
+            "camera_label": self._camera_label,
+            "history": history,
+        }
+
         if self._clip_writer is None:
-            return None
-        postroll = _postroll_seconds()
-        if self._clip is not None:
-            self._clip_until = now + postroll
-            return None
-        handle = await self._clip_writer.open(self._camera_id, event_id, _NOMINAL_CLIP_FPS)
-        for packet in self._preroll.flush():
-            await handle.append(packet)
-        self._clip = handle
-        self._clip_until = now + postroll
-        return handle
+            self._submit(EscalationRequest(clip=None, **base))
+            return event_id
 
-    async def _maybe_close_clip(self, now: float) -> None:
-        if self._clip is not None and self._clip_until is not None and now >= self._clip_until:
-            await self._close_clip(abort=False)
-
-    async def _close_clip(self, *, abort: bool) -> None:
-        clip, self._clip, self._clip_until = self._clip, None, None
-        if clip is None:
-            return
-        if abort:
-            await clip.abort()
-        # A finished clip's URI is collected by the scheduler worker (Task 7),
-        # which owns event assembly; the runner only controls the recording window.
-
-    async def describe_now(self) -> UUID:
-        """USER_REQUESTED (spec §6) — bypasses every governor via the domain's force()."""
-        if self._last_scene is None or self._last_frame is None:
-            raise RuntimeError(f"camera {self._camera_id} has not produced a frame yet")
-        now = self._clock()
-        outcome = force(EscalationReason.USER_REQUESTED, self._gate, now)
-        self._gate = outcome.state
-        event_id = uuid4()
-        request = EscalationRequest(
-            camera_id=self._camera_id,
-            event_id=event_id,
-            reason=EscalationReason.USER_REQUESTED,
-            detail="user requested a description",
-            scene=self._last_scene,
-            keyframe=self._last_frame,
-            profile=self._profile,
-            camera_label=self._camera_label,
-            history=self._history,
-            clip=None,
-        )
-        if not self._scheduler.submit(request):
-            self._escalations_dropped += 1
-        else:
-            self._escalations += 1
+        async with self._clip_lock:
+            if self._active_clip is None:
+                handle = await self._clip_writer.open(
+                    self._camera_id, event_id, fps=self._estimated_fps()
+                )
+                for packet in self._preroll.flush():
+                    await handle.append(packet)
+                request = EscalationRequest(clip=handle, **base)
+                self._active_clip = _ActiveClip(
+                    handle=handle,
+                    deadline=now + self._clip_postroll_seconds,
+                    request=request,
+                )
+            else:
+                # A clip is already recording: extend its post-roll instead of
+                # opening a second, overlapping one (spec §5.5). This escalation
+                # still gets its own event — just without a clip of its own, since
+                # a `ClipHandle` may only ever be finished once.
+                self._active_clip = replace(
+                    self._active_clip, deadline=now + self._clip_postroll_seconds
+                )
+                self._submit(EscalationRequest(clip=None, **base))
         return event_id
 
-    def telemetry(self) -> CameraTelemetry:
-        return CameraTelemetry(
-            camera_id=self._camera_id,
-            frames_seen=self._frames_seen,
-            frames_dropped=self._frames_dropped,
-            detections_run=self._detections_run,
-            escalations=self._escalations,
-            escalations_dropped=self._escalations_dropped,
-            discontinuities=self._discontinuities,
-            last_frame_at=self._last_frame_at,
-            last_escalation_at=self._last_escalation_at,
-        )
+    async def _packet_loop(self) -> None:
+        async for packet in self._source.packets():
+            self._preroll.append(packet)
+            async with self._clip_lock:
+                if self._active_clip is not None:
+                    await self._active_clip.handle.append(packet)
+                    if packet.pts >= self._active_clip.deadline:
+                        pending = self._active_clip
+                        self._active_clip = None
+                        self._submit(pending.request)
 
+    def _submit(self, request: EscalationRequest) -> None:
+        if self._scheduler.submit(request):
+            self._escalations += 1
+        else:
+            self._escalations_dropped += 1
 
-_NOMINAL_CLIP_FPS = 30.0
-"""The nominal rate stamped on the clip's video stream.
-
-Only a declared rate: `EncodedPacket.pts` drives every packet's actual timing in the
-muxer, so playback is correct even when the source's real rate differs. A clip is never
-re-timed from this number.
-"""
-
-
-def _postroll_seconds() -> float:
-    from sentinel_ai.config import get_settings
-
-    return get_settings().clip_postroll_seconds
+    def _estimated_fps(self) -> float:
+        if self._last_two_timestamps is None:
+            return _DEFAULT_FPS
+        previous, current = self._last_two_timestamps
+        delta = current - previous
+        return 1.0 / delta if delta > 0 else _DEFAULT_FPS
 ```
 
-Note the two module-level helpers import `sentinel_ai.config` **inside** the function. This is
-the outer layer so the fitness test permits it either way, but keeping it lazy means importing
-`runner.py` does not read `.env`, which is what lets the tests construct a runner without
-touching the environment.
+The one subtlety worth flagging: `_packet_loop` holds `self._clip_lock` around every
+append, so a live packet arriving mid-preroll-flush (itself inside the same lock, in
+`_escalate`) simply waits for the lock instead of racing ahead of older, still-buffered
+pre-roll packets — the clip's packets stay pts-ordered without a second queue.
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 16: Verify**
 
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/pipeline/test_runner.py -v`
-Expected: all PASS.
-
-Then the full gate:
-
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest -q -m "not gpu and not integration" -W error && ruff check . && ruff format --check . && mypy`
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest -q -m "not gpu and not integration" && ruff check . && ruff format --check . && mypy`
 Expected: all PASS, ruff clean, mypy `Success`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 17: Commit**
 
 ```bash
-git add ai-engine/sentinel_ai/pipeline ai-engine/sentinel_ai/orchestrator ai-engine/tests/pipeline ai-engine/tests/fakes/io.py
-git commit -m "feat(pipeline): add the per-camera runner
+git add ai-engine/sentinel_ai/pipeline/runner.py ai-engine/tests/pipeline/__init__.py ai-engine/tests/pipeline/test_runner.py ai-engine/tests/fakes/io.py
+git commit -m "feat(pipeline): add CameraRunner — decode/detect/track/motion/gate on one task per camera
 
-Runs decode -> detect -> track -> motion -> gate as one async task and hands
-positive decisions to the VLM scheduler without ever awaiting it: Qwen takes
-seconds, and a camera that stops seeing while it describes misses the next
-event.
-
-Resets tracker, motion, pre-roll and gate state on a stream discontinuity —
-detected as either a frame_index regression (RTSP reconnect) or a scene
-signature length change (resolution renegotiation), the latter being the case
-the Phase 1A review found crashing decide()."
+Backpressure drops stale frames under a slow detector rather than queuing a
+delayed complete record; a second escalation while a clip records extends its
+post-roll instead of opening a second overlapping one; a signature-length
+change or source reconnect resets tracker, motion and gate state."
 ```
 
 ---
 
-### Task 7: Orchestrator — registry, resident set, admission gate, scheduler, service
+### Task 7: Orchestrator — registry, resident set, service (consuming Task 6's admission gate and scheduler)
+
+Implements S10 (`ModelRegistry`, `ResidentSet`) and S12 (`EngineService`), and adds the
+S14 error-path tests against Task 6's `VlmScheduler` — those paths are the point of this
+task, not an afterthought. `AdmissionGate` (S8) and `VlmScheduler`/`EscalationRequest` (S7,
+S9) already exist from Task 6 (Reconciliation Log R8).
 
 **Files:**
-- Create: `ai-engine/sentinel_ai/orchestrator/registry.py`
-- Create: `ai-engine/sentinel_ai/orchestrator/resident_set.py`
-- Create: `ai-engine/sentinel_ai/orchestrator/admission.py`
-- Modify: `ai-engine/sentinel_ai/orchestrator/scheduler.py` (Task 6 created the stub)
-- Create: `ai-engine/sentinel_ai/orchestrator/service.py`
-- Create: `ai-engine/tests/orchestrator/__init__.py`
-- Test: `ai-engine/tests/orchestrator/test_registry.py`, `test_resident_set.py`, `test_admission.py`, `test_scheduler.py`, `test_service.py`
+- Modify: `ai-engine/tests/fakes/models.py` — add `FakeModelRuntime` (a `ModelRuntime` fake;
+  nothing earlier defined one).
+- Create: `ai-engine/sentinel_ai/orchestrator/registry.py` — `ModelSpec`, `ModelRegistry` (S10).
+- Create: `ai-engine/sentinel_ai/orchestrator/resident_set.py` — `ResidentSet` (S10).
+- Create: `ai-engine/sentinel_ai/orchestrator/service.py` — `EngineService`, `UnknownCameraError` (S12).
+- Test: `ai-engine/tests/orchestrator/test_registry.py`
+- Test: `ai-engine/tests/orchestrator/test_resident_set.py`
+- Test: `ai-engine/tests/orchestrator/test_service.py`
+- Modify: `ai-engine/tests/orchestrator/test_scheduler.py` — add the S14 error-path tests
+  (VLM timeout, clip-finish failure) against Task 6's `VlmScheduler`.
 
 **Interfaces:**
-- Consumes: `ModelSpec`, `ResidencyPlan`, `plan_residency`, `InsufficientVram` (`sentinel_ai.domain.policy.vram_budget`); `ModelRuntime`, `LifecycleState`, `HealthReport` (`sentinel_ai.ports.model_runtime`); `VisionLanguageModel`, `VisionRequest`, `SceneDescription` (`sentinel_ai.ports.vision_llm`); `EventPublisher`; `Event`, `ThreatScore` (`sentinel_ai.domain.entities`); `EscalationRequest` (Task 6's stub); `CameraRunner`, `CameraTelemetry` (Task 6)
-- Produces: `ModelRegistry`, `ResidentSet`, `AdmissionGate`, `VlmScheduler`, `EngineService`, `UnknownCameraError`
+- Consumes: `AdmissionGate` (S8), `EscalationRequest`/`VlmScheduler` (S7/S9) verbatim from
+  Task 6; `plan_residency`/`ModelSpec`/`ResidencyPlan`/`InsufficientVram` from
+  `sentinel_ai.domain.policy.vram_budget` (Phase 1A); `ModelRuntime`/`HealthReport`/
+  `LifecycleState`/`Capabilities` from `sentinel_ai.ports.model_runtime`; `CameraRunner`/
+  `CameraTelemetry` (S11) from Task 6.
+- Produces: `ModelSpec`/`ModelRegistry`/`ResidentSet` (S10), `EngineService`/
+  `UnknownCameraError` (S12) — used verbatim by the FastAPI surface (Task 10) and by the
+  real adapters' wiring (Tasks 11-14).
 
-Five modules in one task because none is independently useful — `EngineService` is what wires
-them, and a registry with no resident set and no scheduler has nothing to prove.
+**One `ModelSpec`, not two.** Reuse `sentinel_ai.domain.policy.vram_budget.ModelSpec`
+(`model_key`, `vram_mib`, `priority`, `idle_unload_seconds`) — do not define a registry-local
+twin. `plan_residency()` consumes exactly that type, so a second one would have to be
+translated on every call for no benefit. There is no `kind` field because a model's kind is
+already on `ModelRuntime.capabilities().kind`, which is where `ModelRegistry.kind()` reads it
+from. See Reconciliation Log R2.
 
-**Why `AdmissionGate` exists.** Phase 1A's governors — token bucket, cooldown, dedup — are all
-*per camera*, but the GPU they protect is *global*. With one camera they are equivalent, so
-this is not a bug today. With N cameras, N independent buckets can each legitimately permit a
-call and collectively saturate an 8 GB card. Building the seam now, while it is trivially
-testable with one camera, avoids retrofitting it into the hot path in Phase 2.
-
-**Event assembly (S14) lives in the scheduler worker.** Exactly one place builds an `Event`, so
-there is exactly one place where spec §9's governing rule — *an anomaly event is never lost to
-an infrastructure failure* — can be got wrong. The error paths are the point of this task, not
-an afterthought: a VLM timeout still publishes, a clip failure still publishes.
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# ai-engine/tests/orchestrator/test_admission.py
-"""Tests for the global GPU admission gate (Task 7)."""
-
-from __future__ import annotations
-
-import asyncio
-
-from sentinel_ai.orchestrator.admission import AdmissionGate
-
-
-class TestConcurrency:
-    async def test_it_serialises_beyond_its_concurrency_limit(self) -> None:
-        gate = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
-        await gate.acquire(now=0.0)
-        assert gate.in_flight == 1
-
-        second = asyncio.create_task(gate.acquire(now=0.0))
-        await asyncio.sleep(0)
-        assert not second.done(), "a second acquire must wait for the first to release"
-
-        gate.release(now=0.0)
-        await second
-        assert gate.in_flight == 1
-
-    async def test_release_frees_a_slot(self) -> None:
-        gate = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
-        await gate.acquire(now=0.0)
-        gate.release(now=0.0)
-        assert gate.in_flight == 0
-
-
-class TestMinInterval:
-    async def test_it_refuses_to_start_two_calls_inside_the_interval(self) -> None:
-        """The per-camera cooldown cannot bound a global GPU; this can."""
-        gate = AdmissionGate(concurrency=1, min_interval_seconds=2.0)
-        await gate.acquire(now=0.0)
-        gate.release(now=0.5)
-
-        waiting = asyncio.create_task(gate.acquire(now=1.0))
-        await asyncio.sleep(0)
-        assert not waiting.done(), "1.0s after the last start is inside a 2.0s interval"
-
-        waiting.cancel()
-
-    async def test_it_admits_immediately_once_the_interval_has_elapsed(self) -> None:
-        gate = AdmissionGate(concurrency=1, min_interval_seconds=2.0)
-        await gate.acquire(now=0.0)
-        gate.release(now=0.5)
-
-        await gate.acquire(now=2.0)
-        assert gate.in_flight == 1
-```
+- [ ] **Step 1: Add `FakeModelRuntime`**
 
 ```python
-# ai-engine/tests/orchestrator/test_scheduler.py
-"""Tests for the VLM scheduler and event assembly (Task 7).
-
-The error paths here ARE the feature: spec §9 says an anomaly event is never
-lost to an infrastructure failure.
-"""
-
-from __future__ import annotations
-
-from uuid import uuid4
-
-from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import EscalationReason, SceneState
-from sentinel_ai.orchestrator.admission import AdmissionGate
-from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
-from sentinel_ai.ports.vision_llm import SceneDescription
-from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
-from tests.fakes.models import FakeVisionLLM
-
-PROFILE = CameraProfile(camera_id="cam-1")
-
-
-def a_request(clip: object = None) -> EscalationRequest:
-    return EscalationRequest(
-        camera_id="cam-1",
-        event_id=uuid4(),
-        reason=EscalationReason.SPEED_ANOMALY,
-        detail="person running",
-        scene=SceneState("cam-1", 0, 0.0, (), (), 0.0, (1.0,)),
-        keyframe=FakeSource.make_frame("cam-1", 0, 0.0),
-        profile=PROFILE,
-        camera_label="Front Door",
-        history=(),
-        clip=clip,  # type: ignore[arg-type]
-    )
-
-
-def build(
-    vlm: FakeVisionLLM, publisher: FakePublisher, *, maxsize: int = 4
-) -> VlmScheduler:
-    return VlmScheduler(
-        vlm=vlm,
-        publisher=publisher,
-        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
-        maxsize=maxsize,
-        timeout_seconds=30.0,
-        clock=lambda: 0.0,
-    )
-
-
-class TestHappyPath:
-    async def test_a_described_scene_becomes_a_published_event(self) -> None:
-        vlm = FakeVisionLLM(
-            response=SceneDescription(
-                description="A person is running toward the gate.",
-                threat_value=0.7,
-                suggested_action="Review the clip.",
-            )
-        )
-        publisher = FakePublisher()
-        scheduler = build(vlm, publisher)
-
-        assert scheduler.submit(a_request()) is True
-        await scheduler.drain()
-
-        assert len(publisher.events) == 1
-        event = publisher.events[0]
-        assert event.description == "A person is running toward the gate."
-        assert event.threat.value == 0.7
-        assert event.description_unavailable is False
-
-    async def test_a_finished_clip_uri_lands_on_the_event(self) -> None:
-        writer = FakeClipWriter()
-        handle = await writer.open("cam-1", uuid4(), 30.0)
-        publisher = FakePublisher()
-        scheduler = build(FakeVisionLLM(), publisher)
-
-        scheduler.submit(a_request(clip=handle))
-        await scheduler.drain()
-
-        assert publisher.events[0].clip_uri is not None
-        assert handle.finished is True
-
-
-class TestErrorPaths:
-    async def test_a_vlm_timeout_still_publishes_a_flagged_event(self) -> None:
-        """Spec §9: the event is created from metadata, flagged, never dropped."""
-        publisher = FakePublisher()
-        scheduler = build(FakeVisionLLM(error=TimeoutError("vlm timed out")), publisher)
-
-        scheduler.submit(a_request())
-        await scheduler.drain()
-
-        assert len(publisher.events) == 1
-        event = publisher.events[0]
-        assert event.description_unavailable is True
-        assert event.description, "a metadata-derived description is still required"
-
-    async def test_a_vlm_crash_still_publishes(self) -> None:
-        publisher = FakePublisher()
-        scheduler = build(FakeVisionLLM(error=RuntimeError("CUDA OOM")), publisher)
-
-        scheduler.submit(a_request())
-        await scheduler.drain()
-
-        assert len(publisher.events) == 1
-        assert publisher.events[0].description_unavailable is True
-
-    async def test_a_clip_failure_still_publishes_with_no_uri(self) -> None:
-        class ExplodingHandle:
-            finished = False
-            aborted = False
-
-            async def append(self, packet: object) -> None: ...
-            async def finish(self) -> str:
-                raise OSError("minio unreachable")
-            async def abort(self) -> None: ...
-
-        publisher = FakePublisher()
-        scheduler = build(FakeVisionLLM(), publisher)
-
-        scheduler.submit(a_request(clip=ExplodingHandle()))
-        await scheduler.drain()
-
-        assert len(publisher.events) == 1
-        assert publisher.events[0].clip_uri is None
-
-    async def test_the_admission_slot_is_released_even_when_the_vlm_raises(self) -> None:
-        publisher = FakePublisher()
-        gate = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
-        scheduler = VlmScheduler(
-            vlm=FakeVisionLLM(error=RuntimeError("boom")),
-            publisher=publisher,
-            admission=gate,
-            maxsize=4,
-            timeout_seconds=30.0,
-            clock=lambda: 0.0,
-        )
-
-        scheduler.submit(a_request())
-        await scheduler.drain()
-
-        assert gate.in_flight == 0, "a leaked slot would wedge the GPU forever"
-
-
-class TestBackpressure:
-    async def test_a_full_queue_drops_and_counts_without_raising(self) -> None:
-        scheduler = build(FakeVisionLLM(), FakePublisher(), maxsize=1)
-
-        first = scheduler.submit(a_request())
-        second = scheduler.submit(a_request())
-
-        assert first is True
-        assert second is False
-        assert scheduler.dropped == 1
-```
-
-```python
-# ai-engine/tests/orchestrator/test_resident_set.py
-"""Tests for ResidentSet (Task 7) — it executes plan_residency()'s output."""
-
-from __future__ import annotations
-
-from sentinel_ai.domain.policy.vram_budget import ModelSpec
-from sentinel_ai.orchestrator.registry import ModelRegistry
-from sentinel_ai.orchestrator.resident_set import ResidentSet
+# ai-engine/tests/fakes/models.py — append to the existing file
 from sentinel_ai.ports.model_runtime import Capabilities, HealthReport, LifecycleState, ModelRuntime
 
 
-class RecordingRuntime(ModelRuntime):
-    def __init__(self, key: str, vram_mib: int) -> None:
-        self.key = key
-        self.vram_mib = vram_mib
-        self.initialized = 0
-        self.shutdowns = 0
+class FakeModelRuntime(ModelRuntime):
+    """A controllable `ModelRuntime`: tests drive its lifecycle state directly rather
+    than simulating a real load/warmup/shutdown sequence."""
+
+    def __init__(
+        self,
+        model_key: str,
+        kind: str = "vision",
+        vram_mib: int = 100,
+        initialize_error: Exception | None = None,
+    ) -> None:
+        self._model_key = model_key
+        self._kind = kind
+        self._vram_mib = vram_mib
+        self._initialize_error = initialize_error
+        self._state = LifecycleState.UNLOADED
+        self.initialize_calls = 0
+        self.warmup_calls = 0
+        self.shutdown_calls = 0
+        self.predict_calls: list[object] = []
 
     async def initialize(self) -> None:
-        self.initialized += 1
+        self.initialize_calls += 1
+        if self._initialize_error is not None:
+            self._state = LifecycleState.UNHEALTHY
+            raise self._initialize_error
+        self._state = LifecycleState.LOADED
 
-    async def warmup(self) -> None: ...
+    async def warmup(self) -> None:
+        self.warmup_calls += 1
+        self._state = LifecycleState.HEALTHY
 
     async def predict(self, request: object) -> object:
+        self.predict_calls.append(request)
         return request
 
     async def shutdown(self) -> None:
-        self.shutdowns += 1
+        self.shutdown_calls += 1
+        self._state = LifecycleState.UNLOADED
 
     def health(self) -> HealthReport:
-        return HealthReport(state=LifecycleState.HEALTHY, detail="", vram_mib=self.vram_mib)
+        vram = self._vram_mib if self._state != LifecycleState.UNLOADED else 0
+        return HealthReport(state=self._state, vram_mib=vram)
 
     def version(self) -> str:
-        return "test-1"
+        return "fake-1"
 
     def capabilities(self) -> Capabilities:
-        return Capabilities(model_key=self.key, kind="vision", vram_mib=self.vram_mib)
-
-
-def build() -> tuple[ModelRegistry, ResidentSet, dict[str, RecordingRuntime]]:
-    registry = ModelRegistry()
-    runtimes = {
-        "detector": RecordingRuntime("detector", 900),
-        "vlm": RecordingRuntime("vlm", 4400),
-    }
-    registry.register(
-        ModelSpec(model_key="detector", vram_mib=900, priority=10, idle_unload_seconds=None),
-        runtimes["detector"],
-    )
-    registry.register(
-        ModelSpec(model_key="vlm", vram_mib=4400, priority=5, idle_unload_seconds=600.0),
-        runtimes["vlm"],
-    )
-    return registry, ResidentSet(registry, total_mib=8192, reserved_mib=2048), runtimes
-
-
-class TestEnsure:
-    async def test_it_loads_a_required_model_and_marks_it_loaded(self) -> None:
-        registry, residents, runtimes = build()
-
-        await residents.ensure(("detector",), now=0.0)
-
-        assert runtimes["detector"].initialized == 1
-        assert registry.state("detector") is LifecycleState.LOADED
-        assert residents.resident() == frozenset({"detector"})
-
-    async def test_it_does_not_reload_an_already_resident_model(self) -> None:
-        _registry, residents, runtimes = build()
-
-        await residents.ensure(("detector",), now=0.0)
-        await residents.ensure(("detector",), now=1.0)
-
-        assert runtimes["detector"].initialized == 1
-
-
-class TestIdleSweep:
-    async def test_it_unloads_a_model_past_its_idle_window(self) -> None:
-        registry, residents, runtimes = build()
-        await residents.ensure(("detector", "vlm"), now=0.0)
-
-        await residents.sweep_idle(now=601.0)
-
-        assert runtimes["vlm"].shutdowns == 1
-        assert registry.state("vlm") is LifecycleState.UNLOADED
-        assert "detector" in residents.resident(), "idle_unload_seconds=None must never evict"
-
-    async def test_it_keeps_a_model_inside_its_idle_window(self) -> None:
-        _registry, residents, runtimes = build()
-        await residents.ensure(("detector", "vlm"), now=0.0)
-
-        await residents.sweep_idle(now=599.0)
-
-        assert runtimes["vlm"].shutdowns == 0
+        return Capabilities(model_key=self._model_key, kind=self._kind, vram_mib=self._vram_mib)
 ```
 
-```python
-# ai-engine/tests/orchestrator/test_service.py
-"""Tests for EngineService (Task 7)."""
+- [ ] **Step 2: Run it to confirm the fake type-checks**
 
+Run: `cd ai-engine && . .venv/bin/activate && mypy tests/fakes`
+Expected: `Success`.
+
+- [ ] **Step 3: Write the failing test for `ModelRegistry`**
+
+```python
+# ai-engine/tests/orchestrator/test_registry.py
 from __future__ import annotations
 
 import pytest
 
-from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError
+from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
+from sentinel_ai.ports.model_runtime import LifecycleState
+from tests.fakes.models import FakeModelRuntime
+
+DETECTOR_SPEC = ModelSpec(
+    model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None
+)
+VLM_SPEC = ModelSpec(
+    model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0
+)
 
 
-class TestUnknownCamera:
-    async def test_telemetry_for_an_unknown_camera_raises(self) -> None:
-        service = EngineService(runners={}, resident_set=None, scheduler=None, registry=None)  # type: ignore[arg-type]
-        with pytest.raises(UnknownCameraError, match="cam-missing"):
-            service.telemetry("cam-missing")
+def test_register_and_get_round_trip() -> None:
+    registry = ModelRegistry()
+    runtime = FakeModelRuntime("yolo11s")
+    registry.register(DETECTOR_SPEC, runtime)
+    assert registry.get("yolo11s") is runtime
+    assert registry.specs() == (DETECTOR_SPEC,)
 
-    async def test_describe_now_for_an_unknown_camera_raises(self) -> None:
-        service = EngineService(runners={}, resident_set=None, scheduler=None, registry=None)  # type: ignore[arg-type]
-        with pytest.raises(UnknownCameraError, match="cam-missing"):
-            await service.describe_now("cam-missing")
+
+def test_get_of_an_unknown_key_raises() -> None:
+    registry = ModelRegistry()
+    with pytest.raises(KeyError, match="qwen25vl3b"):
+        registry.get("qwen25vl3b")
+
+
+async def test_state_reflects_the_runtimes_own_health() -> None:
+    registry = ModelRegistry()
+    runtime = FakeModelRuntime("yolo11s")
+    registry.register(DETECTOR_SPEC, runtime)
+    assert registry.state("yolo11s") == LifecycleState.UNLOADED
+    await runtime.initialize()
+    assert registry.state("yolo11s") == LifecycleState.LOADED
+
+
+async def test_health_aggregates_every_registered_runtime() -> None:
+    registry = ModelRegistry()
+    detector = FakeModelRuntime("yolo11s")
+    vlm = FakeModelRuntime("qwen25vl3b")
+    registry.register(DETECTOR_SPEC, detector)
+    registry.register(VLM_SPEC, vlm)
+    await detector.initialize()
+
+    health = registry.health()
+
+    assert set(health) == {"yolo11s", "qwen25vl3b"}
+    assert health["yolo11s"].state == LifecycleState.LOADED
+    assert health["qwen25vl3b"].state == LifecycleState.UNLOADED
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [ ] **Step 4: Run it to verify it fails**
 
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator -v`
-Expected: FAIL at collection — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator.admission'`.
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_registry.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator.registry'`
 
-- [ ] **Step 3a: Implement the registry**
+- [ ] **Step 5: Implement `ModelRegistry`**
 
 ```python
 # ai-engine/sentinel_ai/orchestrator/registry.py
-"""Model discovery and the eight §5 lifecycle states."""
+"""Model discovery and the eight §5 lifecycle states (spec §5.4).
+
+A thin lookup layer, deliberately: lifecycle truth lives in each runtime's own
+`health()` (spec §10), so the registry never keeps a second, driftable copy of it.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from sentinel_ai.domain.policy.vram_budget import ModelSpec
 from sentinel_ai.ports.model_runtime import HealthReport, LifecycleState, ModelRuntime
+
+__all__ = ["ModelRegistry", "ModelSpec"]
+# ModelSpec is re-exported so callers import one name from one place; it is the
+# domain type, not a copy (Reconciliation Log R2).
 
 
 class ModelRegistry:
     def __init__(self) -> None:
         self._specs: dict[str, ModelSpec] = {}
         self._runtimes: dict[str, ModelRuntime] = {}
-        self._states: dict[str, LifecycleState] = {}
 
     def register(self, spec: ModelSpec, runtime: ModelRuntime) -> None:
-        if spec.model_key in self._specs:
-            raise ValueError(f"model_key already registered: {spec.model_key}")
         self._specs[spec.model_key] = spec
         self._runtimes[spec.model_key] = runtime
-        self._states[spec.model_key] = LifecycleState.UNLOADED
 
     def get(self, key: str) -> ModelRuntime:
         try:
@@ -3946,34 +4452,135 @@ class ModelRegistry:
             raise KeyError(f"unknown model key: {key}") from None
 
     def state(self, key: str) -> LifecycleState:
-        return self._states[key]
+        return self.get(key).health().state
 
-    def set_state(self, key: str, state: LifecycleState) -> None:
-        self._states[key] = state
-
-    def specs(self) -> Mapping[str, ModelSpec]:
-        return dict(self._specs)
+    def specs(self) -> tuple[ModelSpec, ...]:
+        return tuple(self._specs.values())
 
     def health(self) -> dict[str, HealthReport]:
         return {key: runtime.health() for key, runtime in self._runtimes.items()}
 ```
 
-- [ ] **Step 3b: Implement the resident set**
+- [ ] **Step 6: Verify**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_registry.py -v`
+Expected: all PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add ai-engine/sentinel_ai/orchestrator/registry.py ai-engine/tests/orchestrator/test_registry.py ai-engine/tests/fakes/models.py
+git commit -m "feat(orchestrator): add ModelRegistry — discovery plus the eight spec §5 lifecycle states
+
+Lifecycle truth lives in each runtime's own health() so the registry never
+keeps a second, driftable copy of it."
+```
+
+- [ ] **Step 8: Write the failing test for `ResidentSet`**
+
+```python
+# ai-engine/tests/orchestrator/test_resident_set.py
+from __future__ import annotations
+
+from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
+from sentinel_ai.orchestrator.resident_set import ResidentSet
+from tests.fakes.models import FakeModelRuntime
+
+TOTAL_MIB = 8192
+RESERVED_MIB = 2048
+
+DETECTOR_SPEC = ModelSpec(
+    model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None
+)
+VLM_SPEC = ModelSpec(
+    model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0
+)
+
+
+def new_resident_set() -> tuple[ResidentSet, FakeModelRuntime, FakeModelRuntime]:
+    registry = ModelRegistry()
+    detector = FakeModelRuntime("yolo11s", vram_mib=900)
+    vlm = FakeModelRuntime("qwen25vl3b", vram_mib=4400)
+    registry.register(DETECTOR_SPEC, detector)
+    registry.register(VLM_SPEC, vlm)
+    return ResidentSet(registry, total_mib=TOTAL_MIB, reserved_mib=RESERVED_MIB), detector, vlm
+
+
+class TestEnsure:
+    async def test_a_required_model_is_loaded_and_warmed_up(self) -> None:
+        resident_set, detector, _vlm = new_resident_set()
+        await resident_set.ensure(("yolo11s",), now=0.0)
+        assert detector.initialize_calls == 1
+        assert detector.warmup_calls == 1
+        assert resident_set.resident() == frozenset({"yolo11s"})
+
+    async def test_an_already_resident_model_is_not_reloaded(self) -> None:
+        resident_set, detector, _vlm = new_resident_set()
+        await resident_set.ensure(("yolo11s",), now=0.0)
+        await resident_set.ensure(("yolo11s",), now=1.0)
+        assert detector.initialize_calls == 1
+
+    async def test_both_models_fit_the_budget_together(self) -> None:
+        resident_set, _detector, _vlm = new_resident_set()
+        await resident_set.ensure(("yolo11s", "qwen25vl3b"), now=0.0)
+        assert resident_set.resident() == frozenset({"yolo11s", "qwen25vl3b"})
+
+
+class TestSweepIdle:
+    async def test_the_vlm_is_unloaded_600s_after_its_last_ensure_call(self) -> None:
+        resident_set, _detector, vlm = new_resident_set()
+        await resident_set.ensure(("yolo11s", "qwen25vl3b"), now=0.0)
+        await resident_set.sweep_idle(now=599.0)
+        assert resident_set.resident() == frozenset({"yolo11s", "qwen25vl3b"})
+
+        await resident_set.sweep_idle(now=600.0)
+        assert resident_set.resident() == frozenset({"yolo11s"})
+        assert vlm.shutdown_calls == 1
+
+    async def test_the_detector_never_idle_evicts(self) -> None:
+        resident_set, detector, _vlm = new_resident_set()
+        await resident_set.ensure(("yolo11s",), now=0.0)
+        await resident_set.sweep_idle(now=10_000.0)
+        assert resident_set.resident() == frozenset({"yolo11s"})
+        assert detector.shutdown_calls == 0
+
+    async def test_re_ensuring_the_vlm_refreshes_its_idle_clock(self) -> None:
+        resident_set, _detector, vlm = new_resident_set()
+        await resident_set.ensure(("qwen25vl3b",), now=0.0)
+        await resident_set.ensure(("qwen25vl3b",), now=500.0)  # a fresh "use" before 600s
+        await resident_set.sweep_idle(now=1000.0)  # only 500s since the refresh
+        assert resident_set.resident() == frozenset({"qwen25vl3b"})
+        assert vlm.shutdown_calls == 0
+```
+
+- [ ] **Step 9: Run it to verify it fails**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_resident_set.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator.resident_set'`
+
+- [ ] **Step 10: Implement `ResidentSet`**
 
 ```python
 # ai-engine/sentinel_ai/orchestrator/resident_set.py
-"""Executes the pure residency plan (spec §4.3). The planning is domain logic;
-this module only performs the I/O the plan calls for."""
+"""Executes the Phase 1A `plan_residency()` output (spec §5.4): loads, unloads, and
+applies the 600s VLM idle-unload via `sweep_idle()`.
+
+`plan_residency()` is pure and takes the orchestrator's own bookkeeping (currently
+resident, last-used) as arguments — this class is that bookkeeping plus the I/O
+(`ModelRuntime.initialize`/`shutdown`) the plan calls for.
+
+Freshening a model's idle clock is just calling `ensure()` again with that key in
+`required`: `plan_residency` stamps `last_used_at` for every required key on every
+call, so a caller invoking a model (e.g. wrapping a `VisionLanguageModel.describe`
+call with `await resident_set.ensure((vlm_key,), now)` first) keeps it alive for as
+long as it is genuinely being used, and `sweep_idle` — `ensure` with nothing
+required — evicts it exactly `idle_unload_seconds` after the last such call.
+"""
 
 from __future__ import annotations
 
-import logging
-
-from sentinel_ai.domain.policy.vram_budget import plan_residency
+from sentinel_ai.domain.policy import vram_budget
 from sentinel_ai.orchestrator.registry import ModelRegistry
-from sentinel_ai.ports.model_runtime import LifecycleState
-
-logger = logging.getLogger(__name__)
 
 
 class ResidentSet:
@@ -3984,274 +4591,272 @@ class ResidentSet:
         self._resident: set[str] = set()
         self._last_used_at: dict[str, float] = {}
 
-    def resident(self) -> frozenset[str]:
-        return frozenset(self._resident)
-
-    def touch(self, key: str, now: float) -> None:
-        self._last_used_at[key] = now
-
     async def ensure(self, required: tuple[str, ...], now: float) -> None:
-        plan = plan_residency(
-            specs=self._registry.specs(),
-            currently_resident=sorted(self._resident),
+        """Apply plan_residency(): load required, evict what must go."""
+        specs = {
+            spec.model_key: vram_budget.ModelSpec(
+                model_key=spec.model_key,
+                vram_mib=spec.vram_mib,
+                priority=spec.priority,
+                idle_unload_seconds=spec.idle_unload_seconds,
+            )
+            for spec in self._registry.specs()
+        }
+        plan = vram_budget.plan_residency(
+            specs=specs,
+            currently_resident=tuple(self._resident),
             required=required,
             last_used_at=self._last_used_at,
             now=now,
             total_mib=self._total_mib,
             reserved_mib=self._reserved_mib,
         )
-        await self._apply(plan.unload, plan.load, now)
-
-    async def sweep_idle(self, now: float) -> None:
-        """Idle-unload with nothing required: plan_residency evicts what has aged out."""
-        plan = plan_residency(
-            specs=self._registry.specs(),
-            currently_resident=sorted(self._resident),
-            required=(),
-            last_used_at=self._last_used_at,
-            now=now,
-            total_mib=self._total_mib,
-            reserved_mib=self._reserved_mib,
-        )
-        await self._apply(plan.unload, plan.load, now)
-
-    async def _apply(
-        self, unload: tuple[str, ...], load: tuple[str, ...], now: float
-    ) -> None:
-        for key in unload:
-            runtime = self._registry.get(key)
-            await runtime.shutdown()
+        for key in plan.unload:
+            await self._registry.get(key).shutdown()
             self._resident.discard(key)
-            self._registry.set_state(key, LifecycleState.UNLOADED)
-            logger.info("unloaded model %s", key)
-
-        for key in load:
+        for key in plan.load:
             runtime = self._registry.get(key)
-            self._registry.set_state(key, LifecycleState.DOWNLOADING)
             await runtime.initialize()
             await runtime.warmup()
             self._resident.add(key)
+        for key in required:
             self._last_used_at[key] = now
-            self._registry.set_state(key, LifecycleState.LOADED)
-            logger.info("loaded model %s", key)
+
+    async def sweep_idle(self, now: float) -> None:
+        await self.ensure((), now)
+
+    def resident(self) -> frozenset[str]:
+        return frozenset(self._resident)
 ```
 
-- [ ] **Step 3c: Implement the admission gate**
+- [ ] **Step 11: Verify**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_resident_set.py -v && mypy`
+Expected: all PASS, mypy `Success`.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add ai-engine/sentinel_ai/orchestrator/resident_set.py ai-engine/tests/orchestrator/test_resident_set.py
+git commit -m "feat(orchestrator): add ResidentSet — executes plan_residency and the 600s VLM idle-unload"
+```
+
+- [ ] **Step 13: Write the S14 error-path tests against Task 6's `VlmScheduler`**
 
 ```python
-# ai-engine/sentinel_ai/orchestrator/admission.py
-"""Process-wide GPU admission.
+# ai-engine/tests/orchestrator/test_scheduler.py — append to the file Task 6 created
+async def test_a_vlm_timeout_still_publishes_an_event_flagged_unavailable() -> None:
+    scheduler, _vlm, publisher = new_scheduler(vlm=FakeVisionLLM(error=TimeoutError("vlm timed out")))
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request())
+        await scheduler.drain()
+    finally:
+        worker.cancel()
 
-Phase 1A's governors — token bucket, cooldown, signature dedup — are all per
-camera, but the GPU they protect is global. With one camera that is the same
-thing; with N cameras, N buckets can each legitimately permit a call and
-collectively saturate an 8 GB card. This is the seam that bounds the total.
-"""
+    assert len(publisher.events) == 1
+    event = publisher.events[0]
+    assert event.description_unavailable is True
+    assert "periodic_summary" in event.description
+    assert event.threat.value == pytest.approx(0.5)
 
+
+async def test_a_vlm_exception_other_than_timeout_also_still_publishes() -> None:
+    scheduler, _vlm, publisher = new_scheduler(vlm=FakeVisionLLM(error=RuntimeError("cuda oom")))
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request())
+        await scheduler.drain()
+    finally:
+        worker.cancel()
+
+    assert publisher.events[0].description_unavailable is True
+
+
+async def test_a_clip_finish_failure_still_publishes_with_clip_uri_none() -> None:
+    writer = FakeClipWriter(finish_error=OSError("minio unreachable"))
+    handle = await writer.open("cam-1", uuid4(), fps=10.0)
+    scheduler, _vlm, publisher = new_scheduler()
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request(clip=handle))
+        await scheduler.drain()
+    finally:
+        worker.cancel()
+
+    assert len(publisher.events) == 1
+    assert publisher.events[0].clip_uri is None
+    assert publisher.events[0].description_unavailable is False  # the VLM call itself succeeded
+
+
+async def test_admission_is_released_even_when_the_vlm_raises() -> None:
+    """The `finally` around `admission.release()` (S14 step 7) must run on every path,
+    not just the happy one — otherwise one failed escalation would permanently
+    starve every later one of its slot."""
+    admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+    scheduler = VlmScheduler(
+        vlm=FakeVisionLLM(error=RuntimeError("boom")),
+        publisher=FakePublisher(),
+        admission=admission,
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    worker = asyncio.create_task(scheduler.run())
+    try:
+        scheduler.submit(a_request())
+        await scheduler.drain()
+        assert admission.in_flight == 0
+
+        scheduler.submit(a_request())
+        await scheduler.drain()  # would hang forever if the first call never released
+        assert admission.in_flight == 0
+    finally:
+        worker.cancel()
+```
+
+- [ ] **Step 14: Verify**
+
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_scheduler.py -v`
+Expected: all PASS — Task 6's `_describe`/`_attach_clip` `except Exception` branches and the
+`try`/`finally` around `admission.release()` already implement every path these tests exercise.
+
+- [ ] **Step 15: Commit**
+
+```bash
+git add ai-engine/tests/orchestrator/test_scheduler.py
+git commit -m "test(orchestrator): cover the S14 error paths — VLM timeout, clip failure, admission release
+
+Spec §9's governing rule: an anomaly event is never lost to an infrastructure
+failure. These are first-class tests, not an afterthought."
+```
+
+- [ ] **Step 16: Write the failing test for `EngineService`**
+
+```python
+# ai-engine/tests/orchestrator/test_service.py
 from __future__ import annotations
 
 import asyncio
 
+import pytest
 
-class AdmissionGate:
-    def __init__(self, concurrency: int, min_interval_seconds: float) -> None:
-        if concurrency < 1:
-            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
-        if min_interval_seconds < 0.0:
-            raise ValueError(
-                f"min_interval_seconds must be >= 0, got {min_interval_seconds}"
-            )
-        self._semaphore = asyncio.Semaphore(concurrency)
-        self._min_interval = min_interval_seconds
-        self._last_started_at: float | None = None
-        self._in_flight = 0
-
-    @property
-    def in_flight(self) -> int:
-        return self._in_flight
-
-    async def acquire(self, now: float) -> None:
-        await self._semaphore.acquire()
-        while not self._interval_elapsed(now):
-            # The clock is injected, so a test advances it rather than waiting.
-            await asyncio.sleep(0)
-        self._last_started_at = now
-        self._in_flight += 1
-
-    def _interval_elapsed(self, now: float) -> bool:
-        if self._last_started_at is None:
-            return True
-        return now - self._last_started_at >= self._min_interval
-
-    def release(self, now: float) -> None:
-        self._in_flight = max(0, self._in_flight - 1)
-        self._semaphore.release()
-```
-
-- [ ] **Step 3d: Implement the scheduler and event assembly**
-
-Replace the Task 6 stub body in `ai-engine/sentinel_ai/orchestrator/scheduler.py`, keeping
-`EscalationRequest` exactly as it is:
-
-```python
-_MAX_DESCRIPTION_LABELS = 6
-
-
-def _metadata_description(request: EscalationRequest) -> str:
-    """A description built from the gate's own signals, for when the VLM cannot answer.
-
-    Spec §9: a VLM timeout still produces an event — flagged, never dropped.
-    Carries no model identity (spec §3.3), because there is no model involved.
-    """
-    labels = sorted({track.label for track in request.scene.tracks})[:_MAX_DESCRIPTION_LABELS]
-    seen = ", ".join(labels) if labels else "no tracked objects"
-    return f"{request.reason.value.replace('_', ' ')} on {request.camera_label}: {seen}."
-
-
-class VlmScheduler:
-    def __init__(
-        self,
-        vlm: VisionLanguageModel,
-        publisher: EventPublisher,
-        admission: AdmissionGate,
-        *,
-        maxsize: int,
-        timeout_seconds: float,
-        clock: Callable[[], float],
-    ) -> None:
-        self._vlm = vlm
-        self._publisher = publisher
-        self._admission = admission
-        self._timeout = timeout_seconds
-        self._clock = clock
-        self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
-        self._dropped = 0
-
-    @property
-    def dropped(self) -> int:
-        return self._dropped
-
-    def submit(self, request: EscalationRequest) -> bool:
-        """Non-blocking. A full queue is safe: the bucket and cooldown already
-        bound the arrival rate, so a drop means the GPU is genuinely saturated."""
-        try:
-            self._queue.put_nowait(request)
-        except asyncio.QueueFull:
-            self._dropped += 1
-            logger.warning("VLM queue full; dropped escalation for %s", request.camera_id)
-            return False
-        return True
-
-    async def run(self) -> None:
-        while True:
-            request = await self._queue.get()
-            try:
-                await self._handle(request)
-            finally:
-                self._queue.task_done()
-
-    async def drain(self) -> None:
-        """Process everything queued, then return. Tests only — run() is the real loop."""
-        while not self._queue.empty():
-            request = self._queue.get_nowait()
-            try:
-                await self._handle(request)
-            finally:
-                self._queue.task_done()
-
-    async def _handle(self, request: EscalationRequest) -> None:
-        """The S14 sequence. Every path here ends in a published event."""
-        now = self._clock()
-        await self._admission.acquire(now)
-        try:
-            description, unavailable = await self._describe(request)
-            clip_uri = await self._finish_clip(request)
-            event = Event(
-                event_id=request.event_id,
-                camera_id=request.camera_id,
-                occurred_at=request.scene.timestamp,
-                reason=request.reason,
-                threat=description_threat(description),
-                description=description.description,
-                suggested_action=description.suggested_action,
-                labels=tuple(sorted({t.label for t in request.scene.tracks})),
-                track_ids=tuple(t.track_id for t in request.scene.tracks),
-                clip_uri=clip_uri,
-                description_unavailable=unavailable,
-            )
-            await self._publisher.publish(event)
-        finally:
-            self._admission.release(self._clock())
-
-    async def _describe(self, request: EscalationRequest) -> tuple[SceneDescription, bool]:
-        vision_request = VisionRequest(
-            keyframe=request.keyframe,
-            scene=request.scene,
-            history=request.history,
-            camera_label=request.camera_label,
-            reason_detail=request.detail,
-        )
-        try:
-            async with asyncio.timeout(self._timeout):
-                return await self._vlm.describe(vision_request), False
-        except Exception as exc:  # noqa: BLE001 — spec §9: publish regardless of how the VLM fails
-            logger.warning(
-                "VLM unavailable for %s (%s); publishing metadata-only event",
-                request.camera_id,
-                exc,
-            )
-            return (
-                SceneDescription(
-                    description=_metadata_description(request),
-                    threat_value=0.3,
-                    suggested_action="Review the clip.",
-                ),
-                True,
-            )
-
-    async def _finish_clip(self, request: EscalationRequest) -> str | None:
-        if request.clip is None:
-            return None
-        try:
-            return await request.clip.finish()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("clip write failed for %s: %s", request.camera_id, exc)
-            return None
-
-
-def description_threat(description: SceneDescription) -> ThreatScore:
-    return ThreatScore.from_value(max(0.0, min(1.0, description.threat_value)))
-```
-
-Add the imports this needs to the top of `scheduler.py`:
-
-```python
-import asyncio
-import logging
-from collections.abc import Callable
-
-from sentinel_ai.domain.entities import Event, ThreatScore
+from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.orchestrator.admission import AdmissionGate
-from sentinel_ai.ports.event_publisher import EventPublisher
-from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
+from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
+from sentinel_ai.orchestrator.resident_set import ResidentSet
+from sentinel_ai.orchestrator.scheduler import VlmScheduler
+from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError
+from sentinel_ai.pipeline.runner import CameraRunner
+from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
+from sentinel_ai.adapters.sources.preroll import PreRollBuffer
+from tests.fakes.io import FakePublisher, FakeSource
+from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
-logger = logging.getLogger(__name__)
+DETECTOR_SPEC = ModelSpec(
+    model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None
+)
+VLM_SPEC = ModelSpec(
+    model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0
+)
+
+
+def clock() -> float:
+    return 0.0
+
+
+def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakePublisher]:
+    from sentinel_ai.config import Settings
+    from sentinel_ai.pipeline import runner as runner_module
+
+    monkeypatch.setattr(runner_module, "get_settings", lambda: Settings(clip_postroll_seconds=0.0))
+
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    publisher = FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=FakeVisionLLM(),
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    runner = CameraRunner(
+        camera_id="cam-1",
+        camera_label="Front Door",
+        source=FakeSource.constant("cam-1", count=1, fps=10.0),
+        detector=FakeDetector(script=[()]),
+        tracker=FakeTracker(),
+        motion=MotionAnalyzer(),
+        profile=CameraProfile(camera_id="cam-1"),
+        scheduler=scheduler,
+        clip_writer=None,
+        preroll=PreRollBuffer(preroll_seconds=3.0),
+        clock=clock,
+    )
+    service = EngineService(
+        cameras={"cam-1": runner},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=clock,
+    )
+    return service, publisher
+
+
+async def test_start_loads_the_required_models_and_runs_every_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _publisher = build_service(monkeypatch)
+    await service.start()
+    await asyncio.sleep(0)  # let the one-frame camera task run to completion
+    await service.stop()
+
+    assert service.health()["yolo11s"].state.value == "healthy"
+    telemetry = service.telemetry("cam-1")
+    assert telemetry.frames_seen == 1
+
+
+async def test_cameras_lists_every_configured_camera(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, _publisher = build_service(monkeypatch)
+    await service.start()
+    await service.stop()
+    assert {t.camera_id for t in service.cameras()} == {"cam-1"}
+
+
+async def test_telemetry_of_an_unknown_camera_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, _publisher = build_service(monkeypatch)
+    with pytest.raises(UnknownCameraError, match="cam-404"):
+        service.telemetry("cam-404")
+
+
+async def test_describe_now_of_an_unknown_camera_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, _publisher = build_service(monkeypatch)
+    with pytest.raises(UnknownCameraError, match="cam-404"):
+        await service.describe_now("cam-404")
 ```
 
-`ThreatScore.from_value` clamps into [0, 1] via `description_threat` before constructing,
-because a VLM is free to return 1.7 and `from_value` raises outside the range — a badly
-behaved model must not take down the publish path.
+- [ ] **Step 17: Run it to verify it fails**
 
-- [ ] **Step 3e: Implement the service**
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator/test_service.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'sentinel_ai.orchestrator.service'`
+
+- [ ] **Step 18: Implement `EngineService`**
 
 ```python
 # ai-engine/sentinel_ai/orchestrator/service.py
-"""The single entry point the API delegates to (spec §6.1)."""
+"""The single entry point the API delegates to (spec §5.4, §5.7)."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable, Mapping
 from uuid import UUID
 
 from sentinel_ai.orchestrator.registry import ModelRegistry
@@ -4262,26 +4867,33 @@ from sentinel_ai.ports.model_runtime import HealthReport
 
 
 class UnknownCameraError(KeyError):
-    """Raised for a camera id the engine does not know. The API maps this to 404."""
+    def __init__(self, camera_id: str) -> None:
+        super().__init__(f"unknown camera: {camera_id}")
+        self.camera_id = camera_id
 
 
 class EngineService:
     def __init__(
         self,
-        runners: dict[str, CameraRunner],
+        cameras: Mapping[str, CameraRunner],
+        registry: ModelRegistry,
         resident_set: ResidentSet,
         scheduler: VlmScheduler,
-        registry: ModelRegistry,
+        required_model_keys: tuple[str, ...],
+        clock: Callable[[], float],
     ) -> None:
-        self._runners = runners
+        self._cameras = dict(cameras)
+        self._registry = registry
         self._resident_set = resident_set
         self._scheduler = scheduler
-        self._registry = registry
+        self._required_model_keys = required_model_keys
+        self._clock = clock
         self._tasks: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
+        await self._resident_set.ensure(self._required_model_keys, self._clock())
         self._tasks.append(asyncio.create_task(self._scheduler.run()))
-        for runner in self._runners.values():
+        for runner in self._cameras.values():
             self._tasks.append(asyncio.create_task(runner.run()))
 
     async def stop(self) -> None:
@@ -4293,49 +4905,49 @@ class EngineService:
         self._tasks.clear()
 
     def cameras(self) -> tuple[CameraTelemetry, ...]:
-        return tuple(runner.telemetry() for runner in self._runners.values())
+        return tuple(runner.telemetry() for runner in self._cameras.values())
 
     def telemetry(self, camera_id: str) -> CameraTelemetry:
-        return self._runner(camera_id).telemetry()
+        return self._get_runner(camera_id).telemetry()
 
     def health(self) -> dict[str, HealthReport]:
         return self._registry.health()
 
     async def describe_now(self, camera_id: str) -> UUID:
-        return await self._runner(camera_id).describe_now()
+        return await self._get_runner(camera_id).describe_now()
 
-    def _runner(self, camera_id: str) -> CameraRunner:
+    def _get_runner(self, camera_id: str) -> CameraRunner:
         try:
-            return self._runners[camera_id]
+            return self._cameras[camera_id]
         except KeyError:
-            raise UnknownCameraError(f"unknown camera: {camera_id}") from None
+            raise UnknownCameraError(camera_id) from None
 ```
 
-- [ ] **Step 4: Run the tests**
+`start()` deliberately does not spin up a periodic idle-sweep loop calling
+`resident_set.sweep_idle()` on a real timer: doing so with `asyncio.sleep(interval)` would be
+untestable in CI without threading a fake clock all the way through the service, and every
+path that actually needs `sweep_idle()`'s behaviour is already covered where it is cheap to
+test precisely — `ResidentSet`'s own unit tests, with an injected `now`. A production
+deployment (Task 14, alongside `RtspSource`, outside this task's CI-green scope) wraps a
+running `EngineService` in a `while True: await asyncio.sleep(30); await
+resident_set.sweep_idle(time.monotonic())` loop and wraps the VLM passed into `VlmScheduler`
+so that each `describe()` call first does `await resident_set.ensure((vlm_key,), now)` —
+refreshing the VLM's idle clock exactly when it is genuinely used, so it survives for as long
+as escalations keep arriving and unloads 600s after the last one, per spec. Neither wrapper
+changes S9's or S10's fixed shape; both are composition Task 14 adds around them.
 
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest tests/orchestrator -v`
-Expected: all PASS.
+- [ ] **Step 19: Verify**
 
-Then the full gate:
-
-Run: `cd ai-engine && . .venv/bin/activate && python -m pytest -q -m "not gpu and not integration" -W error && ruff check . && ruff format --check . && mypy`
+Run: `cd ai-engine && . .venv/bin/activate && python -m pytest -q -m "not gpu and not integration" && ruff check . && ruff format --check . && mypy`
 Expected: all PASS, ruff clean, mypy `Success`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 20: Commit**
 
 ```bash
-git add ai-engine/sentinel_ai/orchestrator ai-engine/tests/orchestrator
-git commit -m "feat(orchestrator): add registry, resident set, admission gate and VLM scheduler
+git add ai-engine/sentinel_ai/orchestrator/service.py ai-engine/tests/orchestrator/test_service.py
+git commit -m "feat(orchestrator): add EngineService — the single entry point for start/stop/telemetry/health/describe_now
 
-The scheduler worker is the single place an Event is assembled, so spec §9's
-rule that an anomaly event is never lost to an infrastructure failure has
-exactly one place it can be got wrong: a VLM timeout publishes a flagged
-metadata-only event, a clip failure publishes with clip_uri=None, and the
-admission slot is released in a finally.
-
-AdmissionGate is new relative to spec §6.1's layout. Phase 1A's governors are
-per-camera but the GPU is global; with one camera these coincide, which is
-exactly why the seam is cheap to build now rather than retrofit in Phase 2."
+UnknownCameraError is defined here; the API layer (Task 10) maps it to 404."
 ```
 
 
