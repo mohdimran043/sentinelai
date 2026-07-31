@@ -13,7 +13,7 @@ from sentinel_ai.adapters.serialization.event_codec import (
     encode_event,
     validate_payload,
 )
-from sentinel_ai.domain.entities import EscalationReason, Event, ThreatScore
+from sentinel_ai.domain.entities import EscalationReason, Event, Severity, ThreatScore
 
 
 def make_event(**overrides: object) -> Event:
@@ -95,6 +95,19 @@ def test_invalid_payloads_are_rejected(mutation: dict[str, object]) -> None:
     payload = encode_event(make_event()) | mutation
     with pytest.raises(ValidationError):
         validate_payload(payload)
+
+
+def test_encoding_an_event_with_a_blank_camera_id_is_rejected() -> None:
+    """Nothing upstream enforces minLength: 1, so the codec is the last line."""
+    with pytest.raises(ValidationError, match="should be non-empty"):
+        encode_event(make_event(camera_id=""))
+
+
+def test_encoding_an_out_of_range_threat_score_is_rejected() -> None:
+    """ThreatScore constructed directly bypasses from_value's range check."""
+    bypassed = ThreatScore(value=5.0, severity=Severity.CRITICAL)
+    with pytest.raises(ValidationError, match="greater than the maximum"):
+        encode_event(make_event(threat=bypassed))
 
 
 def test_a_payload_missing_a_required_field_is_rejected() -> None:

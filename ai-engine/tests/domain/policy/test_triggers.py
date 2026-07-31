@@ -126,6 +126,15 @@ class TestSceneChange:
         ctx = context(scene_state=scene(), previous_signature=None, scene_delta_streak=100)
         assert scene_change(ctx).fired is False
 
+    def test_a_signature_of_a_different_length_never_fires(self) -> None:
+        """A resolution change makes the histograms incomparable, not different."""
+        ctx = context(
+            scene_state=scene(signature=(0.5, 0.25, 0.25)),
+            previous_signature=(1.0, 0.0),
+            scene_delta_streak=100,
+        )
+        assert scene_change(ctx).fired is False
+
 
 class TestDwellExceeded:
     def test_fires_once_the_anchor_is_older_than_the_dwell_window(self) -> None:

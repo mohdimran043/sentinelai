@@ -75,18 +75,21 @@ def _speed_threshold(profile: CameraProfile) -> float:
 
 
 def _next_streak(scene: SceneState, profile: CameraProfile, state: GateState) -> int:
-    delta = scene.signature_delta(state.previous_signature)
-    return state.scene_delta_streak + 1 if delta >= profile.scene_delta_threshold else 0
+    delta = scene.signature_delta_or_none(state.previous_signature)
+    # An incomparable delta (the bin count changed) makes a sustained-change
+    # streak meaningless, so the streak resets rather than extends.
+    if delta is None or delta < profile.scene_delta_threshold:
+        return 0
+    return state.scene_delta_streak + 1
 
 
 def _is_duplicate(scene: SceneState, state: GateState) -> bool:
     if state.last_escalated_signature is None:
         return False
-    try:
-        return scene.signature_delta(state.last_escalated_signature) < DEDUP_EPSILON
-    except ValueError:
-        # Signature length changed (resolution change) — not a duplicate.
-        return False
+    delta = scene.signature_delta_or_none(state.last_escalated_signature)
+    # Incomparable is not "unchanged": a resolution change must not be mistaken
+    # for a repeat of the scene we have already described.
+    return delta is not None and delta < DEDUP_EPSILON
 
 
 def _context(scene: SceneState, profile: CameraProfile, state: GateState) -> TriggerContext:

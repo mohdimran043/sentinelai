@@ -209,6 +209,45 @@ class TestSceneDeltaStreak:
         assert settled.state.scene_delta_streak == 0
 
 
+class TestSignatureLengthChange:
+    """An RTSP reconnect can renegotiate resolution mid-stream, and any change to
+    the signature extractor's bin count does the same. The histograms are then
+    incomparable — but that must degrade the gate, not kill the camera.
+    """
+
+    RESCALED_SIGNATURE = (0.5, 0.25, 0.25)
+
+    def test_a_longer_signature_does_not_crash_the_gate(self) -> None:
+        state = settled_state()
+        outcome = decide(scene(timestamp=1.0, signature=self.RESCALED_SIGNATURE), PROFILE, state)
+        assert outcome.state.previous_signature == self.RESCALED_SIGNATURE
+
+    def test_an_incomparable_signature_resets_the_scene_delta_streak(self) -> None:
+        """A changed bin count makes a sustained-change streak meaningless."""
+        state = settled_state()
+        changed = decide(scene(timestamp=1.0, signature=(0.0, 1.0)), PROFILE, state)
+        assert changed.state.scene_delta_streak == 1, "streak established"
+
+        rescaled = decide(
+            scene(timestamp=2.0, signature=self.RESCALED_SIGNATURE), PROFILE, changed.state
+        )
+        assert rescaled.state.scene_delta_streak == 0
+
+    def test_an_incomparable_signature_is_not_a_duplicate(self) -> None:
+        """Incomparable is not 'unchanged' — dedup must not swallow the escalation."""
+        outcome = decide(
+            scene(
+                timestamp=20.0,
+                tracks=(running_track(),),
+                signature=self.RESCALED_SIGNATURE,
+            ),
+            PROFILE,
+            settled_state(),
+        )
+        assert outcome.decision.should_escalate is True
+        assert outcome.decision.suppressed_by is None
+
+
 class TestForce:
     def test_a_user_request_escalates_regardless_of_budget(self) -> None:
         state = initial_state()

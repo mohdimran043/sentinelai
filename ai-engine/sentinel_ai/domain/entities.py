@@ -78,6 +78,20 @@ class SceneState:
             )
         return sum(abs(a - b) for a, b in zip(self.scene_signature, previous, strict=True)) / 2.0
 
+    def signature_delta_or_none(self, previous: tuple[float, ...] | None) -> float | None:
+        """`signature_delta`, returning None instead of raising when incomparable.
+
+        A mid-stream resolution change (an RTSP reconnect renegotiating), or any
+        change to the signature extractor's bin count, leaves two histograms
+        with different lengths. That is *not* the same as "no change": each
+        caller decides what an incomparable pair means for it, and none of them
+        may take the camera's pipeline down. `signature_delta` still raises, for
+        callers that genuinely want strictness.
+        """
+        if previous is not None and len(previous) != len(self.scene_signature):
+            return None
+        return self.signature_delta(previous)
+
     def tracks_of(self, labels: Collection[str]) -> Iterator[Track]:
         return (track for track in self.tracks if track.label in labels)
 

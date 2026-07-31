@@ -57,8 +57,10 @@ def new_salient_track(ctx: TriggerContext) -> TriggerOutcome:
 
 
 def scene_change(ctx: TriggerContext) -> TriggerOutcome:
-    delta = ctx.scene.signature_delta(ctx.previous_signature)
-    if delta < ctx.profile.scene_delta_threshold:
+    delta = ctx.scene.signature_delta_or_none(ctx.previous_signature)
+    # None means the histograms have different bin counts, so they are
+    # incomparable — which is not evidence of a changed scene.
+    if delta is None or delta < ctx.profile.scene_delta_threshold:
         return _NOT_FIRED
     if ctx.scene_delta_streak + 1 < ctx.profile.scene_delta_frames:
         return _NOT_FIRED

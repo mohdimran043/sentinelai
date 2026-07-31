@@ -39,7 +39,15 @@ def validate_payload(payload: Mapping[str, object]) -> None:
 
 
 def encode_event(event: Event) -> dict[str, object]:
-    return {
+    """Build the wire payload and validate it before it can leave the process.
+
+    Validating on the way *out* is the point: `Event` cannot enforce the schema
+    on its own (`camera_id=""` and a directly constructed out-of-range
+    `ThreatScore` both slip past it), and the Go consumer breaks on whatever we
+    publish. A 15-field Draft 2020-12 validate costs microseconds against at
+    most a few events per minute per camera.
+    """
+    payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "event_id": str(event.event_id),
         "camera_id": event.camera_id,
@@ -56,6 +64,8 @@ def encode_event(event: Event) -> dict[str, object]:
         "description_unavailable": event.description_unavailable,
         "metadata": dict(event.metadata),
     }
+    validate_payload(payload)
+    return payload
 
 
 def decode_event(payload: Mapping[str, object]) -> Event:
