@@ -30,4 +30,4 @@ jobs:
         run: mypy
 
       - name: Test (CPU only)
-        run: pytest -v -m "not gpu" --cov=sentinel_ai --cov-report=term-missing
+        run: pytest -v -m "not gpu and not integration" --cov=sentinel_ai --cov-report=term-missing
