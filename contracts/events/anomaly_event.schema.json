@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sentinelai.dev/contracts/events/anomaly_event.schema.json",
+  "title": "SentinelAI Anomaly Event",
+  "description": "Published by the AI Engine to the Web Platform. Carries no model identity (spec §3.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "camera_id",
+    "occurred_at",
+    "reason",
+    "threat_score",
+    "severity",
+    "description",
+    "suggested_action",
+    "labels",
+    "track_ids",
+    "description_unavailable",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "camera_id": { "type": "string", "minLength": 1 },
+    "occurred_at": { "type": "number" },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "new_salient_track",
+        "scene_change",
+        "dwell_exceeded",
+        "speed_anomaly",
+        "track_count_spike",
+        "periodic_summary",
+        "user_requested"
+      ]
+    },
+    "threat_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+    "severity": {
+      "type": "string",
+      "enum": ["info", "low", "medium", "high", "critical"]
+    },
+    "description": { "type": "string" },
+    "suggested_action": { "type": "string" },
+    "labels": { "type": "array", "items": { "type": "string" } },
+    "track_ids": { "type": "array", "items": { "type": "integer" } },
+    "keyframe_uri": { "type": ["string", "null"] },
+    "clip_uri": { "type": ["string", "null"] },
+    "description_unavailable": { "type": "boolean" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

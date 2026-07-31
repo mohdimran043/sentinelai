@@ -62,7 +62,15 @@ disallow_untyped_defs = true
 files = ["sentinel_ai"]
 
 [[tool.mypy.overrides]]
-module = ["ultralytics.*", "supervision.*", "av.*", "autoawq.*", "qwen_vl_utils.*", "minio.*"]
+module = [
+    "ultralytics.*",
+    "supervision.*",
+    "av.*",
+    "autoawq.*",
+    "qwen_vl_utils.*",
+    "minio.*",
+    "jsonschema.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
