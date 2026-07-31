@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from itertools import pairwise
+
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, EscalationReason, SceneState, Track
-from sentinel_ai.domain.policy.escalation import GateState, decide, force
+from sentinel_ai.domain.policy.escalation import GateOutcome, GateState, decide, force
 
 PROFILE = CameraProfile(camera_id="cam-1")
 QUIET_SIGNATURE = (1.0, 0.0)
@@ -102,19 +104,45 @@ class TestPriority:
 
 
 class TestBudgetGovernor:
-    def test_the_bucket_caps_escalations_under_sustained_pressure(self) -> None:
+    def test_the_governors_cap_escalations_under_sustained_pressure(self) -> None:
         """A chaotic scene must not be able to saturate the GPU (spec §4.1).
 
-        60 s at 10 fps where every single frame trips speed_anomaly. Signatures
-        alternate so dedup never suppresses — the budget is the only limiter.
-        Expect 7 VLM calls, not 600.
+        60 s at 10 fps where every single frame trips speed_anomaly, with
+        signatures alternating every frame. Expect 7 VLM calls, not 600.
+
+        Why 7 — and why the cooldown does not change it:
+
+        1. Only the bucket caps the *total*. It starts with `bucket_capacity`
+           = 2 tokens and gains one per `bucket_refill_seconds` = 10 s. The last
+           frame is at t = 59.9, so the supply over the window is
+           2 + 59.9/10 = 7.99 tokens, of which 7 whole ones can be spent.
+        2. Neither of the other two governors can *cancel* a call here, only
+           delay it by a frame. A trigger fires on all 600 frames, so a frame
+           the cooldown refuses is followed 100 ms later by another candidate;
+           and because the signature alternates, a frame dedup refuses is
+           followed 100 ms later by one it cannot refuse. So all 7 available
+           tokens really are spent, and the answer is exactly 7 rather than
+           fewer.
+        3. For (2) to hold the cooldown must be shorter than the refill
+           interval, which is why `cooldown_seconds` = 5 s against a 10 s
+           refill. After the opening burst the bucket alone paces the calls.
+
+        The delays in (2) are visible in the schedule — calls land at
+        t = 0.0, 5.1, 10.2, 20.1, 30.2, 40.1, 50.2 rather than on round
+        multiples — which is also why this test asserts a count and a minimum
+        gap rather than exact timestamps.
+
+        What the cooldown changes is the *spacing*. Before it existed this exact
+        scenario fired at t=0.0 and t=0.1: two VLM invocations 100 ms apart,
+        which the burst-2 bucket permits and a cooldown exists to prevent.
         """
         state = initial_state()
-        escalations = 0
+        fired_at: list[float] = []
         for tick in range(600):
+            now = tick * 0.1
             outcome = decide(
                 scene(
-                    timestamp=tick * 0.1,
+                    timestamp=now,
                     tracks=(running_track(),),
                     signature=alternating(tick),
                     frame_index=tick,
@@ -123,15 +151,27 @@ class TestBudgetGovernor:
                 state,
             )
             state = outcome.state
-            escalations += outcome.decision.should_escalate
-        assert escalations == 7
+            if outcome.decision.should_escalate:
+                fired_at.append(now)
+
+        assert len(fired_at) == 7
+        gaps = [later - earlier for earlier, later in pairwise(fired_at)]
+        assert min(gaps) >= PROFILE.cooldown_seconds, (
+            f"no two VLM calls may land inside the cooldown window; got {fired_at}"
+        )
 
     def test_a_denied_decision_records_the_budget_as_the_suppressor(self) -> None:
+        """Frames are spaced by exactly the cooldown so the bucket is the limiter.
+
+        At 5 s intervals the cooldown never suppresses, so the two starting
+        tokens are spent at t=0 and t=5; by t=10 refill has produced a third,
+        and at t=15 only 0.5 of a token has accrued — the budget is what denies.
+        """
         state = initial_state()
-        for tick in range(3):
+        for tick in range(4):
             outcome = decide(
                 scene(
-                    timestamp=float(tick),
+                    timestamp=tick * PROFILE.cooldown_seconds,
                     tracks=(running_track(),),
                     signature=alternating(tick),
                 ),
@@ -144,6 +184,74 @@ class TestBudgetGovernor:
         assert outcome.decision.reason is EscalationReason.SPEED_ANOMALY, (
             "the reason is still reported so telemetry can show what was suppressed"
         )
+
+
+class TestCooldownGovernor:
+    """The post-call cooldown — the second of spec §4.1's three governors.
+
+    Without it the burst-2 bucket permits two VLM invocations 100 ms apart,
+    which is exactly what a cooldown exists to prevent.
+    """
+
+    # settled_state() escalated on QUIET_SIGNATURE, so each frame below carries
+    # a signature far enough from the previously *escalated* one that dedup
+    # cannot be what suppresses it.
+    FIRST = (0.0, 1.0)
+    SECOND = (0.5, 0.5)
+
+    def _first_escalation(self) -> GateOutcome:
+        outcome = decide(
+            scene(timestamp=20.0, tracks=(running_track(),), signature=self.FIRST),
+            PROFILE,
+            settled_state(),
+        )
+        assert outcome.decision.should_escalate is True, "precondition"
+        assert outcome.state.last_escalation_at == 20.0
+        return outcome
+
+    def _resight(self, state: GateState, timestamp: float) -> GateOutcome:
+        return decide(
+            scene(timestamp=timestamp, tracks=(running_track(),), signature=self.SECOND),
+            PROFILE,
+            state,
+        )
+
+    def test_a_second_escalation_inside_the_window_is_suppressed(self) -> None:
+        first = self._first_escalation()
+        assert first.state.bucket.available >= 1.0, "the budget is not the limiter here"
+
+        second = self._resight(first.state, 20.0 + PROFILE.cooldown_seconds / 2.0)
+        assert second.decision.should_escalate is False
+        assert second.decision.suppressed_by == "cooldown"
+        assert second.decision.reason is EscalationReason.SPEED_ANOMALY, (
+            "the reason is still reported so telemetry can show what was suppressed"
+        )
+
+    def test_a_cooldown_suppressed_decision_does_not_spend_a_token(self) -> None:
+        first = self._first_escalation()
+        second = self._resight(first.state, 21.0)
+        assert second.state.bucket.available == first.state.bucket.available
+        assert second.state.last_escalation_at == 20.0, "the window is not restarted"
+
+    def test_an_escalation_at_the_end_of_the_window_is_allowed(self) -> None:
+        """The boundary is inclusive, matching the `>=` convention in triggers.py."""
+        first = self._first_escalation()
+        second = self._resight(first.state, 20.0 + PROFILE.cooldown_seconds)
+        assert second.decision.should_escalate is True
+        assert second.decision.suppressed_by is None
+
+    def test_an_escalation_after_the_window_is_allowed(self) -> None:
+        first = self._first_escalation()
+        second = self._resight(first.state, 20.0 + PROFILE.cooldown_seconds + 1.0)
+        assert second.decision.should_escalate is True
+
+    def test_a_user_request_is_not_rate_limited_by_the_cooldown(self) -> None:
+        """Spec §6: someone explicitly asking for a description always gets one."""
+        first = self._first_escalation()
+        forced = force(EscalationReason.USER_REQUESTED, first.state, now=20.1)
+        assert forced.decision.should_escalate is True
+        assert forced.decision.reason is EscalationReason.USER_REQUESTED
+        assert forced.state.last_escalation_at == 20.1
 
 
 class TestDeduplication:

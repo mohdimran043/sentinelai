@@ -18,7 +18,15 @@ def test_defaults_match_the_spec_table() -> None:
     assert profile.summary_interval_seconds == 45.0
     assert profile.bucket_capacity == 2
     assert profile.bucket_refill_seconds == 10.0
+    assert profile.cooldown_seconds == 5.0
     assert profile.vlm_enabled is True
+
+
+def test_the_cooldown_is_shorter_than_the_refill_interval() -> None:
+    """Otherwise the cooldown would dominate the bucket and `bucket_capacity`
+    would be dead configuration: the burst allowance could never be spent."""
+    profile = CameraProfile(camera_id="cam-1")
+    assert 0.0 < profile.cooldown_seconds < profile.bucket_refill_seconds
 
 
 def test_default_salient_classes_match_the_spec() -> None:
@@ -53,6 +61,8 @@ def test_default_salient_classes_match_the_spec() -> None:
         ("summary_interval_seconds", 0.0, "summary_interval_seconds"),
         ("bucket_capacity", 0, "bucket_capacity"),
         ("bucket_refill_seconds", 0.0, "bucket_refill_seconds"),
+        ("cooldown_seconds", 0.0, "cooldown_seconds"),
+        ("cooldown_seconds", -1.0, "cooldown_seconds"),
     ],
 )
 def test_invalid_values_are_rejected_at_construction(

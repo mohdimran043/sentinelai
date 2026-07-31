@@ -41,6 +41,19 @@ class CameraProfile:
     bucket_capacity: int = 2
     bucket_refill_seconds: float = 10.0
 
+    cooldown_seconds: float = 5.0
+    """Minimum spacing between VLM invocations (spec §4.1's second gate).
+
+    Deliberately shorter than `bucket_refill_seconds`: at or above it the
+    cooldown would dominate the bucket entirely and `bucket_capacity` would
+    become dead configuration, since the burst allowance that lets a genuinely
+    novel scene get a second look could never be spent. At half the refill
+    interval it caps the worst case at 2 calls in 5 s rather than 2 calls in
+    100 ms, while leaving the steady-state rate the bucket sets untouched. It
+    also comfortably exceeds a single VLM turnaround, so the next call is never
+    admitted before the previous description exists.
+    """
+
     vlm_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -58,6 +71,7 @@ class CameraProfile:
         self._require(self.summary_interval_seconds > 0.0, "summary_interval_seconds must be > 0")
         self._require(self.bucket_capacity >= 1, "bucket_capacity must be >= 1")
         self._require(self.bucket_refill_seconds > 0.0, "bucket_refill_seconds must be > 0")
+        self._require(self.cooldown_seconds > 0.0, "cooldown_seconds must be > 0")
 
     @staticmethod
     def _require(condition: bool, message: str) -> None:

@@ -7,11 +7,19 @@ the gate ever holding mutable state or reading a clock.
 Order of evaluation matters and is deliberate:
   1. vlm_enabled           — a disabled camera short-circuits everything
   2. triggers              — is anything worth looking at?
-  3. duplicate suppression — have we already described this exact scene?
-  4. rate budget           — can we afford it?
+  3. post-call cooldown    — is it simply too soon since the last call?
+  4. duplicate suppression — have we already described this exact scene?
+  5. rate budget           — can we afford it?
 
-Suppression at stages 3 and 4 still reports the trigger reason, so telemetry can
-show what the gate declined and why.
+Stages 3, 4 and 5 are spec §4.1's three governors. The bucket is deliberately
+last: it is the only stage that *consumes* anything, so neither the cooldown nor
+dedup may run after it and throw a spent token away. Cooldown precedes dedup
+because it is an unconditional temporal floor — inside the window nothing can
+escalate, whatever the scene looks like, so comparing signatures would be wasted
+work and would report the less actionable of the two reasons.
+
+Suppression at stages 3, 4 and 5 still reports the trigger reason, so telemetry
+can show what the gate declined and why.
 """
 
 from __future__ import annotations
@@ -83,6 +91,17 @@ def _next_streak(scene: SceneState, profile: CameraProfile, state: GateState) ->
     return state.scene_delta_streak + 1
 
 
+def _is_cooling_down(now: float, profile: CameraProfile, state: GateState) -> bool:
+    """Spec §4.1's post-call cooldown: a hard floor on VLM call spacing.
+
+    The boundary is inclusive-allowed — at exactly `cooldown_seconds` the window
+    is over — matching the `>=` convention the triggers use.
+    """
+    if state.last_escalation_at is None:
+        return False
+    return now - state.last_escalation_at < profile.cooldown_seconds
+
+
 def _is_duplicate(scene: SceneState, state: GateState) -> bool:
     if state.last_escalated_signature is None:
         return False
@@ -124,6 +143,21 @@ def decide(scene: SceneState, profile: CameraProfile, state: GateState) -> GateO
     fired = next((outcome for trigger in ALL_TRIGGERS if (outcome := trigger(ctx)).fired), None)
     if fired is None or fired.reason is None:
         return GateOutcome(decision=EscalationDecision(should_escalate=False), state=carried)
+
+    if _is_cooling_down(now, profile, state):
+        return GateOutcome(
+            decision=EscalationDecision(
+                should_escalate=False,
+                reason=fired.reason,
+                detail=fired.detail,
+                suppressed_by="cooldown",
+            ),
+            # The bucket is left exactly as it was: a decision the cooldown
+            # refused must not cost a token. (Leaving it un-refilled is not a
+            # loss either — `refilled` is a pure function of elapsed time, so
+            # advancing it later yields the same tokens.)
+            state=carried,
+        )
 
     if _is_duplicate(scene, state):
         return GateOutcome(
