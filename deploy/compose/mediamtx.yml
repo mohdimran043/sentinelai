@@ -1,0 +1,11 @@
+# deploy/compose/mediamtx.yml
+#
+# avenue_01 is a `source: publisher` path (spec §5): mediamtx does not pull this stream on
+# its own — an external client pushes it in over RTSP. The exact ffmpeg command that loops
+# a file into this path is documented in this task's own report; every camera in this slice,
+# real or looped file, arrives at RtspSource (Task 14) through the same rtsp:// URL, which is
+# the entire point of normalising every source through mediamtx.
+
+paths:
+  avenue_01:
+    source: publisher
