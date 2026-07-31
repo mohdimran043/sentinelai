@@ -25,3 +25,5 @@ clips/
 .DS_Store
 ai-engine/.venv/
 ai-engine/var/
+__pycache__/
+.pytest_cache/
