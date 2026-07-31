@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
 
+import numpy as np
+
 from sentinel_ai.domain.entities import Event
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.event_publisher import EventPublisher
@@ -27,13 +29,21 @@ class FakeSource(FrameSource):
 
     @staticmethod
     def make_frame(camera_id: str, frame_index: int, timestamp: float, value: int = 0) -> FrameData:
+        """A 4x4 BGR frame filled with `value`.
+
+        `pixels` is a real `numpy` array, not a list of lists: `MotionAnalyzer`
+        (the only stage that reads pixels) rejects anything else, so a fake that
+        handed out lists could never be fed through the real pipeline — which is
+        precisely what `CameraRunner`'s end-to-end tests do. Shaped (H, W, 3) to
+        match `av`'s `to_ndarray(format="bgr24")`.
+        """
         return FrameData(
             camera_id=camera_id,
             frame_index=frame_index,
             timestamp=timestamp,
             width=4,
             height=4,
-            pixels=[[value] * 4 for _ in range(4)],
+            pixels=np.full((4, 4, 3), value, dtype=np.uint8),
         )
 
     @staticmethod
@@ -99,19 +109,32 @@ class FakePublisher(EventPublisher):
 
 
 class FakeClipHandle(ClipHandle):
-    """Records every appended packet; `finish` and `abort` never raise."""
+    """Records every appended packet; `abort` never raises.
 
-    def __init__(self, camera_id: str, event_id: UUID) -> None:
+    `finish_error`, when set, makes `finish()` raise — spec §9 requires an event to
+    survive a clip-finalisation failure, and that path needs a handle that fails.
+    """
+
+    def __init__(
+        self,
+        camera_id: str,
+        event_id: UUID,
+        *,
+        finish_error: Exception | None = None,
+    ) -> None:
         self.camera_id = camera_id
         self.event_id = event_id
         self.packets: list[EncodedPacket] = []
         self.finished = False
         self.aborted = False
+        self._finish_error = finish_error
 
     async def append(self, packet: EncodedPacket) -> None:
         self.packets.append(packet)
 
     async def finish(self) -> str:
+        if self._finish_error is not None:
+            raise self._finish_error
         self.finished = True
         return f"s3://sentinel-clips/{self.camera_id}/{self.event_id}.mp4"
 
@@ -120,9 +143,12 @@ class FakeClipHandle(ClipHandle):
 
 
 class FakeClipWriter(ClipWriter):
-    def __init__(self) -> None:
+    """`finish_error`, when set, is attached to every handle this writer opens."""
+
+    def __init__(self, finish_error: Exception | None = None) -> None:
         self.opened: list[tuple[str, UUID, float]] = []
         self.handles: list[FakeClipHandle] = []
+        self._finish_error = finish_error
 
     async def open(self, camera_id: str, event_id: UUID, fps: float) -> FakeClipHandle:
         """Returns the concrete `FakeClipHandle`, not the abstract `ClipHandle`.
@@ -133,6 +159,6 @@ class FakeClipWriter(ClipWriter):
         typecheck without an `isinstance` narrowing at every call site.
         """
         self.opened.append((camera_id, event_id, fps))
-        handle = FakeClipHandle(camera_id, event_id)
+        handle = FakeClipHandle(camera_id, event_id, finish_error=self._finish_error)
         self.handles.append(handle)
         return handle
