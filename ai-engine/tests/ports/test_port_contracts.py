@@ -13,14 +13,14 @@ from sentinel_ai.domain.entities import (
     SceneState,
     ThreatScore,
 )
-from sentinel_ai.ports.clip_writer import ClipWriter
+from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.event_publisher import EventPublisher
-from sentinel_ai.ports.frame_source import FrameData, FrameSource
+from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 from sentinel_ai.ports.model_runtime import LifecycleState, ModelRuntime
 from sentinel_ai.ports.tracker import Tracker
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
-from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakePublisher, FakeSource
 from tests.fakes.models import FakeDetector, FakeTracker, FakeVisionLLM
 
 ALL_PORTS = [
@@ -31,6 +31,7 @@ ALL_PORTS = [
     FrameSource,
     EventPublisher,
     ClipWriter,
+    ClipHandle,
 ]
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
@@ -38,6 +39,18 @@ BOX = BBox(0.0, 0.0, 10.0, 10.0)
 
 def a_frame(frame_index: int = 0, timestamp: float = 0.0) -> FrameData:
     return FakeSource.make_frame("cam-1", frame_index, timestamp)
+
+
+def a_packet(
+    frame_index: int = 0, timestamp: float = 0.0, is_keyframe: bool = True
+) -> EncodedPacket:
+    return EncodedPacket(
+        camera_id="cam-1",
+        data=f"packet-{frame_index}".encode(),
+        pts=timestamp,
+        is_keyframe=is_keyframe,
+        codec="h264",
+    )
 
 
 def a_scene() -> SceneState:
@@ -106,6 +119,7 @@ def test_lifecycle_states_cover_all_eight_from_spec_section_5() -> None:
         (FakeSource, FrameSource),
         (FakePublisher, EventPublisher),
         (FakeClipWriter, ClipWriter),
+        (FakeClipHandle, ClipHandle),
     ],
     ids=lambda x: x.__name__,
 )
@@ -231,6 +245,22 @@ class TestFakeSource:
         await source.close()
         assert source.closed is True
 
+    async def test_it_yields_a_synthetic_packet_per_frame_when_none_are_given(self) -> None:
+        source = FakeSource.constant("cam-1", count=3, fps=10.0)
+        packets = [packet async for packet in source.packets()]
+        assert [p.pts for p in packets] == pytest.approx([0.0, 0.1, 0.2])
+        assert all(p.camera_id == "cam-1" for p in packets)
+        assert all(p.is_keyframe for p in packets), "every synthetic packet is a keyframe"
+
+    async def test_it_yields_explicit_packets_when_given(self) -> None:
+        frames = [FakeSource.make_frame("cam-1", i, i / 10.0) for i in range(2)]
+        packets = [a_packet(0, 0.0, is_keyframe=True), a_packet(1, 0.1, is_keyframe=False)]
+        source = FakeSource(frames, packets=packets)
+
+        collected = [packet async for packet in source.packets()]
+
+        assert collected == packets
+
 
 class TestFakePublisher:
     async def test_it_collects_published_events(self) -> None:
@@ -265,12 +295,50 @@ class TestFakePublisher:
 
 
 class TestFakeClipWriter:
-    async def test_it_returns_a_uri_and_records_the_frame_count(self) -> None:
+    async def test_open_records_the_call_and_returns_a_handle(self) -> None:
         writer = FakeClipWriter()
         event_id = uuid4()
-        frames = [a_frame(i, i / 10.0) for i in range(5)]
 
-        uri = await writer.write("cam-1", event_id, frames, fps=10.0)
+        handle = await writer.open("cam-1", event_id, fps=30.0)
+
+        assert writer.opened == [("cam-1", event_id, 30.0)]
+        assert isinstance(handle, FakeClipHandle)
+
+    async def test_append_records_every_packet_in_order(self) -> None:
+        writer = FakeClipWriter()
+        handle = await writer.open("cam-1", uuid4(), fps=30.0)
+        packets = [a_packet(i, i / 30.0) for i in range(3)]
+
+        for packet in packets:
+            await handle.append(packet)
+
+        assert handle.packets == packets
+
+    async def test_finish_returns_a_deterministic_uri(self) -> None:
+        writer = FakeClipWriter()
+        event_id = uuid4()
+        handle = await writer.open("cam-1", event_id, fps=30.0)
+
+        uri = await handle.finish()
 
         assert uri == f"s3://sentinel-clips/cam-1/{event_id}.mp4"
-        assert writer.calls == [("cam-1", event_id, 5)]
+        assert handle.finished is True
+
+    async def test_abort_cannot_raise_even_after_finish(self) -> None:
+        writer = FakeClipWriter()
+        handle = await writer.open("cam-1", uuid4(), fps=30.0)
+        await handle.finish()
+
+        await handle.abort()  # must not raise
+
+        assert handle.aborted is True
+
+    async def test_each_open_call_returns_an_independent_handle(self) -> None:
+        writer = FakeClipWriter()
+        first = await writer.open("cam-1", uuid4(), fps=30.0)
+        second = await writer.open("cam-1", uuid4(), fps=30.0)
+
+        await first.append(a_packet(0, 0.0))
+
+        assert first.packets != second.packets
+        assert len(writer.handles) == 2

@@ -6,14 +6,23 @@ from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
 
 from sentinel_ai.domain.entities import Event
-from sentinel_ai.ports.clip_writer import ClipWriter
+from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.event_publisher import EventPublisher
-from sentinel_ai.ports.frame_source import FrameData, FrameSource
+from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 
 
 class FakeSource(FrameSource):
-    def __init__(self, frames: Sequence[FrameData]) -> None:
+    def __init__(
+        self,
+        frames: Sequence[FrameData],
+        packets: Sequence[EncodedPacket] | None = None,
+    ) -> None:
         self._frames = list(frames)
+        self._packets = (
+            list(packets)
+            if packets is not None
+            else [self._synthetic_packet(frame) for frame in self._frames]
+        )
         self.closed = False
 
     @staticmethod
@@ -27,6 +36,21 @@ class FakeSource(FrameSource):
             pixels=[[value] * 4 for _ in range(4)],
         )
 
+    @staticmethod
+    def _synthetic_packet(frame: FrameData) -> EncodedPacket:
+        """A deterministic stand-in for an encoded packet, paired to `frame` by camera id
+        and pts. Always a keyframe: this fake exercises the clip *plumbing* (open/append/
+        finish wiring through the runner and scheduler), not GOP-quantised flush semantics
+        — that is Task 4's job, against real PyAV output.
+        """
+        return EncodedPacket(
+            camera_id=frame.camera_id,
+            data=f"packet-{frame.frame_index}".encode(),
+            pts=frame.timestamp,
+            is_keyframe=True,
+            codec="h264",
+        )
+
     @classmethod
     def constant(cls, camera_id: str, count: int, fps: float = 10.0, value: int = 0) -> FakeSource:
         return cls([cls.make_frame(camera_id, index, index / fps, value) for index in range(count)])
@@ -34,11 +58,10 @@ class FakeSource(FrameSource):
     def __aiter__(self) -> AsyncIterator[FrameData]:
         """Sync, matching the port and the async-iterator protocol.
 
-        `async for` calls `__aiter__()` without awaiting it, so the method must
-        return the iterator directly. Writing it as `async def` happened to work
-        only because an `async def` containing `yield` is an async *generator*
-        function — remove the yield and it breaks. The port's shape is the
-        correct one, so the fake follows it.
+        `async for` calls `__aiter__()` without awaiting it, so the method must return the
+        iterator directly. Writing it as `async def` happened to work only because an
+        `async def` containing `yield` is an async *generator* function — remove the yield
+        and it breaks. The port's shape is the correct one, so the fake follows it.
         """
 
         async def frames() -> AsyncIterator[FrameData]:
@@ -46,6 +69,15 @@ class FakeSource(FrameSource):
                 yield frame
 
         return frames()
+
+    def packets(self) -> AsyncIterator[EncodedPacket]:
+        """Sync for the same reason `__aiter__` is — see above."""
+
+        async def stream() -> AsyncIterator[EncodedPacket]:
+            for packet in self._packets:
+                yield packet
+
+        return stream()
 
     async def close(self) -> None:
         self.closed = True
@@ -66,12 +98,41 @@ class FakePublisher(EventPublisher):
         self.closed = True
 
 
+class FakeClipHandle(ClipHandle):
+    """Records every appended packet; `finish` and `abort` never raise."""
+
+    def __init__(self, camera_id: str, event_id: UUID) -> None:
+        self.camera_id = camera_id
+        self.event_id = event_id
+        self.packets: list[EncodedPacket] = []
+        self.finished = False
+        self.aborted = False
+
+    async def append(self, packet: EncodedPacket) -> None:
+        self.packets.append(packet)
+
+    async def finish(self) -> str:
+        self.finished = True
+        return f"s3://sentinel-clips/{self.camera_id}/{self.event_id}.mp4"
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+
 class FakeClipWriter(ClipWriter):
     def __init__(self) -> None:
-        self.calls: list[tuple[str, UUID, int]] = []
+        self.opened: list[tuple[str, UUID, float]] = []
+        self.handles: list[FakeClipHandle] = []
 
-    async def write(
-        self, camera_id: str, event_id: UUID, frames: Sequence[FrameData], fps: float
-    ) -> str:
-        self.calls.append((camera_id, event_id, len(frames)))
-        return f"s3://sentinel-clips/{camera_id}/{event_id}.mp4"
+    async def open(self, camera_id: str, event_id: UUID, fps: float) -> FakeClipHandle:
+        """Returns the concrete `FakeClipHandle`, not the abstract `ClipHandle`.
+
+        A covariant, Liskov-valid narrowing of the port's return type: callers coded against
+        `ClipWriter` still see a `ClipHandle`, but the tests in this suite that assert on
+        `.packets`/`.finished`/`.aborted` — attributes the port itself does not promise —
+        typecheck without an `isinstance` narrowing at every call site.
+        """
+        self.opened.append((camera_id, event_id, fps))
+        handle = FakeClipHandle(camera_id, event_id)
+        self.handles.append(handle)
+        return handle

@@ -41,6 +41,24 @@ class Settings(BaseSettings):
     minio_secure: bool = False
 
     clip_preroll_seconds: float = Field(default=3.0, ge=0)
+    clip_postroll_seconds: float = Field(default=5.0, gt=0)
+
+    detector_conf_threshold: float = Field(default=0.35, gt=0.0, lt=1.0)
+    detector_iou_threshold: float = Field(default=0.45, gt=0.0, lt=1.0)
+    detector_imgsz: int = Field(default=640, gt=0)
+
+    vlm_queue_maxsize: int = Field(default=4, ge=1)
+    vlm_timeout_seconds: float = Field(default=30.0, gt=0)
+    vlm_max_new_tokens: int = Field(default=256, gt=0)
+    vlm_global_concurrency: int = Field(default=1, ge=1)
+    vlm_global_min_interval_seconds: float = Field(default=2.0, ge=0)
+
+    detect_every_n_frames: int = Field(default=1, ge=1)
+    source_realtime: bool = True
+    rtsp_reconnect_initial_seconds: float = Field(default=1.0, gt=0)
+    rtsp_reconnect_max_seconds: float = Field(default=30.0, gt=0)
+
+    clip_temp_dir: str = "./var/clips"
 
 
 @lru_cache(maxsize=1)
