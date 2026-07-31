@@ -69,7 +69,8 @@ def test_invalid_values_are_rejected_at_construction(
     field_name: str, bad_value: object, message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        CameraProfile(camera_id="cam-1", **{field_name: bad_value})
+        # The field name is parametrised, so its value type cannot be static.
+        CameraProfile(camera_id="cam-1", **{field_name: bad_value})  # type: ignore[arg-type]
 
 
 def test_profile_is_immutable() -> None:

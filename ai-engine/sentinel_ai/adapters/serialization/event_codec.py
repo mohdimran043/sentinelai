@@ -1,4 +1,3 @@
-# ai-engine/sentinel_ai/adapters/serialization/event_codec.py
 """Event ⇄ wire-payload translation, validated against the committed JSON Schema.
 
 Lives in adapters, not domain: it depends on jsonschema and on file layout.

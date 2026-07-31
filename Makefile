@@ -1,4 +1,4 @@
-.PHONY: help install lint format typecheck test test-gpu check up down logs
+.PHONY: help install install-runtime install-gpu lint format typecheck test test-gpu check
 
 VENV := ai-engine/.venv/bin
 
@@ -31,11 +31,7 @@ test-gpu:
 
 check: lint typecheck test
 
-up:
-	docker compose -f deploy/compose/docker-compose.core.yml --profile core up -d
-
-down:
-	docker compose -f deploy/compose/docker-compose.core.yml --profile core down
-
-logs:
-	docker compose -f deploy/compose/docker-compose.core.yml logs -f
+# `up` / `down` / `logs` are deliberately absent: they referenced
+# deploy/compose/docker-compose.core.yml, which does not exist yet, so `make
+# help` advertised three targets that could only fail. The compose file lands in
+# Phase 1B; the targets come back with it.

@@ -31,9 +31,21 @@ class FakeSource(FrameSource):
     def constant(cls, camera_id: str, count: int, fps: float = 10.0, value: int = 0) -> FakeSource:
         return cls([cls.make_frame(camera_id, index, index / fps, value) for index in range(count)])
 
-    async def __aiter__(self) -> AsyncIterator[FrameData]:
-        for frame in self._frames:
-            yield frame
+    def __aiter__(self) -> AsyncIterator[FrameData]:
+        """Sync, matching the port and the async-iterator protocol.
+
+        `async for` calls `__aiter__()` without awaiting it, so the method must
+        return the iterator directly. Writing it as `async def` happened to work
+        only because an `async def` containing `yield` is an async *generator*
+        function — remove the yield and it breaks. The port's shape is the
+        correct one, so the fake follows it.
+        """
+
+        async def frames() -> AsyncIterator[FrameData]:
+            for frame in self._frames:
+                yield frame
+
+        return frames()
 
     async def close(self) -> None:
         self.closed = True

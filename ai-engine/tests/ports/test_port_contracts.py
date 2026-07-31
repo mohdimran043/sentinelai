@@ -16,7 +16,7 @@ from sentinel_ai.domain.entities import (
 from sentinel_ai.ports.clip_writer import ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.event_publisher import EventPublisher
-from sentinel_ai.ports.frame_source import FrameSource
+from sentinel_ai.ports.frame_source import FrameData, FrameSource
 from sentinel_ai.ports.model_runtime import LifecycleState, ModelRuntime
 from sentinel_ai.ports.tracker import Tracker
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
@@ -36,7 +36,7 @@ ALL_PORTS = [
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
 
 
-def a_frame(frame_index: int = 0, timestamp: float = 0.0):
+def a_frame(frame_index: int = 0, timestamp: float = 0.0) -> FrameData:
     return FakeSource.make_frame("cam-1", frame_index, timestamp)
 
 
@@ -66,7 +66,7 @@ def a_vision_request() -> VisionRequest:
 def test_every_port_is_abstract_and_cannot_be_instantiated(port: type) -> None:
     assert inspect.isabstract(port), f"{port.__name__} has no abstract methods"
     with pytest.raises(TypeError):
-        port()  # type: ignore[call-arg,abstract]
+        port()
 
 
 def test_model_runtime_exposes_the_seven_spec_section_10_methods() -> None:

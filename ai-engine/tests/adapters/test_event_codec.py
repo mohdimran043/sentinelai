@@ -1,4 +1,3 @@
-# ai-engine/tests/adapters/test_event_codec.py
 from __future__ import annotations
 
 import json
