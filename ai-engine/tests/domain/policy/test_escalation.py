@@ -130,9 +130,9 @@ class TestBudgetGovernor:
             state = outcome.state
         assert outcome.decision.should_escalate is False
         assert outcome.decision.suppressed_by == "rate_budget"
-        assert (
-            outcome.decision.reason is EscalationReason.SPEED_ANOMALY
-        ), "the reason is still reported so telemetry can show what was suppressed"
+        assert outcome.decision.reason is EscalationReason.SPEED_ANOMALY, (
+            "the reason is still reported so telemetry can show what was suppressed"
+        )
 
 
 class TestDeduplication:

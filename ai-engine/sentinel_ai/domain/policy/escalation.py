@@ -149,9 +149,7 @@ def decide(scene: SceneState, profile: CameraProfile, state: GateState) -> GateO
         now if fired.reason is EscalationReason.PERIODIC_SUMMARY else carried.last_summary_at
     )
     return GateOutcome(
-        decision=EscalationDecision(
-            should_escalate=True, reason=fired.reason, detail=fired.detail
-        ),
+        decision=EscalationDecision(should_escalate=True, reason=fired.reason, detail=fired.detail),
         state=replace(
             carried,
             bucket=bucket,
