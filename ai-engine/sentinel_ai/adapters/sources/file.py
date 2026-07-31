@@ -47,7 +47,13 @@ class FileSource(FrameSource):
     blocks the pump. See the design note in the plan for why they differ.
     """
 
-    def __init__(self, path: str, camera_id: str, realtime: bool) -> None:
+    def __init__(
+        self,
+        path: str,
+        camera_id: str,
+        realtime: bool,
+        packet_queue_maxsize: int = _PACKET_QUEUE_MAXSIZE,
+    ) -> None:
         self._path = path
         self._camera_id = camera_id
         self._realtime = realtime
@@ -55,7 +61,7 @@ class FileSource(FrameSource):
             maxsize=_FRAME_QUEUE_MAXSIZE
         )
         self._packet_queue: queue.Queue[EncodedPacket | _QueueEnd] = queue.Queue(
-            maxsize=_PACKET_QUEUE_MAXSIZE
+            maxsize=packet_queue_maxsize
         )
         self._stop = threading.Event()
         self._pump_started = False
@@ -83,6 +89,39 @@ class FileSource(FrameSource):
                 continue
         return False
 
+    def _decode_and_emit(
+        self,
+        packet: av.Packet[av.VideoStream],
+        frame_index: int,
+        pts_seconds: float,
+        rate: float,
+        start_wall: float,
+    ) -> int:
+        """Decode `packet` and push each resulting frame to the frame queue.
+
+        Returns the next `frame_index`, or `-1` if `close()` won the race and the pump
+        should stop.
+        """
+        for frame in packet.decode():
+            if self._realtime and rate > 0:
+                due = start_wall + frame_index / rate
+                delay = due - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            pixels = frame.to_ndarray(format="bgr24")
+            frame_data = FrameData(
+                camera_id=self._camera_id,
+                frame_index=frame_index,
+                timestamp=pts_seconds,
+                width=pixels.shape[1],
+                height=pixels.shape[0],
+                pixels=pixels,
+            )
+            if not self._put_frame_blocking(frame_data):
+                return -1
+            frame_index += 1
+        return frame_index
+
     def _pump(self) -> None:
         try:
             container = av.open(self._path)
@@ -94,12 +133,25 @@ class FileSource(FrameSource):
                 rate = float(stream.average_rate) if stream.average_rate else 0.0
                 first_pts: int | None = None
                 frame_index = 0
+                pts_seconds = 0.0
                 start_wall = time.monotonic()
                 for packet in container.demux(stream):
                     if self._stop.is_set():
                         return
                     if packet.pts is None:
-                        continue  # the trailing flush packet carries no timing
+                        # PyAV's synthetic end-of-stream flush packet. It carries no real
+                        # payload for the clip path, so it is never pushed onto the packet
+                        # queue, but `.decode()` must still be called on it: on any stream
+                        # with B-frames or reference reordering, this is what flushes the
+                        # frames the decoder is still holding for reorder. Skipping decode
+                        # here (as opposed to just skipping the packet-queue push) silently
+                        # drops the tail of the stream.
+                        frame_index = self._decode_and_emit(
+                            packet, frame_index, pts_seconds, rate, start_wall
+                        )
+                        if frame_index < 0:
+                            return
+                        continue
                     if first_pts is None:
                         first_pts = packet.pts
                     pts_seconds = float((packet.pts - first_pts) * time_base)
@@ -115,24 +167,11 @@ class FileSource(FrameSource):
                         ),
                     )
 
-                    for frame in packet.decode():
-                        if self._realtime and rate > 0:
-                            due = start_wall + frame_index / rate
-                            delay = due - time.monotonic()
-                            if delay > 0:
-                                time.sleep(delay)
-                        pixels = frame.to_ndarray(format="bgr24")
-                        frame_data = FrameData(
-                            camera_id=self._camera_id,
-                            frame_index=frame_index,
-                            timestamp=pts_seconds,
-                            width=pixels.shape[1],
-                            height=pixels.shape[0],
-                            pixels=pixels,
-                        )
-                        if not self._put_frame_blocking(frame_data):
-                            return
-                        frame_index += 1
+                    frame_index = self._decode_and_emit(
+                        packet, frame_index, pts_seconds, rate, start_wall
+                    )
+                    if frame_index < 0:
+                        return
             finally:
                 container.close()
         except Exception as exc:

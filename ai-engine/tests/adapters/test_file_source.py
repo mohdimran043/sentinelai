@@ -12,6 +12,7 @@ from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.ports.frame_source import EncodedPacket
 
 ASSET = str(Path(__file__).resolve().parents[1] / "assets" / "synthetic_clip.mp4")
+ASSET_BFRAMES = str(Path(__file__).resolve().parents[1] / "assets" / "synthetic_clip_bframes.mp4")
 
 
 async def _drain(source: FileSource) -> None:
@@ -73,9 +74,47 @@ async def test_concurrent_drain_of_both_streams_agrees_on_counts() -> None:
     await source.close()
 
 
+async def test_decodes_every_frame_from_a_stream_with_b_frames() -> None:
+    """A pts-less flush packet at end-of-stream still holds buffered frames.
+
+    `synthetic_clip_bframes.mp4` is encoded with `-profile:v main -bf 3`, so the decoder
+    reorders and holds frames for reference; PyAV's synthetic end-of-stream packet (pts is
+    None) is what flushes them. A loop that skips `.decode()` on that packet drops the tail
+    of the clip -- 48 of 50 frames here -- even though it passes against the committed
+    baseline-profile fixture, which forbids B-frames by construction and so never triggers
+    this path.
+    """
+    source = FileSource(ASSET_BFRAMES, camera_id="cam-1", realtime=False)
+    frames = [f async for f in source]
+    assert [f.frame_index for f in frames] == list(range(50))
+    await source.close()
+
+
 async def test_only_iterating_frames_never_touching_packets_does_not_deadlock() -> None:
     """The literal crux case: packets() is never even called."""
     source = FileSource(ASSET, camera_id="cam-1", realtime=False)
+
+    async def collect_frames() -> int:
+        return len([f async for f in source])
+
+    frames_count = await asyncio.wait_for(collect_frames(), timeout=5.0)
+    assert frames_count == 50
+    await source.close()
+
+
+async def test_never_touching_packets_overflows_a_small_packet_queue_without_stalling() -> None:
+    """The crux case, made to actually bite: a packet queue small enough that the
+
+    fixture's 50 packets overflow it well before end of stream. `packets()` is never
+    called, so the only way the pump can still deliver every frame is if the packet
+    queue drops its oldest entry non-blockingly rather than blocking the shared pump.
+
+    `test_only_iterating_frames_never_touching_packets_does_not_deadlock` exercises the
+    same shape against the default maxsize of 256, but the fixture only ever produces 50
+    packets, so that queue never fills -- it would pass identically against a queue that
+    blocks instead of dropping. This test drives the queue past capacity for real.
+    """
+    source = FileSource(ASSET, camera_id="cam-1", realtime=False, packet_queue_maxsize=4)
 
     async def collect_frames() -> int:
         return len([f async for f in source])
