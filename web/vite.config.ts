@@ -22,6 +22,19 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/engine/, ''),
       },
+      // The recorder appliance (`sentinel-ingest`, a DIFFERENT product from the
+      // AI engine) likewise sends no CORS headers for this origin. Same fix,
+      // separate prefix so the two products never share a path namespace:
+      // `/recorder/api/alerts` -> `http://127.0.0.1:8080/api/alerts`.
+      //
+      // DEPLOYMENT: dev-only, exactly like `/engine` above. Production needs
+      // CORS on the recorder, a reverse proxy in front of both, or this console
+      // served from the recorder itself. See src/recorder/config.ts.
+      '/recorder': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/recorder/, ''),
+      },
     },
   },
   test: {
@@ -29,5 +42,8 @@ export default defineConfig({
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     css: true,
+    // Timestamps render in the operator's local zone. Pin the zone so an
+    // assertion on a formatted `at_ns` does not depend on where CI runs.
+    env: { TZ: 'UTC' },
   },
 })

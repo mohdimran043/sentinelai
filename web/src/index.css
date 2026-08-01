@@ -119,6 +119,43 @@
     color: var(--color-signal);
     font-size: 12.5px;
   }
+
+  /*
+   * Table styling copied from the reference build's global `table/th/td` rules.
+   * Scoped to a class rather than the bare element so it is opt-in, but the
+   * values are the reference's own: 12.5px body, mono uppercase headers with
+   * 0.12em tracking, a stronger rule under the head and a hairline between rows.
+   */
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+
+  .data-table th {
+    text-align: left;
+    padding: 7px 9px;
+    border-bottom: 1px solid var(--color-line-2);
+    font: 500 10.5px/1.4 var(--font-mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--color-dimmer);
+  }
+
+  .data-table td {
+    padding: 8px 9px;
+    border-bottom: 1px solid #141c22;
+    vertical-align: top;
+  }
+
+  .data-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  /* Wide tables scroll inside their panel instead of scrolling the page sideways. */
+  .table-scroll {
+    overflow-x: auto;
+  }
 }
 
 /* Motion is reserved for state transitions, so both animations are gated behind
