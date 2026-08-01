@@ -161,8 +161,9 @@ GPU box with real core services — not just documented:
    RabbitMQ → MinIO, started with `uvicorn sentinel_ai.main:app`. It used to
    need a bespoke script because there was no composition root; it no longer
    does. Full details of the original run, and the two real bugs it found
-   (and fixed), are in `.superpowers/sdd/task-14-report.md`; the run through
-   the composition root is in `.superpowers/sdd/phase1b-important-fix-report.md`.
+   (and fixed) were recorded during development. Those working notes live in
+   `.superpowers/sdd/`, which is **gitignored** — they are not in a fresh clone.
+   What survives of them is in `docs/decisions.md`, which is the durable record.
    The short version:
 
 ### 1. Fetch the clip once

@@ -61,7 +61,8 @@ nor a `cameras.json` present.
 | `GET /cameras` | `CameraStatus` for every camera |
 | `GET /cameras/{id}/telemetry` | One camera's counters. 404 if unknown |
 | `POST /cameras/{id}/describe` | Forces a `user_requested` escalation, returns `event_id` |
-| `GET /cameras/{id}/events` | Recent events for one camera. **Landing as this is written** — check `contracts/openapi/ai-engine.yaml` for the shipped shape |
+| `GET /cameras/{id}/events` | A bounded ring of that camera's recent events, capped at 200, plus `latest` and `latest_description_state` (`none`/`available`/`unavailable`). Volatile — this is the console's view, not the event store. RabbitMQ plus the Go consumer is the durable record. 404 if unknown |
+| `GET /events/stream` | `text/event-stream`. Opens with `event: backlog` carrying a JSON array, then streams live events. A sequence watermark makes the backlog-to-live handover gapless and duplicate-free; the same `event_id` at a higher sequence is a legitimate new version, not a repeat — that is how a clip URI back-fills onto an event a client already displayed. The ring is bounded, so a long disconnect genuinely loses history |
 
 Telemetry counters: `frames_seen`, `frames_dropped`, `detections_run`,
 `escalations`, `escalations_dropped`, `discontinuities`, `last_frame_at`,
