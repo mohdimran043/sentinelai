@@ -470,11 +470,26 @@ class CameraRunner:
 
         async with self._clip_lock:
             if self._active_clip is None:
-                handle = await self._clip_writer.open(
-                    self._camera_id, event_id, self._estimated_fps()
-                )
-                for packet in self._preroll.flush():
-                    await handle.append(packet)
+                try:
+                    handle = await self._clip_writer.open(
+                        self._camera_id, event_id, self._estimated_fps()
+                    )
+                    for packet in self._preroll.flush():
+                        await handle.append(packet)
+                except Exception:
+                    # Opening or seeding a clip is I/O — MinIO's bucket check, a PyAV
+                    # muxer, a temp file. Any of it can fail, and none of it may cost
+                    # the event (spec §9) or the camera: this runs on the frame loop,
+                    # so an escaping exception ends `run()` and the camera with it.
+                    logger.warning(
+                        "could not start a clip for camera %s event %s; publishing "
+                        "the event without one",
+                        self._camera_id,
+                        event_id,
+                        exc_info=True,
+                    )
+                    self._submit(request_with(None))
+                    return event_id
                 self._active_clip = _ActiveClip(
                     handle=handle,
                     deadline=now + self._clip_postroll_seconds,
@@ -497,16 +512,43 @@ class CameraRunner:
         The lock is held across `append`, so a live packet arriving mid-pre-roll-flush
         (itself inside the same lock, in `_escalate`) waits rather than racing ahead of
         older, still-buffered packets: the clip stays pts-ordered without a second queue.
+
+        A failure while writing *one* packet into a clip abandons that clip and nothing
+        else. Letting it out of this coroutine kills the packet loop, and killing the
+        packet loop silently kills the whole camera: `run()` is still awaiting the frame
+        loop and never observes the dead task, while the source's packet queue — which
+        the demux thread pushes into with a blocking put — fills and stops the demux,
+        so frames stop too. The camera then reports a frozen `frames_seen` and no error
+        anywhere. Observed live against a real RTSP stream through the composition root
+        (`sentinel_ai/main.py`), after roughly 5 000 frames. The clip is best-effort
+        evidence; the camera and the event are not.
         """
         async for packet in self._source.packets():
             self._preroll.append(packet)
             async with self._clip_lock:
                 active = self._active_clip
                 if active is not None:
-                    await active.handle.append(packet)
-                    if packet.pts >= active.deadline:
+                    try:
+                        await active.handle.append(packet)
+                        closed = packet.pts >= active.deadline
+                    except Exception:
+                        logger.warning(
+                            "clip append failed for camera %s event %s; abandoning the clip "
+                            "and keeping the camera running",
+                            self._camera_id,
+                            active.request.event_id,
+                            exc_info=True,
+                        )
                         self._active_clip = None
-                        self._submit(active.request)
+                        # Same rule as `_abandon_open_clip`: the file goes, the event
+                        # stays (spec §9). `abort()` is contractually idempotent and
+                        # never raises.
+                        await active.handle.abort()
+                        self._submit(replace(active.request, clip=None))
+                    else:
+                        if closed:
+                            self._active_clip = None
+                            self._submit(active.request)
             await asyncio.sleep(0)  # cooperative yield; see the module docstring
 
     async def _abandon_open_clip(self) -> None:

@@ -121,6 +121,8 @@ class FakeClipHandle(ClipHandle):
         event_id: UUID,
         *,
         finish_error: Exception | None = None,
+        append_error: Exception | None = None,
+        append_error_after: int = 0,
     ) -> None:
         self.camera_id = camera_id
         self.event_id = event_id
@@ -128,8 +130,17 @@ class FakeClipHandle(ClipHandle):
         self.finished = False
         self.aborted = False
         self._finish_error = finish_error
+        self._append_error = append_error
+        self._append_error_after = append_error_after
 
     async def append(self, packet: EncodedPacket) -> None:
+        """`append_error`, when set, raises from the `append_error_after`-th call on.
+
+        A remux `append` genuinely can fail mid-clip -- PyAV raises on a packet its
+        parser cannot make sense of -- and the packet loop must survive it.
+        """
+        if self._append_error is not None and len(self.packets) >= self._append_error_after:
+            raise self._append_error
         self.packets.append(packet)
 
     async def finish(self) -> str:
@@ -145,10 +156,17 @@ class FakeClipHandle(ClipHandle):
 class FakeClipWriter(ClipWriter):
     """`finish_error`, when set, is attached to every handle this writer opens."""
 
-    def __init__(self, finish_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        finish_error: Exception | None = None,
+        append_error: Exception | None = None,
+        append_error_after: int = 0,
+    ) -> None:
         self.opened: list[tuple[str, UUID, float]] = []
         self.handles: list[FakeClipHandle] = []
         self._finish_error = finish_error
+        self._append_error = append_error
+        self._append_error_after = append_error_after
 
     async def open(self, camera_id: str, event_id: UUID, fps: float) -> FakeClipHandle:
         """Returns the concrete `FakeClipHandle`, not the abstract `ClipHandle`.
@@ -159,6 +177,12 @@ class FakeClipWriter(ClipWriter):
         typecheck without an `isinstance` narrowing at every call site.
         """
         self.opened.append((camera_id, event_id, fps))
-        handle = FakeClipHandle(camera_id, event_id, finish_error=self._finish_error)
+        handle = FakeClipHandle(
+            camera_id,
+            event_id,
+            finish_error=self._finish_error,
+            append_error=self._append_error,
+            append_error_after=self._append_error_after,
+        )
         self.handles.append(handle)
         return handle

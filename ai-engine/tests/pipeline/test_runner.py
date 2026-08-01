@@ -668,6 +668,78 @@ class TestClipLifecycle:
         assert len(publisher.events) == 2
         assert all(event.clip_uri is None for event in publisher.events)
 
+    async def test_a_failing_clip_append_costs_the_clip_and_nothing_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A remux failure on one packet must not take the camera down with it.
+
+        Before this was guarded, the exception escaped `_packet_loop` and killed that
+        task. `run()` is still awaiting the *frame* loop at that point, so it never
+        observes the dead task — and the source's packet queue, which a real demux
+        thread fills with a blocking put, then fills up and stops the demux, so frames
+        stop arriving too. The camera reports a frozen `frames_seen` with no error
+        logged anywhere. Observed live against RTSP through the composition root after
+        ~5 000 frames; here it is provoked deterministically.
+
+        Fails against the unguarded loop with `frames_seen == 3` (the mailbox depth)
+        instead of 15, and with no event published at all.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = FakeClipWriter(
+            append_error=RuntimeError("mux: Invalid argument"), append_error_after=3
+        )
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=2, cooldown_seconds=0.2),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        telemetry = runner.telemetry()
+        assert telemetry.frames_seen == 15, "the camera must survive a failed clip append"
+        assert telemetry.escalations >= 1
+        handle = writer.handles[0]
+        assert handle.finished is False
+        assert handle.aborted is True, "the unusable partial file is discarded"
+        assert len(publisher.events) == telemetry.escalations, "spec §9: the event survives"
+        assert all(event.clip_uri is None for event in publisher.events)
+
+    async def test_a_clip_that_cannot_even_be_opened_costs_the_clip_and_nothing_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same rule one step earlier, and on the frame loop rather than the packet
+        loop — so an unguarded failure here ends `run()` outright.
+
+        Fails against the unguarded `_escalate` with the writer's error propagating out
+        of `runner.run()`.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = FakeClipWriter(append_error=RuntimeError("mux: Invalid argument"))
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=2, cooldown_seconds=0.2),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().frames_seen == 15
+        assert len(publisher.events) >= 1
+        assert all(event.clip_uri is None for event in publisher.events)
+
     async def test_the_clip_opens_with_the_preroll_already_in_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
