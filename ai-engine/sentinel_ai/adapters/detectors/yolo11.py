@@ -101,6 +101,20 @@ def _to_detections(
 
 
 class Yolo11Detector(ObjectDetector, ModelRuntime):
+    """One instance serves every camera, so it must serialise its own model access.
+
+    `compose()` builds exactly one detector and hands it to every `CameraRunner`
+    (unlike trackers, motion analyzers, pre-roll buffers and sources, which are all
+    per-camera). That sharing is deliberate — see `_lock` below for why the
+    alternative is worse — but it means N camera tasks call `detect()` concurrently
+    on one `ultralytics.YOLO`, and `YOLO.predict` keeps per-call state on
+    `self.predictor` (`batch`, `results`, `source`). Ultralytics documents one model
+    instance per thread for exactly this reason. Unsynchronised, two cameras'
+    `predict` calls interleave on that shared state and the detections of one camera
+    are attributed to the other — silently, because both calls still return a
+    well-formed result.
+    """
+
     def __init__(self, model_id: str, conf: float, iou: float, imgsz: int, device: str) -> None:
         self._model_id = model_id
         self._conf = conf
@@ -112,6 +126,25 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
         self._state = LifecycleState.UNLOADED
         self._health_detail = ""
         self._vram_mib = 0
+        self._lock = asyncio.Lock()
+        """Serialises `predict()` across every camera sharing this detector.
+
+        An `asyncio.Lock` rather than one detector per camera: `plan_residency()`
+        admits models against `total_mib - reserved_mib`, and a second detector is a
+        second `ModelSpec` in that arithmetic. On the reference RTX 4060 with the
+        shipped budget (8192 total, 2048 reserved -> 6144 usable) the VLM's 4400 MiB
+        plus one 900 MiB detector already sits at 5300; a second camera's detector
+        takes it to 6200 and `plan_residency` raises `InsufficientVram` at startup.
+        That would turn a silent correctness bug into a hard boot failure on exactly
+        the two-camera config `cameras.example.json` ships, and it scales the wrong
+        way — VRAM per camera, on a box that has one GPU. A dedicated single-thread
+        executor was the other candidate; it buys the same mutual exclusion but adds
+        an executor to create and tear down across every initialize/shutdown cycle,
+        and with this lock held the model is already only ever touched by one thread
+        at a time. Costs nothing but latency the pipeline already absorbs: a camera
+        waiting here simply drops staler frames in its `_LatestSlot`, which is what
+        that mailbox is for.
+        """
 
     async def initialize(self) -> None:
         self._state = LifecycleState.DOWNLOADING
@@ -171,11 +204,16 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
             raise TypeError(f"FrameData.pixels must be a numpy array, got {type(frame.pixels)!r}")
         pixels: npt.NDArray[np.uint8] = frame.pixels
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._detect_sync, pixels)
+        # Held across the offload, not merely around the submission: the shared state
+        # this protects lives inside `predict()`, on the executor thread.
+        async with self._lock:
+            model = self._model
+            if model is None:  # pragma: no cover - a shutdown() that raced the acquire
+                raise RuntimeError("Yolo11Detector.detect called before initialize()")
+            return await loop.run_in_executor(None, self._detect_sync, model, pixels)
 
-    def _detect_sync(self, pixels: npt.NDArray[np.uint8]) -> tuple[Detection, ...]:
-        assert self._model is not None
-        results = self._model.predict(
+    def _detect_sync(self, model: YOLO, pixels: npt.NDArray[np.uint8]) -> tuple[Detection, ...]:
+        results = model.predict(
             source=pixels,
             conf=self._conf,
             iou=self._iou,

@@ -13,14 +13,20 @@ those are skipped there, not merely deselected.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, ParamSpec, TypeVar
 
+import numpy as np
 import pytest
 
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector, _to_detections
 from sentinel_ai.domain.camera_profile import DEFAULT_SALIENT_CLASSES
 from sentinel_ai.domain.entities import BBox, Detection
 from sentinel_ai.ports.detector import ObjectDetector
+from sentinel_ai.ports.frame_source import FrameData
 from sentinel_ai.ports.model_runtime import ModelRuntime
 
 
@@ -97,6 +103,192 @@ async def test_real_detector_raises_and_marks_unhealthy_on_missing_salient_class
     with pytest.raises(ValueError, match="salient"):
         await detector.initialize()
     assert detector.health().state.value == "unhealthy"
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class _ManualExecutor(ThreadPoolExecutor):
+    """Queues submitted work instead of running it, so a test can count exactly how
+    many `_detect_sync` bodies the detector has released at once.
+
+    A `ThreadPoolExecutor` subclass because `loop.set_default_executor()` type-checks
+    for one, and `Yolo11Detector.detect` offloads through `run_in_executor(None, ...)`
+    — so this intercepts the real production code path unchanged. No thread is ever
+    started, nothing sleeps, and the interleaving under test is decided entirely by
+    when the test calls `run_next()`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.pending: list[tuple[Future[Any], Callable[..., Any], tuple[Any, ...]]] = []
+
+    def submit(self, fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> Future[_T]:
+        future: Future[_T] = Future()
+        self.pending.append((future, fn, args))
+        return future
+
+    def run_next(self) -> None:
+        future, fn, args = self.pending.pop(0)
+        future.set_result(fn(*args))
+
+
+class _Boxes:
+    def __init__(self, class_id: int) -> None:
+        self.xyxy = np.array([[0.0, 0.0, 10.0, 10.0]])
+        self.conf = np.array([0.9])
+        self.cls = np.array([float(class_id)])
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _Result:
+    def __init__(self, class_id: int) -> None:
+        self.boxes = _Boxes(class_id)
+
+
+class _SharedStateYolo:
+    """Stand-in for `ultralytics.YOLO` that keeps per-call state on `self`, exactly as
+    the real one keeps `batch`/`results`/`source` on `self.predictor`.
+
+    `predict()` writes the incoming frame to `self.batch` and then reads it back to
+    build the result. That is the whole defect in miniature: if two cameras' calls are
+    ever in flight together, the second overwrites `batch` before the first reads it
+    and camera A is handed camera B's detections — a well-formed, silently wrong
+    answer, not a crash.
+    """
+
+    def __init__(self) -> None:
+        self.batch: Any = None
+        self.calls = 0
+
+    def predict(self, *, source: Any, verbose: bool, **_kwargs: Any) -> list[_Result]:
+        self.calls += 1
+        self.batch = source
+        return [_Result(class_id=int(self.batch[0][0][0]) // 10 - 1)]
+
+
+def _frame(camera_id: str, value: int) -> FrameData:
+    return FrameData(
+        camera_id=camera_id,
+        frame_index=0,
+        timestamp=0.0,
+        width=4,
+        height=4,
+        pixels=np.full((4, 4, 3), value, dtype=np.uint8),
+    )
+
+
+async def _settle() -> None:
+    """Let every ready coroutine reach its next suspension point. Zero wall clock."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+async def test_two_cameras_detecting_concurrently_never_share_a_model_call() -> None:
+    """B1: one `Yolo11Detector` is shared by every `CameraRunner` (`main.py`'s
+    `compose()`), and `cameras.example.json` ships two cameras — so two `detect()`
+    calls are genuinely in flight at once on one `ultralytics.YOLO`, whose `predict()`
+    keeps per-call state on `self.predictor`.
+
+    Fails against the unsynchronised version with `2 == 1`: both `_detect_sync` bodies
+    are handed to the executor in the same event-loop pass, which on the real default
+    thread pool means two threads inside `predict()` on the same model object at the
+    same time. The reviewer's probe measured exactly that — "max concurrent detect()
+    bodies in flight: 2, distinct executor threads used: 16".
+
+    Deterministic by construction: the executor never runs anything until this test
+    says so, so "how many bodies were released" is a fact about the detector's own
+    synchronisation and nothing else.
+    """
+    executor = _ManualExecutor()
+    asyncio.get_running_loop().set_default_executor(executor)
+
+    model = _SharedStateYolo()
+    detector = Yolo11Detector(model_id="yolo11s.pt", conf=0.35, iou=0.45, imgsz=640, device="cpu")
+    detector._model = model
+    detector._names = {0: "person", 1: "car"}
+
+    task_a = asyncio.create_task(detector.detect(_frame("cam-a", 10)))
+    task_b = asyncio.create_task(detector.detect(_frame("cam-b", 20)))
+    await _settle()
+
+    assert len(executor.pending) == 1, (
+        "two cameras must never have a model call in flight at the same time"
+    )
+    executor.run_next()
+    await _settle()
+
+    assert len(executor.pending) == 1, "the second camera's call is released only after the first"
+    executor.run_next()
+    await _settle()
+
+    detections_a = await task_a
+    detections_b = await task_b
+    assert model.calls == 2
+    assert [d.label for d in detections_a] == ["person"], "cam-a must get cam-a's detections"
+    assert [d.label for d in detections_b] == ["car"], "cam-b must get cam-b's detections"
+
+
+@pytest.mark.gpu
+async def test_real_shared_detector_stays_correct_under_concurrent_cameras() -> None:
+    """A smoke check on real hardware, **not** a regression pin for B1.
+
+    Stated plainly because this project has already shipped twenty-two tests that
+    discriminated nothing: this test passes against the unlocked detector too. It was
+    run both ways on an RTX 4060 — 60 rounds of four concurrent `detect()` calls on one
+    shared model, locked and unlocked — and neither produced a single mis-attributed
+    result. The Python-level interleaving that corrupts `self.predictor` is real by
+    construction (ultralytics documents one model instance per thread) but did not
+    reproduce here; CUDA synchronisation inside `predict()` appears to serialise the
+    window in practice, which is a property of this driver and this model, not a
+    guarantee.
+
+    What it does earn its place for: proving the lock does not deadlock or change the
+    answers under genuine concurrent load on a real GPU. The discriminating pin is
+    `test_two_cameras_detecting_concurrently_never_share_a_model_call` above.
+    """
+    import cv2
+    import ultralytics
+
+    from sentinel_ai.adapters.detectors.yolo11 import select_device
+
+    detector = Yolo11Detector(
+        model_id="yolo11s.pt", conf=0.25, iou=0.45, imgsz=640, device=select_device()
+    )
+    await detector.initialize()
+    await detector.warmup()
+
+    pixels = cv2.imread(str(Path(ultralytics.__file__).parent / "assets" / "bus.jpg"))
+    assert pixels is not None
+    height, width = pixels.shape[:2]
+    busy = FrameData(
+        camera_id="cam-a",
+        frame_index=0,
+        timestamp=0.0,
+        width=width,
+        height=height,
+        pixels=pixels,
+    )
+    blank = FrameData(
+        camera_id="cam-b",
+        frame_index=0,
+        timestamp=0.0,
+        width=width,
+        height=height,
+        pixels=np.zeros((height, width, 3), dtype=np.uint8),
+    )
+
+    for _ in range(10):
+        busy_result, blank_result = await asyncio.gather(
+            detector.detect(busy), detector.detect(blank)
+        )
+        assert "person" in {d.label for d in busy_result}, "the busy camera lost its detections"
+        assert blank_result == (), "the blank camera was handed another camera's detections"
+
+    await detector.shutdown()
 
 
 @pytest.mark.gpu
