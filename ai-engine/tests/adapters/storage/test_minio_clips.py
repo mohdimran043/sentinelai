@@ -15,6 +15,7 @@ import av
 import pytest
 
 from sentinel_ai.adapters.storage.minio_clips import (
+    MinioClipHandle,
     MinioClipWriter,
     UnsupportedCodecError,
     _RemuxSession,
@@ -304,3 +305,81 @@ class TestMinioClipHandle:
         await handle.abort()
         assert not temp_path.exists()
         await handle.abort()  # idempotent, must not raise
+
+    async def test_finish_retains_temp_file_when_upload_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §9: an anomaly event is never lost to an infrastructure failure. A
+        transient MinIO failure (network blip, disk full, timeout) must not destroy
+        the only copy of the evidence — the temp file must survive so an operator
+        can recover it, even though the upload itself failed.
+        """
+        writer = MinioClipWriter(
+            endpoint="localhost:9000",
+            access_key="x",
+            secret_key="x",
+            bucket="sentinel-clips",
+            secure=False,
+            temp_dir=tmp_path,
+        )
+        monkeypatch.setattr(writer._client, "bucket_exists", lambda *_a, **_kw: True)
+        monkeypatch.setattr(writer._client, "make_bucket", lambda *_a, **_kw: None)
+
+        def _raise_upload_failure(*_a: object, **_kw: object) -> None:
+            raise OSError("simulated MinIO upload failure")
+
+        monkeypatch.setattr(writer._client, "fput_object", _raise_upload_failure)
+
+        camera_id, event_id = "cam-1", uuid4()
+        handle = await writer.open(camera_id, event_id, fps=25.0)
+        for packet in _annexb_packets_from_fixture(camera_id):
+            await handle.append(packet)
+        temp_path = tmp_path / f"{camera_id}-{event_id}.mp4"
+        assert temp_path.exists(), "test setup: the handle must have written a real file"
+
+        with pytest.raises(OSError, match="simulated MinIO upload failure"):
+            await handle.finish()
+
+        assert temp_path.exists(), "the only copy of the clip must survive an upload failure"
+
+    async def test_abort_after_failed_finish_still_cleans_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the session's flush-and-close raises (e.g. a mux() failure while
+        flushing trailing packets), the handle must not already be marked done —
+        otherwise a subsequent `abort()` is a permanent no-op that leaks both the
+        open PyAV container and the temp file.
+        """
+        writer = MinioClipWriter(
+            endpoint="localhost:9000",
+            access_key="x",
+            secret_key="x",
+            bucket="sentinel-clips",
+            secure=False,
+            temp_dir=tmp_path,
+        )
+        monkeypatch.setattr(writer._client, "bucket_exists", lambda *_a, **_kw: True)
+        monkeypatch.setattr(writer._client, "make_bucket", lambda *_a, **_kw: None)
+
+        camera_id, event_id = "cam-1", uuid4()
+        handle = await writer.open(camera_id, event_id, fps=25.0)
+        packets = _annexb_packets_from_fixture(camera_id)
+        # Two packets, not one: same PyAV-file-creation-timing reasoning as the abort
+        # tests above — one packet never produces a muxed access unit, so no file
+        # would exist yet to leak regardless of what abort() does.
+        await handle.append(packets[0])
+        await handle.append(packets[1])
+        temp_path = tmp_path / f"{camera_id}-{event_id}.mp4"
+        assert temp_path.exists(), "test setup: the handle must have written a real file"
+
+        def _raise_flush_failure() -> Path:
+            raise RuntimeError("simulated mux() failure while flushing trailing packets")
+
+        assert isinstance(handle, MinioClipHandle), "test setup: writer.open() must return this"
+        monkeypatch.setattr(handle._session, "finish", _raise_flush_failure)
+
+        with pytest.raises(RuntimeError, match="simulated mux"):
+            await handle.finish()
+
+        await handle.abort()
+        assert not temp_path.exists(), "abort() must still clean up after a failed finish()"

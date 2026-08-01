@@ -253,15 +253,35 @@ class MinioClipHandle(ClipHandle):
     async def finish(self) -> str:
         if self._done:
             raise RuntimeError("clip handle already finished or aborted")
-        self._done = True
+        # `_done` is set only once the remux itself has actually completed. If
+        # `self._session.finish()` raises (e.g. a mux() failure while flushing
+        # trailing packets), the handle must NOT be marked done — otherwise a
+        # caller's subsequent `abort()` would return immediately as a no-op,
+        # leaking the still-open PyAV container and the temp file.
         temp_path = await asyncio.to_thread(self._session.finish)
+        self._done = True
         object_name = f"{self._camera_id}/{self._event_id}.mp4"
         try:
             await asyncio.to_thread(
                 self._client.fput_object, self._bucket, object_name, str(temp_path)
             )
-        finally:
-            temp_path.unlink(missing_ok=True)
+        except Exception:
+            # Spec §9: an anomaly event is never lost to an infrastructure failure.
+            # A transient MinIO failure (network blip, disk full, timeout) must not
+            # destroy the only copy of the evidence — retain the temp file and log
+            # its path so an operator can recover it. Deleting it here would trade
+            # "lost to MinIO" for "lost to us", which is strictly worse.
+            logger.warning(
+                "clip upload failed for camera %s event %s; retaining local file at %s "
+                "for manual recovery",
+                self._camera_id,
+                self._event_id,
+                temp_path,
+                exc_info=True,
+            )
+            raise
+        # Only reached on a genuine upload success — the temp file's job is done.
+        temp_path.unlink(missing_ok=True)
         return f"s3://{self._bucket}/{object_name}"
 
     async def abort(self) -> None:
