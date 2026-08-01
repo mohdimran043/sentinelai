@@ -278,6 +278,18 @@ KNOWN_BAD_MODULES: tuple[tuple[str, str, str, str], ...] = (
         "forbidden-import:datetime",
     ),
     (
+        # The one case whose ONLY offence is a clock read. Every other clock case
+        # above trips the forbidden-import ban first and asserts on *that*, so
+        # `_clock_reads` was never the thing under test: mutating it to `return []`
+        # left every control passing. `asyncio` is deliberately not on the forbidden
+        # list — the pure layers may not read a clock, but they are allowed to be
+        # async — which is what makes this case pin the matcher itself.
+        "an awaited sleep is a clock read, and asyncio is not import-banned",
+        POLICY_PACKAGE,
+        "import asyncio\n\nasync def settle() -> None:\n    await asyncio.sleep(1.0)\n",
+        "clock-read:asyncio.sleep",
+    ),
+    (
         "dynamic import via importlib",
         POLICY_PACKAGE,
         'import importlib\n\ntorch = importlib.import_module("torch")\n',

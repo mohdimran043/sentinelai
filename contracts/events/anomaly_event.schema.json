@@ -29,7 +29,7 @@
     "camera_id": { "type": "string", "minLength": 1 },
     "occurred_at": {
       "type": "number",
-      "description": "When the anomaly happened, as Unix epoch seconds (UTC, fractional). Comparable across process restarts and across cameras, whatever kind of source each camera runs: sort and display on this field. Derived from a single wall+monotonic anchor taken once per engine process, so the difference between two events from the same camera is exactly the difference between their source timestamps and no clock step can reorder them relative to each other. Not NTP-corrected after the anchor is taken, so treat it as accurate to the anchor, not to the nanosecond."
+      "description": "When the anomaly happened, as Unix epoch seconds (UTC, fractional). Comparable across process restarts and across cameras, whatever kind of source each camera runs: sort and display on this field. Derived from a wall+monotonic anchor taken once per camera, from that camera's own first-seen source timestamp, so the difference between two events from the same camera is exactly the difference between their source timestamps and no clock step can reorder them relative to each other. A per-process anchor was tried first and was wrong: file-backed sources count from 0.0 per file while time.monotonic() counts from boot, so a replayed event landed one uptime in the past. Cross-camera comparison is therefore precise to when each camera's anchor was established, not to true simultaneity. Not NTP-corrected after the anchor is taken, so treat it as accurate to the anchor, not to the nanosecond."
     },
     "source_timestamp": {
       "type": ["number", "null"],
