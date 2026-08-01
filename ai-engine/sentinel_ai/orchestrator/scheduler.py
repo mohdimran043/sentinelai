@@ -11,7 +11,8 @@ that constructs an `Event`. Every error path below still produces one — spec �
 governing rule is that an anomaly event is never lost to an infrastructure failure.
 That rule is enforced in three places:
 
-  * a failed/timed-out `describe()` yields a metadata-derived description flagged
+  * a failed or timed-out `describe()` -- or one that returns an unusable threat
+    value -- yields a metadata-derived description flagged
     `description_unavailable=True`;
   * a failed `ClipHandle.finish()` yields an event with `clip_uri=None`;
   * a failure anywhere — including the publisher itself — still releases the admission
@@ -163,6 +164,17 @@ class VlmScheduler:
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 description = await self._vlm.describe(vlm_request)
+            # Inside the guard on purpose. `SceneDescription.threat_value` is a bare
+            # unvalidated float and `ThreatScore.from_value` rejects anything outside
+            # [0, 1]; Task 13's Qwen adapter parses that number out of generated model
+            # text, so an out-of-range value is an ordinary infrastructure failure. Left
+            # outside, it raised straight out of the success path and the event was
+            # dropped entirely -- the one thing spec §9 forbids. Here it degrades to the
+            # same `description_unavailable=True` fallback as any other VLM failure.
+            threat = ThreatScore.from_value(description.threat_value)
+            description_text = description.description
+            suggested_action = description.suggested_action
+            unavailable = False
         except Exception as error:
             logger.warning(
                 "vlm describe failed for camera %s event %s: %s",
@@ -170,29 +182,23 @@ class VlmScheduler:
                 request.event_id,
                 error,
             )
-            return Event(
-                event_id=request.event_id,
-                camera_id=request.camera_id,
-                occurred_at=request.scene.timestamp,
-                reason=request.reason,
-                threat=ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE),
-                description=_metadata_description(request),
-                suggested_action=_UNAVAILABLE_ACTION,
-                labels=labels,
-                track_ids=track_ids,
-                description_unavailable=True,
-            )
+            threat = ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE)
+            description_text = _metadata_description(request)
+            suggested_action = _UNAVAILABLE_ACTION
+            unavailable = True
+        # One construction site, both paths: S14 owns event assembly precisely so that
+        # no error path can produce a differently-shaped event, or none at all.
         return Event(
             event_id=request.event_id,
             camera_id=request.camera_id,
             occurred_at=request.scene.timestamp,
             reason=request.reason,
-            threat=ThreatScore.from_value(description.threat_value),
-            description=description.description,
-            suggested_action=description.suggested_action,
+            threat=threat,
+            description=description_text,
+            suggested_action=suggested_action,
             labels=labels,
             track_ids=track_ids,
-            description_unavailable=False,
+            description_unavailable=unavailable,
         )
 
     async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:

@@ -239,6 +239,39 @@ class TestNeverLoseAnEvent:
             "a clip failure says nothing about whether the description succeeded"
         )
 
+    async def test_an_out_of_range_threat_value_degrades_instead_of_dropping_the_event(
+        self,
+    ) -> None:
+        """`SceneDescription.threat_value` is a bare unvalidated float and
+        `ThreatScore.from_value` rejects anything outside [0, 1]. Task 13's Qwen adapter
+        parses that number out of generated model text, so a model that emits `1.2` is
+        an infrastructure failure like any other — and §9 does not exempt it.
+
+        Fails against a `_describe` that builds the success-path `Event` outside the
+        `try`: `from_value` then raises out of the success path, past `_process`, into
+        the worker's top-level handler, which logs it and moves on. The event is gone —
+        `publisher.events` stays empty.
+        """
+        publisher = FakePublisher()
+        scheduler = new_scheduler(
+            vlm=FakeVisionLLM(
+                response=SceneDescription(
+                    description="A person is standing near the door.",
+                    threat_value=1.2,
+                    suggested_action="Monitor.",
+                )
+            ),
+            publisher=publisher,
+        )
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert len(publisher.events) == 1, "an unusable threat value must not lose the event"
+        event = publisher.events[0]
+        assert event.description_unavailable is True
+        assert event.threat.value == pytest.approx(0.5), "the conservative mid-range placeholder"
+
     async def test_a_vlm_exception_other_than_timeout_still_publishes_and_frees_admission(
         self,
     ) -> None:
