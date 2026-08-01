@@ -13,13 +13,15 @@ from sentinel_ai.config import Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, Detection
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
+from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
 from sentinel_ai.pipeline import runner as runner_module
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData
 from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
-from tests.fakes.models import FakeDetector, FakeTracker, FakeVisionLLM
+from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
 NEAR = Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0))
 
@@ -176,6 +178,24 @@ class Worker:
             await self._task
 
 
+VLM_KEY = "qwen25vl3b"
+
+
+def new_resident_set() -> ResidentSet:
+    """A real `ResidentSet` over a real registry, holding a fake VLM runtime.
+
+    The scheduler makes the VLM resident before every describe, so every scheduler
+    needs one. Real rather than stubbed, for the same reason these tests run the real
+    `MotionAnalyzer`: a stub would let the wiring be wrong without anything noticing.
+    """
+    registry = ModelRegistry()
+    registry.register(
+        ModelSpec(model_key=VLM_KEY, vram_mib=4400, priority=50, idle_unload_seconds=600.0),
+        FakeModelRuntime(VLM_KEY, vram_mib=4400),
+    )
+    return ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+
 def new_scheduler(
     publisher: FakePublisher,
     vlm: FakeVisionLLM | None = None,
@@ -185,9 +205,11 @@ def new_scheduler(
         vlm=vlm or FakeVisionLLM(),
         publisher=publisher,
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=new_resident_set(),
+        vlm_model_key=VLM_KEY,
         maxsize=maxsize,
         timeout_seconds=5.0,
-        clock=frozen_clock(),
+        clock=lambda: 0.0,
     )
 
 

@@ -17,12 +17,14 @@ from sentinel_ai.domain.entities import (
     Track,
 )
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
+from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
-from tests.fakes.models import FakeVisionLLM
+from tests.fakes.models import FakeModelRuntime, FakeVisionLLM
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
 
@@ -129,12 +131,43 @@ def a_request(
     )
 
 
+VLM_KEY = "qwen25vl3b"
+VLM_SPEC = ModelSpec(model_key=VLM_KEY, vram_mib=4400, priority=50, idle_unload_seconds=600.0)
+
+
+class RecordingResidentSet(ResidentSet):
+    """The real `ResidentSet` over a real `ModelRegistry`, recording every `ensure()`.
+
+    A real one rather than a stub: the point of routing the reload through
+    `ResidentSet` is that `plan_residency`'s bookkeeping stays authoritative, and a
+    stub would assert the call happened while proving nothing about its effect.
+    """
+
+    def __init__(self) -> None:
+        registry = ModelRegistry()
+        self.runtime = FakeModelRuntime(VLM_KEY, vram_mib=4400)
+        registry.register(VLM_SPEC, self.runtime)
+        super().__init__(registry, total_mib=8192, reserved_mib=2048)
+        self.ensure_calls: list[tuple[tuple[str, ...], float]] = []
+
+    async def ensure(self, required: tuple[str, ...], now: float) -> None:
+        self.ensure_calls.append((required, now))
+        await super().ensure(required, now)
+
+
+class FailingResidentSet(RecordingResidentSet):
+    async def ensure(self, required: tuple[str, ...], now: float) -> None:
+        self.ensure_calls.append((required, now))
+        raise RuntimeError("insufficient vram")
+
+
 def new_scheduler(
     vlm: VisionLanguageModel | None = None,
     publisher: EventPublisher | None = None,
     maxsize: int = 4,
     admission: AdmissionGate | None = None,
     timeout_seconds: float = 5.0,
+    resident_set: ResidentSet | None = None,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -147,6 +180,8 @@ def new_scheduler(
         ),
         publisher=publisher or FakePublisher(),
         admission=admission or AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set or RecordingResidentSet(),
+        vlm_model_key=VLM_KEY,
         maxsize=maxsize,
         timeout_seconds=timeout_seconds,
         clock=clock,
@@ -227,6 +262,91 @@ async def test_a_full_queue_drops_and_counts_without_raising() -> None:
     assert scheduler.submit(a_request()) is True
     assert scheduler.submit(a_request()) is False
     assert scheduler.dropped == 1
+
+
+class TestVlmResidency:
+    """C1: the describe path is the only thing that can keep the VLM alive, and it was
+    not wired to `ResidentSet` at all — the scheduler held no reference to one."""
+
+    async def test_every_describe_makes_the_vlm_resident_first(self) -> None:
+        """`ResidentSet`'s own module docstring specifies this contract verbatim —
+        "a caller invoking a model ... wrapping a `describe` call with
+        `await resident_set.ensure((vlm_key,), now)` first" — and the caller was never
+        written. Both halves matter: the call loads a VLM the idle sweeper has evicted,
+        and it stamps `last_used_at`, without which the 600s idle window measures time
+        since boot rather than time since last use.
+        """
+        resident_set = RecordingResidentSet()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher=publisher, resident_set=resident_set)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert resident_set.ensure_calls == [((VLM_KEY,), 0.0), ((VLM_KEY,), 0.0)], (
+            "every describe, not merely the first, must freshen the idle clock"
+        )
+        assert resident_set.resident() == frozenset({VLM_KEY})
+        assert len(publisher.events) == 2
+
+    async def test_an_evicted_vlm_is_brought_back_rather_than_degrading_forever(
+        self,
+    ) -> None:
+        """The self-heal, at the level the scheduler owns: after an idle eviction the
+        very next escalation must reload the model, not publish a stub description.
+
+        Fails against a scheduler with no `ResidentSet`: the runtime stays UNLOADED,
+        `initialize_calls` stays at 1, and the event carries
+        `description_unavailable=True` for the lifetime of the process.
+        """
+        resident_set = RecordingResidentSet()
+        await resident_set.ensure((VLM_KEY,), 0.0)
+        await resident_set.sweep_idle(1_000.0)  # past idle_unload_seconds=600
+        assert resident_set.resident() == frozenset()
+        assert resident_set.runtime.shutdown_calls == 1
+
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher=publisher, resident_set=resident_set)
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert resident_set.runtime.initialize_calls == 2, "the describe must reload it"
+        assert resident_set.resident() == frozenset({VLM_KEY})
+        assert publisher.events[0].description_unavailable is False
+
+    async def test_a_residency_failure_costs_the_description_but_never_the_event(
+        self,
+    ) -> None:
+        """Spec §9 again, one layer further out. A reload can genuinely fail — the card
+        may have filled up since boot — and it happens inside the admission-gated
+        section, so raising from there would both lose the event and, at concurrency 1,
+        risk wedging the only GPU slot.
+        """
+        admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(
+            vlm=FakeVisionLLM(error=RuntimeError("describe called before initialize()")),
+            publisher=publisher,
+            admission=admission,
+            resident_set=FailingResidentSet(),
+        )
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            assert len(publisher.events) == 1
+            assert publisher.events[0].description_unavailable is True
+            assert admission.in_flight == 0
+
+            # The worker must still be usable, not wedged on a leaked slot.
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert len(publisher.events) == 2
 
 
 class TestNeverLoseAnEvent:

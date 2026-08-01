@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.entities import EscalationReason, SceneState
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
-from sentinel_ai.orchestrator.scheduler import VlmScheduler
+from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError, _IdleSweeper
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
+from sentinel_ai.ports.model_runtime import LifecycleState
+from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakePublisher, FakeSource
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
@@ -43,6 +46,8 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         vlm=FakeVisionLLM(),
         publisher=publisher,
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -277,6 +282,8 @@ async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
         vlm=FakeVisionLLM(),
         publisher=publisher,
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -336,6 +343,8 @@ async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> N
         vlm=FakeVisionLLM(),
         publisher=publisher,
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -367,3 +376,128 @@ async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> N
 
     assert vlm_runtime.shutdown_calls >= 1
     assert resident_set.resident() == frozenset({"yolo11s"})
+
+
+class LoadStateAwareVlm(VisionLanguageModel):
+    """Refuses to describe while its runtime is unloaded — exactly the guard
+    `Qwen25VLDescriber.describe()` opens with
+    (`if self._model is None: raise RuntimeError(... called before initialize())`).
+
+    A `FakeVisionLLM` describes happily whether or not the weights are on the card,
+    which is why a composed test built on one could never have seen C1.
+    """
+
+    def __init__(self, runtime: FakeModelRuntime) -> None:
+        self._runtime = runtime
+        self.calls = 0
+
+    async def describe(self, request: VisionRequest) -> SceneDescription:
+        self.calls += 1
+        if self._runtime.health().state is LifecycleState.UNLOADED:
+            raise RuntimeError("Qwen25VLDescriber.describe called before initialize()")
+        return SceneDescription(
+            description="A person is standing near the door.",
+            threat_value=0.3,
+            suggested_action="Monitor.",
+        )
+
+
+def an_escalation_request() -> EscalationRequest:
+    scene = SceneState(
+        camera_id="cam-1",
+        frame_index=0,
+        timestamp=12.5,
+        detections=(),
+        tracks=(),
+        motion_energy=0.1,
+        scene_signature=(1.0,),
+    )
+    return EscalationRequest(
+        camera_id="cam-1",
+        event_id=uuid4(),
+        reason=EscalationReason.NEW_SALIENT_TRACK,
+        detail="1 new salient track",
+        scene=scene,
+        keyframe=FakeSource.make_frame("cam-1", 0, 0.0),
+        profile=CameraProfile(camera_id="cam-1"),
+        camera_label="Front Door",
+        history=(),
+        clip=None,
+    )
+
+
+async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description() -> None:
+    """C1, at the level it actually bites: the composed system.
+
+    The test above proves half a cycle — that eviction happens. Nothing proved the
+    model ever comes back. It did not: `VlmScheduler` held no `ResidentSet` reference
+    at all, so the system described correctly for exactly ten minutes after boot and
+    then published `description_unavailable=True` with a flat 0.5 threat score for
+    every event thereafter, for the lifetime of the process, while `/health` reported
+    the VLM as UNLOADED — the state an operator reads as *correctly idle*, not as a
+    fault. 600s of quiet is the normal state of a camera watching an empty corridor,
+    so this fired on essentially every deployment.
+
+    Verified against the unwired describe path: `initialize_calls = 1`,
+    `description_unavailable = True`, `threat = 0.5`,
+    `description = 'new_salient_track: motion (1 new salient track)'`.
+    """
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    vlm_runtime = FakeModelRuntime("qwen25vl3b", vram_mib=4400)
+    registry.register(VLM_SPEC, vlm_runtime)
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    elapsed = {"now": 0.0}
+
+    def ticking_clock() -> float:
+        return elapsed["now"]
+
+    async def fake_sleep(seconds: float) -> None:
+        elapsed["now"] += seconds
+        await asyncio.sleep(0)  # cooperative yield; zero wall-clock time
+
+    publisher = FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=LoadStateAwareVlm(vlm_runtime),
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=ticking_clock,
+    )
+    service = EngineService(
+        cameras={},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=ticking_clock,
+        idle_sweep_interval_seconds=100.0,
+        sleep=fake_sleep,
+    )
+
+    await service.start()
+    assert vlm_runtime.initialize_calls == 1
+    for _ in range(50):  # let the sweeper carry the clock past idle_unload_seconds=600
+        await asyncio.sleep(0)
+    assert vlm_runtime.shutdown_calls == 1, "test setup: the VLM must have been evicted"
+    assert service.health()["qwen25vl3b"].state.value == "unloaded"
+
+    scheduler.submit(an_escalation_request())
+    await asyncio.wait_for(scheduler.drain(), timeout=5.0)
+    await service.stop()
+
+    assert vlm_runtime.initialize_calls == 2, "the escalation must have reloaded the VLM"
+    assert resident_set.resident() == frozenset({"yolo11s", "qwen25vl3b"})
+    assert len(publisher.events) == 1
+    event = publisher.events[0]
+    assert event.description_unavailable is False, (
+        "an escalation after the idle window must produce a real description"
+    )
+    assert event.description == "A person is standing near the door."
+    assert event.threat.value == pytest.approx(0.3), (
+        "the 0.5 placeholder makes every event score identically and triage useless"
+    )

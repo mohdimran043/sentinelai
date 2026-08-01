@@ -19,6 +19,25 @@ That rule is enforced in three places:
     slot in a `finally` and leaves the worker alive for the next escalation. A leaked
     slot at concurrency 1 wedges the GPU for the lifetime of the process, and a worker
     that dies on one poisoned request silently stops describing everything after it.
+
+VLM residency
+-------------
+Every describe is preceded by `ResidentSet.ensure((vlm_model_key,), now)`. That single
+call does two jobs, and the system is broken without either: it *reloads* a VLM the
+600s idle sweep has evicted, and it stamps `last_used_at`, which is what makes the
+sweep's window mean "idle" rather than "600s since boot". It goes through
+`ResidentSet` rather than calling `ModelRuntime.initialize()` directly so that
+`plan_residency`'s admission arithmetic and eviction bookkeeping stay authoritative.
+
+Clock
+-----
+`clock` here is *real elapsed time* — `time.monotonic` in production. It has to be:
+`AdmissionGate` spaces GPU admissions with `asyncio.sleep`, which runs on the wall
+clock, so a scheduler clock that did not advance with it would compound the gate's
+deficit without bound. This is deliberately **not** the same clock as the camera
+pipeline's: `CameraRunner` has no clock of its own and runs entirely on the source's
+timeline (see `pipeline/runner.py`). The two agree only for a live RTSP source and
+must not be conflated.
 """
 
 from __future__ import annotations
@@ -32,6 +51,7 @@ from uuid import UUID
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, ThreatScore
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher
 from sentinel_ai.ports.frame_source import FrameData
@@ -90,6 +110,8 @@ class VlmScheduler:
         publisher: EventPublisher,
         admission: AdmissionGate,
         *,
+        resident_set: ResidentSet,
+        vlm_model_key: str,
         maxsize: int,
         timeout_seconds: float,
         clock: Callable[[], float],
@@ -97,6 +119,8 @@ class VlmScheduler:
         self._vlm = vlm
         self._publisher = publisher
         self._admission = admission
+        self._resident_set = resident_set
+        self._vlm_model_key = vlm_model_key
         self._timeout_seconds = timeout_seconds
         self._clock = clock
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
@@ -153,11 +177,39 @@ class VlmScheduler:
     async def _process(self, request: EscalationRequest) -> None:
         await self._admission.acquire(self._clock())
         try:
+            await self._ensure_vlm_resident()
             event = await self._describe(request)
             event = await self._attach_clip(event, request)
             await self._publisher.publish(event)
         finally:
             self._admission.release(self._clock())
+
+    async def _ensure_vlm_resident(self) -> None:
+        """Reload an evicted VLM, and freshen its idle clock so it is not evicted again
+        while it is genuinely in use.
+
+        Without this the system describes correctly for exactly `idle_unload_seconds`
+        after boot and then never again: the idle sweeper evicts the VLM (600s of no
+        activity being the normal state of a camera watching an empty corridor), and
+        nothing on the describe path ever brings it back. Every subsequent event
+        publishes `description_unavailable=True` with a flat 0.5 threat score, which
+        makes triage meaningless, while `/health` reports the VLM as UNLOADED — the
+        state an operator reads as *correctly idle*, not as a fault.
+
+        Inside the admission-gated section on purpose: a reload is a multi-second
+        `from_pretrained`, and running it here means only the one escalation waits for
+        it, never the camera pipeline. A failure is logged and swallowed rather than
+        raised, so it cannot wedge the gate or cost the event — `describe()` then fails
+        on its own load-state guard and §9's fallback publishes as usual.
+        """
+        try:
+            await self._resident_set.ensure((self._vlm_model_key,), self._clock())
+        except Exception as error:
+            logger.warning(
+                "could not make vlm %s resident; the describe will fall back: %s",
+                self._vlm_model_key,
+                error,
+            )
 
     async def _describe(self, request: EscalationRequest) -> Event:
         labels, track_ids = _labels_and_tracks(request.scene)
