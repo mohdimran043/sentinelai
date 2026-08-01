@@ -87,3 +87,20 @@ export function toneForTierStatus(status: string): Tone {
       return 'breach'
   }
 }
+
+/**
+ * A journal day's own `status`, and a journal revision's `status` — same
+ * vocabulary. `sealed` is the settled, evidentiary end state (nominal, not
+ * merely "ok"); `provisional` means the day is still being written and the
+ * numbers can still move, which is worth a caution rather than a shrug.
+ */
+export function toneForJournalStatus(status: string): Tone {
+  switch (status) {
+    case 'sealed':
+      return 'nominal'
+    case 'provisional':
+      return 'caution'
+    default:
+      return 'inert'
+  }
+}

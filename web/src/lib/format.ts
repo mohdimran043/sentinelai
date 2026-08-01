@@ -52,6 +52,17 @@ export function formatPercent(ratio: number): string {
 }
 
 /**
+ * A percentage already expressed on a 0-100 scale — the recorder's own
+ * convention for `recorded_pct`, `total_pct`, etc. Distinct from
+ * `formatPercent`, which takes a 0-1 ratio; using that one here would read a
+ * real "79.9% recorded" as "8000%".
+ */
+export function formatPercentValue(value: number): string {
+  if (!Number.isFinite(value)) return '—'
+  return `${value.toFixed(1)}%`
+}
+
+/**
  * The recorder stamps everything in nanoseconds since the epoch. `Date` takes
  * milliseconds, so divide — and note that the incoming number has already lost
  * sub-microsecond precision to `JSON.parse` (see `recorder/recorder.types.ts`).
@@ -107,4 +118,23 @@ export function formatUsd(amount: number): string {
 
 export function formatThreatScore(score: number): string {
   return score.toFixed(2)
+}
+
+/**
+ * A raw duration in seconds -> "9h 47m", "45m 12s", "8s" — coarse enough for
+ * an operator glance, never fabricating sub-second precision the recorder
+ * never sent. Handles a negative input: `unexplained_shortfall_secs` in a
+ * coverage report can genuinely be negative (the recorder counted more
+ * coverage than it expected), and clamping that to zero would hide the fact.
+ */
+export function formatDurationSeconds(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds)) return '—'
+  const sign = totalSeconds < 0 ? '-' : ''
+  const seconds = Math.round(Math.abs(totalSeconds))
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const secs = seconds % 60
+  if (hours > 0) return `${sign}${formatCount(hours)}h ${minutes}m`
+  if (minutes > 0) return `${sign}${minutes}m ${secs}s`
+  return `${sign}${secs}s`
 }

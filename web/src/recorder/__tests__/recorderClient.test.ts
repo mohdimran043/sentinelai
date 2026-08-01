@@ -1,3 +1,4 @@
+// oxlint-disable no-loss-of-precision -- real recorder nanosecond timestamps; see mocks/fixtures.ts.
 import { describe, expect, it } from 'vitest'
 import { http, HttpResponse } from 'msw'
 import { server } from '@/test/mswServer'
@@ -6,13 +7,23 @@ import {
   RecorderHttpError,
   RecorderUnreachableError,
   getRecorderAlerts,
+  getRecorderJournal,
+  getRecorderJournalDay,
   getRecorderModels,
+  getRecorderReport,
 } from '@/recorder/recorderClient'
 import {
   recorderErrorHandler,
   recorderUnreachableHandler,
 } from '@/recorder/mocks/handlers'
-import { REAL_ALERTS } from '@/recorder/mocks/fixtures'
+import {
+  REAL_ALERTS,
+  REAL_JOURNAL_DAY_HISTORY,
+  REAL_JOURNAL_DAY_NO_CHAPTER,
+  REAL_JOURNAL_DAY_SEALED,
+  REAL_JOURNAL_ROOM_4B,
+  REAL_REPORT,
+} from '@/recorder/mocks/fixtures'
 
 describe('recorderClient', () => {
   it('parses a real /api/alerts payload into the declared shape', async () => {
@@ -70,5 +81,91 @@ describe('recorderClient', () => {
     expect(failure).toBeInstanceOf(RecorderUnreachableError)
     expect(failure).not.toBeInstanceOf(RecorderHttpError)
     expect((failure as Error).message).toBe('The recorder is unreachable.')
+  })
+
+  it('requests /journal/{camera} and parses the real days list', async () => {
+    let seen = ''
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/journal/:cameraId`, ({ request, params }) => {
+        seen = new URL(request.url).pathname
+        expect(params.cameraId).toBe('room_4b')
+        return HttpResponse.json(REAL_JOURNAL_ROOM_4B)
+      }),
+    )
+
+    const response = await getRecorderJournal('room_4b')
+
+    expect(seen).toBe('/recorder/api/journal/room_4b')
+    expect(response.days).toHaveLength(REAL_JOURNAL_ROOM_4B.days.length)
+    expect(response.days[0]).toEqual({
+      date: '2026-07-31',
+      status: 'sealed',
+      revisions: 2,
+      sealed_at_ns: 1785540246958127621,
+    })
+  })
+
+  it('requests /journal/{camera}/{date} with no query string when history is not asked for', async () => {
+    let seen = ''
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/journal/:cameraId/:date`, ({ request }) => {
+        seen = request.url
+        return HttpResponse.json(REAL_JOURNAL_DAY_SEALED)
+      }),
+    )
+
+    const response = await getRecorderJournalDay('room_4b', '2026-07-31')
+
+    expect(new URL(seen).search).toBe('')
+    expect(response.revision?.status).toBe('sealed')
+    expect(response.revision?.supersedes).toBe(1)
+  })
+
+  it('adds ?history=1 only when explicitly asked for, and the response carries the history array', async () => {
+    let seen = ''
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/journal/:cameraId/:date`, ({ request }) => {
+        seen = request.url
+        return HttpResponse.json(REAL_JOURNAL_DAY_HISTORY)
+      }),
+    )
+
+    const response = await getRecorderJournalDay('room_4b', '2026-07-31', { history: true })
+
+    expect(new URL(seen).search).toBe('?history=1')
+    expect(response.history).toHaveLength(2)
+    expect(response.history?.[0]?.revision).toBe(1)
+    expect(response.history?.[0]?.status).toBe('provisional')
+  })
+
+  it('parses a day with no written chapter as detail-only, with no revision key', async () => {
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/journal/:cameraId/:date`, () =>
+        HttpResponse.json(REAL_JOURNAL_DAY_NO_CHAPTER),
+      ),
+    )
+
+    const response = await getRecorderJournalDay('room_4b', '2020-01-01')
+
+    expect(response.revision).toBeUndefined()
+    expect(response.detail).toContain('No chapter has been written')
+  })
+
+  it('builds /report?camera=&date= from its two arguments', async () => {
+    let seen = ''
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/report`, ({ request }) => {
+        seen = request.url
+        return HttpResponse.json(REAL_REPORT)
+      }),
+    )
+
+    const response = await getRecorderReport('room_4b', '2026-08-01')
+
+    const url = new URL(seen)
+    expect(url.searchParams.get('camera')).toBe('room_4b')
+    expect(url.searchParams.get('date')).toBe('2026-08-01')
+    expect(response.coverage.recorded_pct).toBeCloseTo(79.933, 2)
+    expect(response.segments.count).toBe(328)
   })
 })
