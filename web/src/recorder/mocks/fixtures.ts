@@ -6,6 +6,7 @@
 import type {
   RecorderAlert,
   RecorderAlertsResponse,
+  RecorderCapabilitiesResponse,
   RecorderModelsResponse,
   RecorderSettingsResponse,
   RecorderUntrackedResponse,
@@ -380,4 +381,79 @@ export const REAL_STORAGE: RecorderUntrackedResponse = {
   note: 'Footage on disk that the segment index does not account for. It is never deleted automatically: an un-indexed file is one the system has lost its record of, which is exactly when its contents are least safe to assume are worthless. Reclaiming the space is a deliberate act.',
   total_bytes: 84,
   total_count: 3,
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/capabilities — captured live 2026-08-01
+ * ------------------------------------------------------------------ */
+
+export const REAL_CAPABILITIES: RecorderCapabilitiesResponse = {
+  capabilities: [
+    { key: 'coverage', label: 'Coverage & gaps', available: true },
+    { key: 'integrity', label: 'Camera integrity', available: true },
+    { key: 'segments', label: 'Recorded video', available: true },
+    { key: 'masked_scalars', label: 'Masked-region presence/motion', available: true },
+    {
+      key: 'mask_editor',
+      label: 'Draw privacy masks',
+      available: true,
+      reason:
+        "Draws mask polygons over the camera's own frame and validates them server-side, so the console never disagrees with the daemon about what is maskable. It cannot draw ignored_zones: those are not masks, their pixels are still recorded, and one canvas for both would invite an operator to believe an area was blanked when it was merely ignored.",
+    },
+    {
+      key: 'notifications',
+      label: 'Alert delivery',
+      available: true,
+      reason:
+        'Delivers the facts this slice records — integrity transitions and loss of observation. It cannot notify anyone about a person, a fall or distress, because nothing detects those.',
+    },
+    {
+      key: 'detection',
+      label: 'Person detection & pose',
+      available: false,
+      reason:
+        'No perception tier is connected. The CUDA IPC ring is published and tested, but nothing consumes it yet (slice 3).',
+    },
+    {
+      key: 'welfare',
+      label: 'Welfare & distress detection',
+      available: false,
+      reason:
+        'Not implemented (slice 6). Nothing detects stillness, collapse, distress or self-harm, so no welfare judgement of any kind is available. Absence of detection is not confirmation of wellbeing.',
+    },
+    {
+      key: 'events',
+      label: 'Incidents & severity',
+      available: false,
+      reason:
+        'Not implemented (slice 7). Slice 1 emits facts only; severity needs occupancy and elevated_watch context that does not exist yet.',
+    },
+    {
+      key: 'risk',
+      label: 'Pre-incident risk score',
+      available: false,
+      reason: 'Not implemented (slice 9).',
+    },
+    {
+      key: 'narrative',
+      label: 'Written narrative / the Book',
+      available: false,
+      reason:
+        'Not implemented (slice 4). No narrative is generated, and none will be invented for periods that were not analysed.',
+    },
+    {
+      key: 'inference',
+      label: 'Model inference (local or online)',
+      available: false,
+      reason:
+        'No model is loaded. The mode setting is recorded for when a perception tier is wired in, and changes nothing today.',
+    },
+    {
+      key: 'per_camera_context',
+      label: 'Per-camera context',
+      available: false,
+      reason:
+        'elevated_watch, capacity, audio_enabled, face_recognition_enabled and ignored_zones are validated, stored and reported — and acted on by NOTHING in this slice. Setting elevated_watch does not cause a camera to be watched more closely, because nothing yet watches for anything. The schema lands early so a deployment is not configured against one shape and then silently reinterpreted when welfare logic arrives.',
+    },
+  ],
 }

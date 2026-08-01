@@ -58,7 +58,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'notifications',
     label: 'Notifications',
-    built: false,
+    built: true,
     endpoints: ['GET /api/notifications'],
     summary:
       'The sixteen alert types with their descriptions, which channels each is routed to, and which eight are locked so an operator may never suppress them.',
@@ -81,7 +81,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'capabilities',
     label: 'Capabilities',
-    built: false,
+    built: true,
     endpoints: ['GET /api/capabilities'],
     summary:
       'The thirteen capabilities the recorder declares, six available and seven not, each with the recorder’s own statement of what it can and cannot do.',

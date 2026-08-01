@@ -2,12 +2,14 @@ import { http, HttpResponse } from 'msw'
 import { RECORDER_BASE_URL } from '@/recorder/config'
 import {
   REAL_ALERTS,
+  REAL_CAPABILITIES,
   REAL_MODELS,
   REAL_SETTINGS,
   REAL_STORAGE,
 } from '@/recorder/mocks/fixtures'
 import type {
   RecorderAlertsResponse,
+  RecorderCapabilitiesResponse,
   RecorderModelsResponse,
   RecorderSettingsResponse,
   RecorderUntrackedResponse,
@@ -34,6 +36,9 @@ export const recorderSettingsHandler = (body: RecorderSettingsResponse) =>
 export const recorderStorageHandler = (body: RecorderUntrackedResponse) =>
   http.get(`${RECORDER_BASE_URL}/storage/untracked`, () => HttpResponse.json(body))
 
+export const recorderCapabilitiesHandler = (body: RecorderCapabilitiesResponse) =>
+  http.get(`${RECORDER_BASE_URL}/capabilities`, () => HttpResponse.json(body))
+
 /** Make an endpoint fail the way the recorder does: a JSON body with an `error` key. */
 export const recorderErrorHandler = (path: string, status: number, error: string) =>
   http.get(`${RECORDER_BASE_URL}${path}`, () => HttpResponse.json({ error }, { status }))
@@ -48,4 +53,5 @@ export const recorderHandlers = [
   recorderModelsHandler(REAL_MODELS),
   recorderSettingsHandler(REAL_SETTINGS),
   recorderStorageHandler(REAL_STORAGE),
+  recorderCapabilitiesHandler(REAL_CAPABILITIES),
 ]
