@@ -60,34 +60,7 @@ export function ModelsPage() {
             </Notice>
           ) : null}
 
-          <Panel className="mt-3.5">
-            <div className="eyebrow">where inference runs</div>
-            <KvList
-              rows={[
-                {
-                  key: 'mode',
-                  label: 'Selected mode',
-                  value: data.selected.mode === 'online' ? 'Offsite' : 'On this machine',
-                },
-                {
-                  key: 'remote',
-                  label: 'Runs in a separate process',
-                  value: data.perception.remote ? 'Yes' : 'No',
-                },
-                {
-                  key: 'reachable',
-                  label: 'Runtime reachable',
-                  value: data.perception.reachable ? 'Yes' : 'No',
-                },
-                {
-                  key: 'offsite',
-                  label: 'Frames leave this machine',
-                  value: data.perception.offsite ? 'Yes' : 'No',
-                },
-              ]}
-            />
-            <p className="muted mt-3 mb-0">{data.perception.note}</p>
-          </Panel>
+          <WhereItRuns data={data} />
 
           <LocalStack data={data} />
           <FrontierStack data={data} />
@@ -95,6 +68,54 @@ export function ModelsPage() {
         </>
       ) : null}
     </>
+  )
+}
+
+/**
+ * Where inference would run. The whole block is skipped rather than guessed at
+ * if the recorder does not report it — see the note on `perception` in
+ * recorder.types.ts.
+ */
+function WhereItRuns({ data }: { data: RecorderModelsResponse }) {
+  const { perception, selected } = data
+  if (!perception && !selected) return null
+  return (
+    <Panel className="mt-3.5">
+      <div className="eyebrow">where inference runs</div>
+      <KvList
+        rows={[
+          ...(selected
+            ? [
+                {
+                  key: 'mode',
+                  label: 'Selected mode',
+                  value: selected.mode === 'online' ? 'Offsite' : 'On this machine',
+                },
+              ]
+            : []),
+          ...(perception
+            ? [
+                {
+                  key: 'remote',
+                  label: 'Runs in a separate process',
+                  value: perception.remote ? 'Yes' : 'No',
+                },
+                {
+                  key: 'reachable',
+                  label: 'Runtime reachable',
+                  value: perception.reachable ? 'Yes' : 'No',
+                },
+                {
+                  key: 'offsite',
+                  label: 'Frames leave this machine',
+                  value: perception.offsite ? 'Yes' : 'No',
+                },
+              ]
+            : []),
+        ]}
+      />
+      {perception ? <p className="muted mt-3 mb-0">{perception.note}</p> : null}
+    </Panel>
   )
 }
 
@@ -158,8 +179,9 @@ function StatusBlock({ status }: { status: RecorderModelStatus }) {
 }
 
 function LocalStack({ data }: { data: RecorderModelsResponse }) {
+  const catalog = data.catalog ?? []
   const catalogFor = (name: string): RecorderCatalogEntry | undefined =>
-    data.catalog.find((entry) => entry.local_id === name)
+    catalog.find((entry) => entry.local_id === name)
 
   return (
     <Panel className="mt-3.5">
@@ -219,11 +241,11 @@ function LocalStack({ data }: { data: RecorderModelsResponse }) {
         </div>
       )}
 
-      {data.catalog.length > 0 ? (
+      {catalog.length > 0 ? (
         <div className="mt-4">
           <h3 className="mb-1.5 text-[13px]">What the recorder has measured</h3>
-          <p className="muted mb-2">{data.catalog_note}</p>
-          {data.catalog.map((entry) => (
+          {data.catalog_note ? <p className="muted mb-2">{data.catalog_note}</p> : null}
+          {catalog.map((entry) => (
             <details
               key={entry.local_id}
               className="mt-2 rounded-sm border border-line bg-panel-2 px-3 py-2"
@@ -314,7 +336,8 @@ function FrontierStack({ data }: { data: RecorderModelsResponse }) {
 }
 
 function PerceptionTiers({ data }: { data: RecorderModelsResponse }) {
-  if (data.tiers.length === 0) return null
+  const tiers = data.tiers ?? []
+  if (tiers.length === 0) return null
   return (
     <Panel className="mt-3.5">
       <div className="eyebrow">perception tiers</div>
@@ -334,7 +357,7 @@ function PerceptionTiers({ data }: { data: RecorderModelsResponse }) {
             </tr>
           </thead>
           <tbody>
-            {data.tiers.map((tier) => (
+            {tiers.map((tier) => (
               <tr key={tier.tier}>
                 <td className="readout">{tier.tier}</td>
                 <td className="readout">{tier.model}</td>

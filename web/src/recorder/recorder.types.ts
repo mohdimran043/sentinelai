@@ -215,15 +215,25 @@ export interface RecorderModelsResponse {
   /** False means no API key is present, so the offsite path cannot run at all. */
   frontier_credentialed: boolean
   frontier_note: string
-  catalog: RecorderCatalogEntry[]
-  catalog_note: string
-  perception: RecorderPerception
-  selected: {
+  /**
+   * Present on the live instance, but optional on purpose.
+   *
+   * The recorder's own shipped console guards `tiers` before reading it
+   * (`r && r.tiers && ...`) and never reads `catalog`, `perception` or
+   * `selected` at all — which says these blocks are build-dependent, not
+   * guaranteed. Declaring them required would turn a recorder upgrade that
+   * drops one into a white screen on a console someone is meant to be
+   * watching cameras through.
+   */
+  catalog?: RecorderCatalogEntry[]
+  catalog_note?: string
+  perception?: RecorderPerception
+  selected?: {
     mode: string
     cadence: string
     interval_sec: number
   }
-  tiers: RecorderModelTier[]
+  tiers?: RecorderModelTier[]
   /**
    * Neither is present on the live instance, but the recorder's own shipped
    * bundle reads both, so they appear when the configured model is unusable or

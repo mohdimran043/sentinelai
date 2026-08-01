@@ -124,7 +124,7 @@ describe('ModelsPage — local stack', () => {
 
     await tableNamed(/Local models/)
     expect(screen.getByText(/MEASURED PROMPT VIOLATION/)).toBeInTheDocument()
-    expect(screen.getByText(REAL_MODELS.catalog_note)).toBeInTheDocument()
+    expect(screen.getByText(REAL_MODELS.catalog_note!)).toBeInTheDocument()
   })
 
   it('says so when no local runtime answers', async () => {
@@ -186,12 +186,36 @@ describe('ModelsPage — perception tiers', () => {
 
     const table = await tableNamed(/Perception tiers/)
     const rows = within(table).getAllByRole('row').slice(1)
-    expect(rows).toHaveLength(REAL_MODELS.tiers.length)
+    expect(rows).toHaveLength(REAL_MODELS.tiers!.length)
     expect(within(table).getAllByText('NOT_BUILT')).toHaveLength(6)
     expect(within(table).getAllByText('PARTIAL')).toHaveLength(1)
     expect(
       within(table).getByText(/No detector runs. Nothing counts people/),
     ).toBeInTheDocument()
+  })
+})
+
+describe('ModelsPage — a recorder that reports less', () => {
+  it('still renders the parts it was given when the optional blocks are absent', async () => {
+    server.use(
+      recorderModelsHandler({
+        status: REAL_MODELS.status,
+        local: REAL_MODELS.local,
+        frontier: REAL_MODELS.frontier,
+        frontier_credentialed: false,
+        frontier_note: REAL_MODELS.frontier_note,
+      }),
+    )
+    renderWithProviders(<ModelsPage />)
+
+    // The load-bearing parts survive...
+    expect(await screen.findByText('Nothing is reading the footage')).toBeInTheDocument()
+    expect(await tableNamed(/Local models/)).toBeInTheDocument()
+    expect(await tableNamed(/Offsite models/)).toBeInTheDocument()
+    // ...and the blocks with no data are simply absent, not invented.
+    expect(screen.queryByRole('table', { name: /Perception tiers/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('where inference runs')).not.toBeInTheDocument()
+    expect(screen.queryByText(/What the recorder has measured/)).not.toBeInTheDocument()
   })
 })
 
