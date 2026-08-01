@@ -161,13 +161,34 @@ class EngineService:
         """Cancel all, then await all — never cancel-and-await one at a time.
 
         Awaiting each task before cancelling the next would let a still-running task
-        keep producing work for a phase that has already been torn down."""
+        keep producing work for a phase that has already been torn down.
+
+        The `cancelling()` bookkeeping is what makes the ordering in `stop()` mean
+        anything. A blanket `suppress(CancelledError)` here cannot tell "the task I
+        awaited ended via cancellation" — expected, keep unwinding — from "*my own*
+        `stop()` was cancelled while I awaited it". Swallowing the second case lets
+        `stop()` silently skip the remaining phases and cancel the scheduler while a
+        camera's `finally` is still running unawaited, which drops exactly the event
+        that ordering exists to preserve. That is reachable in production: uvicorn's
+        `--timeout-graceful-shutdown` cancels the ASGI lifespan's shutdown task, and
+        this phase deliberately takes longer than the old one-pass teardown did.
+
+        `Task.cancelling()` counts cancellations requested *of this task*, so a rise
+        across the await means the cancellation was aimed at us, not delivered by the
+        task we were waiting on. Re-raise so the caller learns shutdown was cut short.
+        """
         live = [task for task in tasks if task is not None]
         for task in live:
             task.cancel()
+
+        current = asyncio.current_task()
         for task in live:
-            with contextlib.suppress(asyncio.CancelledError):
+            requested_before = current.cancelling() if current is not None else 0
+            try:
                 await task
+            except asyncio.CancelledError:
+                if current is not None and current.cancelling() > requested_before:
+                    raise
 
     def cameras(self) -> tuple[CameraTelemetry, ...]:
         return tuple(runner.telemetry() for runner in self._cameras.values())

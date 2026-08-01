@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
 
@@ -509,3 +510,55 @@ async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description
     assert event.threat.value == pytest.approx(0.3), (
         "the 0.5 placeholder makes every event score identically and triage useless"
     )
+
+
+class TestStopUnderExternalCancellation:
+    """`stop()` must not silently skip its remaining phases when *it* is cancelled.
+
+    The ordering in `stop()` exists so a camera's `finally` can submit its preserved
+    escalation while the scheduler worker is still alive. A blanket
+    `suppress(CancelledError)` around `await task` cannot tell "the task I awaited
+    ended via cancellation" from "my own stop() was cancelled while awaiting it" —
+    and swallowing the second lets stop() march on and cancel the scheduler while a
+    camera's cleanup is still running unawaited, dropping exactly the event the
+    ordering protects. Reachable in production: uvicorn's
+    --timeout-graceful-shutdown cancels the ASGI lifespan's shutdown task.
+    """
+
+    async def test_cancelling_stop_propagates_instead_of_being_swallowed(self) -> None:
+        started = asyncio.Event()
+
+        async def lingering_cleanup() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Cleanup that outlives its own cancellation, like CameraRunner's
+                # finally. Bounded yields, so the test cannot hang if the guard
+                # regresses — it fails instead.
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                raise
+
+        registry = ModelRegistry()
+        service = EngineService(
+            cameras={},
+            registry=registry,
+            resident_set=ResidentSet(registry, total_mib=8192, reserved_mib=2048),
+            scheduler=None,  # type: ignore[arg-type]
+            required_model_keys=(),
+            clock=lambda: 0.0,
+        )
+        camera_task = asyncio.create_task(lingering_cleanup())
+        service._camera_tasks = [camera_task]
+        await started.wait()
+
+        stop_task = asyncio.create_task(service.stop())
+        await asyncio.sleep(0)
+        stop_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await camera_task
