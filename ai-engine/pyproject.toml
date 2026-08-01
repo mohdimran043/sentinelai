@@ -19,11 +19,16 @@ runtime = [
     "numpy>=1.26,<2.2",
     "aio-pika>=9.4",
     "minio>=7.2",
+    # sv.ByteTrack is a numpy/scipy association algorithm with no torch
+    # dependency, unlike everything else in the gpu extra, so it runs (and is
+    # tested) on CPU in CI. Pinned <0.28: sv.ByteTrack is deprecated from
+    # 0.28 and raises a FutureWarning at construction time, which is fatal
+    # under this suite's -W error.
+    "supervision>=0.24,<0.28",
 ]
 gpu = [
     "torch>=2.5",
     "ultralytics>=8.3",
-    "supervision>=0.24",
     "transformers>=4.49",
     "accelerate>=1.0",
     "bitsandbytes>=0.43",

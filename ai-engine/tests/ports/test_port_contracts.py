@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector
+from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
 from sentinel_ai.domain.entities import (
     BBox,
     Detection,
@@ -134,6 +135,10 @@ def test_yolo11_detector_satisfies_object_detector_and_model_runtime() -> None:
     """
     assert issubclass(Yolo11Detector, ObjectDetector)
     assert issubclass(Yolo11Detector, ModelRuntime)
+
+
+def test_bytetrack_tracker_satisfies_tracker() -> None:
+    assert issubclass(ByteTrackTracker, Tracker)
 
 
 class TestFakeDetector:
