@@ -7,9 +7,7 @@ from sentinel_ai.ports.model_runtime import LifecycleState
 from tests.fakes.models import FakeModelRuntime
 
 DETECTOR_SPEC = ModelSpec(model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None)
-VLM_SPEC = ModelSpec(
-    model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0
-)
+VLM_SPEC = ModelSpec(model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0)
 
 
 def test_register_and_get_round_trip() -> None:

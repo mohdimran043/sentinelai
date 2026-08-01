@@ -8,9 +8,7 @@ TOTAL_MIB = 8192
 RESERVED_MIB = 2048
 
 DETECTOR_SPEC = ModelSpec(model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None)
-VLM_SPEC = ModelSpec(
-    model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0
-)
+VLM_SPEC = ModelSpec(model_key="qwen25vl3b", vram_mib=4400, priority=50, idle_unload_seconds=600.0)
 
 
 def new_resident_set() -> tuple[ResidentSet, FakeModelRuntime, FakeModelRuntime]:
