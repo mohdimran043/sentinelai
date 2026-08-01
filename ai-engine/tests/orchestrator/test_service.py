@@ -735,6 +735,81 @@ async def test_a_drain_that_runs_out_of_budget_dead_letters_instead_of_losing_ev
     )
 
 
+async def test_stop_drains_the_queue_rather_than_cancelling_the_worker_on_top_of_it() -> None:
+    """B6: pin `drain()` itself.
+
+    Deleting the drain from `stop()` entirely — keeping the C3 phase ordering — SURVIVED
+    all 437 tests. The ordering carried the pin; the drain, the part that matters once
+    the VLM takes real multi-second time, carried nothing: every existing test's fake
+    describe completes inside a single worker step, so the turns that cancelling the
+    cameras already yields are enough and the drain is never load-bearing.
+
+    This describe takes many event-loop turns and no wall-clock time. Without the
+    drain, the worker is cancelled mid-describe and the event is lost outright — or,
+    after B5, dead-lettered rather than published, which is a strictly weaker outcome
+    than the one the ordering promises. So this asserts the strong property: the event
+    is *published*, and nothing was dead-lettered on the way.
+    """
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    class SlowVlm(VisionLanguageModel):
+        """Many suspension points, zero wall clock — what a real Qwen generate looks
+        like to the event loop, minus the seconds."""
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def describe(self, request: VisionRequest) -> SceneDescription:
+            self.started.set()
+            for _ in range(200):
+                await asyncio.sleep(0)
+            return SceneDescription(
+                description="A person is loitering by the gate.",
+                threat_value=0.6,
+                suggested_action="Dispatch a patrol.",
+            )
+
+    publisher = FakePublisher()
+    dead_letter = FakeFailedEventSink()
+    vlm = SlowVlm()
+    scheduler = VlmScheduler(
+        vlm=vlm,
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
+        dead_letter=dead_letter,
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    service = EngineService(
+        cameras={},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=clock,
+    )
+    await service.start()
+
+    request = an_escalation_request()
+    assert scheduler.submit(request)
+    await asyncio.wait_for(vlm.started.wait(), timeout=5.0)
+
+    await service.stop()
+
+    assert [event.event_id for event in publisher.events] == [request.event_id], (
+        "the drain is what lets an in-flight describe finish and publish"
+    )
+    assert dead_letter.stored == [], "a drained escalation must not need the last resort"
+    assert scheduler.abandoned == 0
+    assert publisher.events[0].description_unavailable is False
+
+
 class TestStopUnderExternalCancellation:
     """`stop()` must not silently skip its remaining phases when *it* is cancelled.
 
