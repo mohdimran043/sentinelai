@@ -34,8 +34,11 @@ def _validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
-_FINITE_FIELDS = ("occurred_at", "threat_score")
-"""The two numeric fields on the wire. Both must be finite; see `_require_finite`."""
+_FINITE_FIELDS = ("occurred_at", "source_timestamp", "threat_score")
+"""Every numeric field on the wire. All must be finite; see `_require_finite`.
+
+`source_timestamp` is nullable, and `None` is not a number, so it is skipped by the
+`isinstance` guard below rather than needing a case of its own."""
 
 
 def _require_finite(payload: Mapping[str, object]) -> None:
@@ -79,6 +82,11 @@ def encode_event(event: Event) -> dict[str, object]:
         "event_id": str(event.event_id),
         "camera_id": event.camera_id,
         "occurred_at": event.occurred_at,
+        # Both timelines, never one: `occurred_at` is Unix epoch seconds and is what a
+        # consumer sorts and displays on; `source_timestamp` is the camera's own
+        # timeline, which is what correlates the event with a clip's pts. See
+        # `Event`'s docstring and the descriptions in the committed schema.
+        "source_timestamp": event.source_timestamp,
         "reason": event.reason.value,
         "threat_score": event.threat.value,
         "severity": event.threat.severity.value,
@@ -98,10 +106,15 @@ def encode_event(event: Event) -> dict[str, object]:
 def decode_event(payload: Mapping[str, object]) -> Event:
     validate_payload(payload)
     data = cast(dict[str, Any], dict(payload))
+    # Absent and explicit-null both decode to None: the field is optional on the wire,
+    # so a payload written before it existed (one already sitting on the disk spool,
+    # say) must still replay rather than raising on a missing key.
+    source_timestamp = data.get("source_timestamp")
     return Event(
         event_id=UUID(data["event_id"]),
         camera_id=data["camera_id"],
         occurred_at=float(data["occurred_at"]),
+        source_timestamp=None if source_timestamp is None else float(source_timestamp),
         reason=EscalationReason(data["reason"]),
         threat=ThreatScore(value=float(data["threat_score"]), severity=Severity(data["severity"])),
         description=data["description"],

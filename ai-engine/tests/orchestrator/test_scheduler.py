@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
@@ -120,15 +121,24 @@ class HangingVisionLLM(VisionLanguageModel):
         raise AssertionError("unreachable: the event is never set")  # pragma: no cover
 
 
+def wall_clock() -> float:
+    """A frozen wall clock, so `occurred_at` is exactly predictable in a test.
+
+    A real `time.time()` here would make every epoch assertion below a moving target
+    and would put a wall-clock read in CI for no benefit."""
+    return 1_700_000_000.0
+
+
 def a_request(
     clip: ClipHandle | None = None,
     reason: EscalationReason = EscalationReason.PERIODIC_SUMMARY,
     tracks: tuple[Track, ...] = (),
+    timestamp: float = 12.5,
 ) -> EscalationRequest:
     scene = SceneState(
         camera_id="cam-1",
         frame_index=0,
-        timestamp=12.5,
+        timestamp=timestamp,
         detections=(Detection("person", 0.9, BOX),),
         tracks=tracks,
         motion_energy=0.1,
@@ -186,6 +196,8 @@ def new_scheduler(
     timeout_seconds: float = 5.0,
     resident_set: ResidentSet | None = None,
     dead_letter: FailedEventSink | None = None,
+    clock: Callable[[], float] = clock,
+    wall_clock: Callable[[], float] = wall_clock,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -204,6 +216,7 @@ def new_scheduler(
         maxsize=maxsize,
         timeout_seconds=timeout_seconds,
         clock=clock,
+        wall_clock=wall_clock,
     )
 
 
@@ -226,7 +239,7 @@ async def test_a_submitted_escalation_is_described_and_published() -> None:
     assert event.suggested_action == "Monitor."
     assert event.threat.value == pytest.approx(0.3)
     assert event.description_unavailable is False
-    assert event.occurred_at == pytest.approx(12.5), "the scene's timestamp, not the clock's"
+    assert event.source_timestamp == pytest.approx(12.5), "the scene's timestamp, not the clock's"
     assert vlm.call_count == 1
 
 
@@ -805,3 +818,103 @@ class TestAdmissionSlotIsNeverLeaked:
         assert publisher.attempts == 2
         assert len(publisher.events) == 1
         assert admission.in_flight == 0
+
+
+class TestEventTimestamps:
+    """D1: `occurred_at` is Unix epoch seconds; the source timeline is kept beside it.
+
+    `occurred_at` used to be `scene.timestamp` verbatim — `time.monotonic()` on RTSP.
+    A live run published `"occurred_at": 51181.128868795`: a number that resets on
+    every restart, shares no origin with a replay camera in the same process, and
+    cannot be converted to a wall time, while `event_codec`'s docstring tells the Go
+    consumer to sort by it.
+
+    The monotonic anchor here is deliberately 51_181.0 — the live run's own reading —
+    rather than the frozen 0.0 the rest of this module uses, because at 0.0 the anchor
+    arithmetic degenerates to `wall + source` and an implementation that never
+    subtracts `mono_at_anchor` would pass.
+    """
+
+    MONO_AT_ANCHOR = 51_181.0
+    WALL_AT_ANCHOR = 1_700_000_000.0
+
+    def _stepping_wall_clock(self) -> Callable[[], float]:
+        """A wall clock that jumps 100s every time it is read.
+
+        Any implementation that samples it per event rather than once at construction
+        gets caught twice over: the absolute value is wrong, and — the part that
+        matters — the gap between two events stops matching the gap between their
+        source timestamps, which is exactly how an NTP step reorders two events
+        relative to each other.
+        """
+        reads = iter(self.WALL_AT_ANCHOR + 100.0 * step for step in range(100))
+        return lambda: next(reads)
+
+    def _scheduler(self, publisher: FakePublisher) -> VlmScheduler:
+        return new_scheduler(
+            publisher=publisher,
+            clock=lambda: self.MONO_AT_ANCHOR,
+            wall_clock=self._stepping_wall_clock(),
+        )
+
+    async def test_occurred_at_is_the_source_timestamp_rebased_onto_unix_epoch(self) -> None:
+        """Fails against the old field with `occurred_at == 12.5` — a Thursday in
+        January 1970, and the same value on the next restart."""
+        publisher = FakePublisher()
+        async with Worker(self._scheduler(publisher)) as scheduler:
+            scheduler.submit(a_request(timestamp=12.5))
+            await scheduler.drain()
+
+        expected = self.WALL_AT_ANCHOR + (12.5 - self.MONO_AT_ANCHOR)
+        assert publisher.events[0].occurred_at == pytest.approx(expected)
+        assert publisher.events[0].occurred_at > 1_600_000_000.0, (
+            "a plausible Unix epoch, not a monotonic reading"
+        )
+
+    async def test_two_events_are_exactly_their_source_delta_apart(self) -> None:
+        """The property the anchor exists for. Fails against a `time.time()` read per
+        event: the wall clock steps 100s between the two assemblies here, so the pair
+        would come out 108s apart instead of 8s — and a backwards step would put them
+        in the wrong order."""
+        publisher = FakePublisher()
+        async with Worker(self._scheduler(publisher)) as scheduler:
+            scheduler.submit(a_request(timestamp=12.5))
+            await scheduler.drain()
+            scheduler.submit(a_request(timestamp=20.5))
+            await scheduler.drain()
+
+        first, second = (event.occurred_at for event in publisher.events)
+        assert second - first == pytest.approx(8.0), (
+            "exactly the source delta — the anchor is read once, not per event"
+        )
+
+    async def test_the_raw_source_timeline_is_kept_alongside(self) -> None:
+        """Rebasing must not throw the source timeline away: it is what correlates an
+        event with its clip's pts and with `CameraTelemetry`. Fails against an
+        implementation that only converts."""
+        publisher = FakePublisher()
+        async with Worker(self._scheduler(publisher)) as scheduler:
+            scheduler.submit(a_request(timestamp=12.5))
+            await scheduler.drain()
+
+        assert publisher.events[0].source_timestamp == pytest.approx(12.5)
+
+    async def test_an_abandoned_escalation_is_stamped_the_same_way(self) -> None:
+        """`_assemble` is the single construction site (S14) precisely so no error path
+        can produce a differently-shaped event. The §9 fallback must carry both
+        timelines too, or a dead-lettered event is the one an operator cannot place in
+        time."""
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(
+            dead_letter=dead_letter,
+            clock=lambda: self.MONO_AT_ANCHOR,
+            wall_clock=self._stepping_wall_clock(),
+        )
+        assert scheduler.submit(a_request(timestamp=12.5))
+        assert await scheduler.abandon_pending(RuntimeError("shutdown")) == 1
+
+        stored = dead_letter.events[0]
+        assert stored.occurred_at == pytest.approx(
+            self.WALL_AT_ANCHOR + (12.5 - self.MONO_AT_ANCHOR)
+        )
+        assert stored.source_timestamp == pytest.approx(12.5)

@@ -141,7 +141,22 @@ class ThreatScore:
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    """The unit published to the Web Platform. Carries no model identity (spec §3.3)."""
+    """The unit published to the Web Platform. Carries no model identity (spec §3.3).
+
+    Two timestamps, deliberately, because one field cannot be both things at once:
+
+    * `occurred_at` is **Unix epoch seconds** (UTC, fractional) — the field a consumer
+      sorts and displays on. It survives a restart and it means the same thing for an
+      RTSP camera and a replay camera in the same process.
+    * `source_timestamp` is the raw **source timeline** the scene was observed on:
+      `time.monotonic()` for a live RTSP camera, seconds-from-start-of-file for a
+      replayed one. It is the timeline a clip's pts and `CameraTelemetry` are on, so it
+      is what correlates an event with its evidence — and it is comparable *only*
+      within one process run for one camera.
+
+    Neither is derived here: `domain/` reads no clock, so both arrive already computed
+    (see `VlmScheduler._assemble`, the one place an `Event` is constructed).
+    """
 
     event_id: UUID
     camera_id: str
@@ -150,6 +165,7 @@ class Event:
     threat: ThreatScore
     description: str
     suggested_action: str
+    source_timestamp: float | None = None
     labels: tuple[str, ...] = ()
     track_ids: tuple[int, ...] = ()
     keyframe_uri: str | None = None

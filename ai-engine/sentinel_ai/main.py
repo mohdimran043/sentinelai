@@ -477,6 +477,10 @@ def compose(
         # different clock from the camera pipeline's, which has none of its own and
         # runs entirely on the source timeline (see pipeline/runner.py).
         clock=time.monotonic,
+        # The other half of the event-timestamp anchor. Read once, next to the
+        # monotonic reading above, so `Event.occurred_at` is Unix epoch seconds that
+        # no NTP step can reorder — see `VlmScheduler._to_epoch`.
+        wall_clock=time.time,
     )
     runners = {
         config.camera_id: CameraRunner(

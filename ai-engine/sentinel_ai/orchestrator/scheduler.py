@@ -59,6 +59,14 @@ deficit without bound. This is deliberately **not** the same clock as the camera
 pipeline's: `CameraRunner` has no clock of its own and runs entirely on the source's
 timeline (see `pipeline/runner.py`). The two agree only for a live RTSP source and
 must not be conflated.
+
+Event timestamps
+----------------
+Which is exactly why an event carries two of them. `Event.source_timestamp` is the
+scene's own timeline, unmodified — the thing a clip's pts and the camera telemetry
+share. `Event.occurred_at` is Unix epoch seconds, rebased onto the wall clock through
+`_to_epoch` so a consumer can sort, display and compare events across restarts and
+across cameras. See `_to_epoch` for why the anchor is captured exactly once.
 """
 
 from __future__ import annotations
@@ -66,6 +74,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from uuid import UUID
@@ -161,6 +170,7 @@ class VlmScheduler:
         maxsize: int,
         timeout_seconds: float,
         clock: Callable[[], float],
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._vlm = vlm
         self._publisher = publisher
@@ -173,6 +183,11 @@ class VlmScheduler:
         self._dead_letter = dead_letter
         self._timeout_seconds = timeout_seconds
         self._clock = clock
+        # Read adjacently and exactly once — see `_to_epoch`. Both readings are
+        # injected rather than taken from `time` directly so no test needs a real
+        # clock to pin the arithmetic.
+        self._wall_at_anchor = wall_clock()
+        self._mono_at_anchor = clock()
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
         self._publish_failures = 0
@@ -422,6 +437,37 @@ class VlmScheduler:
             self._resident_set.mark_unhealthy(self._vlm_model_key, detail)
             raise
 
+    def _to_epoch(self, source_timestamp: float) -> float:
+        """Rebase a source timestamp onto Unix epoch seconds through the boot anchor.
+
+        `occurred_at` used to be `scene.timestamp` verbatim, which for an RTSP camera is
+        `time.monotonic()` — a live run published `"occurred_at": 51181.128868795`. That
+        value resets on every restart, does not share an origin with a replay camera in
+        the same process, and cannot be turned into a wall time by a consumer, while the
+        codec's docstring tells the Go consumer to sort by it.
+
+        **Why the anchor is read once, at construction, and never again.** The obvious
+        alternative — `time.time()` per event — makes `occurred_at` a fresh sample of a
+        clock that `ntpd`, `chronyd` or a hypervisor can step backwards at any moment. Two
+        events a second apart could then land out of order relative to each other, which
+        is precisely the ordering the consumer is told to rely on. Offsetting from one
+        anchor instead makes the difference between any two `occurred_at` values from the
+        same source *exactly* the difference between their source timestamps: the
+        absolute value is as accurate as the anchor was, and the ordering is as reliable
+        as the monotonic clock, which is to say perfectly.
+
+        **What this means per source kind.** The conversion is exact for any source on
+        the same monotonic timeline as `clock` — i.e. every live RTSP camera, which is
+        what `RtspSource` stamps frames with. `FileSource` restarts at 0.0 per file and
+        is *not* on that timeline, so a replayed event is stamped
+        `wall_at_anchor - mono_at_anchor + pts`, i.e. relative to the wall time at this
+        machine's monotonic origin rather than to now. It is a stable, ordered,
+        epoch-shaped number and it is fine for a replay corpus, but it is not the moment
+        the footage was observed; `source_timestamp` is the field to use when what you
+        want is a replay's position in its file.
+        """
+        return self._wall_at_anchor + (source_timestamp - self._mono_at_anchor)
+
     def _assemble(
         self,
         request: EscalationRequest,
@@ -441,7 +487,8 @@ class VlmScheduler:
         return Event(
             event_id=request.event_id,
             camera_id=request.camera_id,
-            occurred_at=request.scene.timestamp,
+            occurred_at=self._to_epoch(request.scene.timestamp),
+            source_timestamp=request.scene.timestamp,
             reason=request.reason,
             threat=threat,
             description=description,

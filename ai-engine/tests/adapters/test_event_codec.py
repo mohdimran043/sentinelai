@@ -20,6 +20,9 @@ def make_event(**overrides: object) -> Event:
         "event_id": uuid4(),
         "camera_id": "cam-1",
         "occurred_at": 1_700_000_000.0,
+        # The two timelines an event carries. The source value is the one a live run
+        # actually published as `occurred_at` before D1 — a `time.monotonic()` reading.
+        "source_timestamp": 51_181.128868795,
         "reason": EscalationReason.SPEED_ANOMALY,
         "threat": ThreatScore.from_value(0.72),
         "description": "A person is running toward the gate.",
@@ -71,6 +74,48 @@ def test_round_trip_preserves_a_minimal_event() -> None:
         description="",
     )
     assert decode_event(encode_event(original)) == original
+
+
+class TestBothTimelinesAreOnTheWire:
+    """D1. `occurred_at` used to be the *source* timeline — a live run published
+    `"occurred_at": 51181.128868795`, a `time.monotonic()` reading — while this
+    module's own docstring tells the Phase 1C Go consumer to sort by it. The two
+    timelines now travel as two fields, and the schema says which is which.
+    """
+
+    def test_the_payload_carries_both_and_they_are_distinct(self) -> None:
+        payload = encode_event(make_event())
+        assert payload["occurred_at"] == 1_700_000_000.0
+        assert payload["source_timestamp"] == 51_181.128868795
+
+    def test_a_round_trip_keeps_the_source_timeline(self) -> None:
+        """Fails against a codec that encodes the new field but drops it on decode:
+        the spool round-trips through exactly this path, so a replayed event would
+        silently lose the value that ties it to its clip."""
+        original = make_event()
+        assert decode_event(encode_event(original)).source_timestamp == 51_181.128868795
+
+    def test_a_payload_written_before_the_field_existed_still_decodes(self) -> None:
+        """Optional on the wire, and it has to be: the disk spool holds payloads
+        written by an older build, and `replay_spool` must not choke on them."""
+        payload = encode_event(make_event())
+        del payload["source_timestamp"]
+        validate_payload(payload)
+        assert decode_event(payload).source_timestamp is None
+
+    def test_the_schema_documents_what_each_timeline_means(self) -> None:
+        """The schema is the artefact Phase 1C generates its Go client from, so the
+        semantics have to live there and not only in a Python docstring. Fails against
+        the bare `{"type": "number"}` this field shipped with, which is precisely how
+        the two readings of `occurred_at` came to disagree in the first place."""
+        properties = json.loads(EVENT_SCHEMA_PATH.read_text(encoding="utf-8"))["properties"]
+        assert "epoch" in properties["occurred_at"]["description"].lower()
+        assert "monotonic" in properties["source_timestamp"]["description"].lower()
+
+    def test_the_schema_rejects_a_source_timestamp_that_is_not_a_number(self) -> None:
+        payload = encode_event(make_event()) | {"source_timestamp": "51181.13"}
+        with pytest.raises(ValidationError):
+            validate_payload(payload)
 
 
 def test_event_id_is_serialized_as_a_uuid_string() -> None:
@@ -135,6 +180,23 @@ class TestNonFiniteNumbersNeverReachTheWire:
         schema alone cannot catch this."""
         with pytest.raises(ValueError, match="occurred_at must be a finite number"):
             encode_event(make_event(occurred_at=value))
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_source_timestamp_is_rejected_on_encode(self, value: float) -> None:
+        """The second numeric timeline needs the same guard as the first: a bare `NaN`
+        token anywhere in the payload breaks Go's `encoding/json` for the whole event,
+        not merely for the field that carries it.
+
+        Fails against a `_FINITE_FIELDS` that was never widened when the field was
+        added — the payload encodes cleanly and the consumer's decode loop is what
+        finds out."""
+        with pytest.raises(ValueError, match="source_timestamp must be a finite number"):
+            encode_event(make_event(source_timestamp=value))
+
+    def test_a_null_source_timestamp_is_not_mistaken_for_a_non_finite_one(self) -> None:
+        """The field is nullable, so the finite check must skip `None` rather than
+        trip over it."""
+        assert encode_event(make_event(source_timestamp=None))["source_timestamp"] is None
 
     def test_a_nan_threat_score_is_rejected_on_encode(self) -> None:
         """NaN is the one that gets through the schema: `maximum: 1.0` already stops

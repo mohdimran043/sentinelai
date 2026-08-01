@@ -1086,7 +1086,9 @@ class TestOneTimeBasePerCamera:
         assert runner.telemetry().last_escalation_at == pytest.approx(1.4), (
             "the last frame's own timestamp, not a reading from a second clock"
         )
-        assert publisher.events[0].occurred_at == pytest.approx(1.4)
+        # `source_timestamp`, not `occurred_at`: since D1 the latter is Unix epoch
+        # seconds, and this test is about which *source* instant was stamped.
+        assert publisher.events[0].source_timestamp == pytest.approx(1.4)
 
     async def test_the_clip_deadline_is_on_the_same_timeline_as_the_packets(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1141,7 +1143,10 @@ class TestOneTimeBasePerCamera:
         assert handle.finished is True, "the post-roll deadline must be reachable"
         owning = next(event for event in publisher.events if event.clip_uri is not None)
         last_pts = handle.packets[-1].pts
-        assert last_pts - owning.occurred_at == pytest.approx(3.0, abs=0.11), (
+        # Against `source_timestamp`: packet pts are on the source timeline, and since
+        # D1 that is the field carrying it — `occurred_at` is Unix epoch seconds.
+        assert owning.source_timestamp is not None
+        assert last_pts - owning.source_timestamp == pytest.approx(3.0, abs=0.11), (
             "the clip must keep recording for its whole post-roll after the escalation; "
-            f"escalated at {owning.occurred_at}, last packet at {last_pts}"
+            f"escalated at {owning.source_timestamp}, last packet at {last_pts}"
         )

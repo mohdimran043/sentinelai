@@ -27,7 +27,14 @@
       "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
     },
     "camera_id": { "type": "string", "minLength": 1 },
-    "occurred_at": { "type": "number" },
+    "occurred_at": {
+      "type": "number",
+      "description": "When the anomaly happened, as Unix epoch seconds (UTC, fractional). Comparable across process restarts and across cameras, whatever kind of source each camera runs: sort and display on this field. Derived from a single wall+monotonic anchor taken once per engine process, so the difference between two events from the same camera is exactly the difference between their source timestamps and no clock step can reorder them relative to each other. Not NTP-corrected after the anchor is taken, so treat it as accurate to the anchor, not to the nanosecond."
+    },
+    "source_timestamp": {
+      "type": ["number", "null"],
+      "description": "The camera source's own timeline for the same instant — time.monotonic() for a live RTSP camera, seconds-from-start-of-file for a replayed one. This is the timeline a clip's pts and the camera telemetry are on, so it is what correlates an event with its evidence. Meaningful only within one process run for one camera: it resets on restart and two cameras do not share an origin. Never sort or display on it. Optional and nullable — absent or null on an event produced before this field existed."
+    },
     "reason": {
       "type": "string",
       "enum": [
