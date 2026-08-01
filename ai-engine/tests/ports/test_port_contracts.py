@@ -7,6 +7,7 @@ import pytest
 
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector
 from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
+from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.domain.entities import (
     BBox,
     Detection,
@@ -139,6 +140,14 @@ def test_yolo11_detector_satisfies_object_detector_and_model_runtime() -> None:
 
 def test_bytetrack_tracker_satisfies_tracker() -> None:
     assert issubclass(ByteTrackTracker, Tracker)
+
+
+def test_qwen25vl_describer_satisfies_vision_llm_and_model_runtime() -> None:
+    """Class-level only — no instantiation, no weights, no GPU needed, so
+    this belongs beside the fakes' contract checks, not behind @pytest.mark.gpu.
+    """
+    assert issubclass(Qwen25VLDescriber, VisionLanguageModel)
+    assert issubclass(Qwen25VLDescriber, ModelRuntime)
 
 
 class TestFakeDetector:

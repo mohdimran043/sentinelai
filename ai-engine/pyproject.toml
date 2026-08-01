@@ -103,6 +103,18 @@ module = ["ultralytics.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# `transformers.*` gets the same `follow_imports = "skip"` treatment as
+# `ultralytics.*` above, for the same reason: it *is* installed here (the
+# `gpu` extra), so mypy reads its real source rather than treating it as
+# missing, and `strict`'s `disallow_untyped_calls` then flags
+# `from_pretrained`, `BitsAndBytesConfig`, etc. as untyped calls (transformers
+# ships only partial inline types). Skipping makes the installed-here and
+# not-installed-in-CI cases behave identically: `Any` either way.
+module = ["transformers.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
