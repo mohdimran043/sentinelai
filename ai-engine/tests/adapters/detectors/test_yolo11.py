@@ -2,8 +2,11 @@
 
 Only the parts that need no torch, no ultralytics weights, and no GPU run
 without a marker — see yolo11.py's module docstring for why the lazy-import
-split makes that possible. The one fact that genuinely needs the
-`ultralytics` package (its bundled COCO names) and real inference are
+split makes that possible. The salient-class guard test below also runs
+unmarked: it injects a fake `ultralytics` module via `sys.modules` instead of
+needing the real package importable, so the safety-critical guard it proves
+gets checked in plain CI too. The facts that genuinely need the real
+`ultralytics` package (its bundled COCO names) or real inference are
 `@pytest.mark.gpu` further down; CI does not install the `gpu` extra, so
 those are skipped there, not merely deselected.
 """
@@ -63,6 +66,39 @@ def test_to_detections_with_wrong_names_mapping_produces_wrong_labels() -> None:
     assert result[0].label != "person"
 
 
+async def test_real_detector_raises_and_marks_unhealthy_on_missing_salient_classes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-time guard against a mismatched checkpoint: this test would
+    fail (no exception, state stays healthy) if `initialize()` did not
+    actually check `model.names` against `DEFAULT_SALIENT_CLASSES`.
+
+    Injects a fake `ultralytics` module via `sys.modules` rather than
+    monkeypatching an attribute on the real, installed package — the guard
+    this proves is safety-critical (its absence means the system silently
+    never alerts on a person), so it must run in plain CI, which does not
+    install the `gpu` extra `ultralytics` ships under.
+    """
+    import sys
+    import types
+
+    class _FakeYolo:
+        def __init__(self, _weights_path: str) -> None:
+            self.names = {0: "person", 1: "car"}  # missing most salient classes
+
+    fake_ultralytics = types.ModuleType("ultralytics")
+    # `types.ModuleType` has no static `YOLO` attribute to assign directly
+    # under mypy strict; `setattr` is the standard escape for building a fake
+    # module object like this.
+    setattr(fake_ultralytics, "YOLO", _FakeYolo)  # noqa: B010
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultralytics)
+
+    detector = Yolo11Detector(model_id="yolo11s.pt", conf=0.35, iou=0.45, imgsz=640, device="cpu")
+    with pytest.raises(ValueError, match="salient"):
+        await detector.initialize()
+    assert detector.health().state.value == "unhealthy"
+
+
 @pytest.mark.gpu
 def test_real_coco_names_cover_every_default_salient_class() -> None:
     """The bundled coco.yaml ships inside the installed `ultralytics` package
@@ -96,19 +132,26 @@ async def test_real_detector_loads_warms_up_and_reports_health() -> None:
     await detector.initialize()
     await detector.warmup()
     assert detector.health().state.value == "healthy"
-    assert detector.capabilities().vram_mib >= 0
+    assert detector.capabilities().vram_mib > 0
     assert detector.capabilities().labels >= DEFAULT_SALIENT_CLASSES
     await detector.shutdown()
     assert detector.health().state.value == "unloaded"
+    # An unloaded model must not keep reporting VRAM it no longer holds.
+    assert detector.capabilities().vram_mib == 0
 
 
 @pytest.mark.gpu
 async def test_real_detector_detects_a_person_in_a_real_image() -> None:
     """Runs actual inference end-to-end and checks the *content* of the
-    result, not just that it returned without raising — a detector that
-    always returned () would pass a weaker test but fails this one.
+    result on a real photo of a person, not just that it returned without
+    raising: a detector that always returned `()` fails this test (it would
+    only have passed the old, weaker version of it, which asserted merely
+    that a blank frame does not hallucinate a person — a fact `()` also
+    satisfies vacuously).
     """
+    import cv2
     import numpy as np
+    import ultralytics
 
     from sentinel_ai.adapters.detectors.yolo11 import select_device
     from sentinel_ai.ports.frame_source import FrameData
@@ -128,9 +171,30 @@ async def test_real_detector_detects_a_person_in_a_real_image() -> None:
         height=640,
         pixels=np.zeros((640, 640, 3), dtype=np.uint8),
     )
-    detections = await detector.detect(blank)
+    blank_detections = await detector.detect(blank)
+    assert "person" not in {d.label for d in blank_detections}
+
+    # `bus.jpg` ships inside the installed `ultralytics` package (its
+    # long-standing quickstart demo image: a bus with several people at a
+    # stop) — real content, no download, deterministic across runs, and no
+    # new binary fixture added to this repo. `cv2.imread` decodes straight to
+    # BGR `uint8`, matching `FrameData.pixels`' documented convention.
+    image_path = Path(ultralytics.__file__).parent / "assets" / "bus.jpg"
+    pixels = cv2.imread(str(image_path))
+    assert pixels is not None, f"failed to decode fixture image at {image_path}"
+    height, width = pixels.shape[:2]
+    real_photo = FrameData(
+        camera_id="cam-1",
+        frame_index=0,
+        timestamp=0.0,
+        width=width,
+        height=height,
+        pixels=pixels,
+    )
+    detections = await detector.detect(real_photo)
     labels = {d.label for d in detections}
-    assert "person" not in labels
+    assert detections, "expected at least one detection in a real photo of people at a bus stop"
+    assert "person" in labels
 
     await detector.shutdown()
 
@@ -155,25 +219,3 @@ async def test_real_detector_rejects_non_ndarray_pixels() -> None:
     with pytest.raises(TypeError, match="pixels"):
         await detector.detect(bad_frame)
     await detector.shutdown()
-
-
-@pytest.mark.gpu
-async def test_real_detector_raises_and_marks_unhealthy_on_missing_salient_classes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The load-time guard against a mismatched checkpoint: this test would
-    fail (no exception, state stays healthy) if `initialize()` did not
-    actually check `model.names` against `DEFAULT_SALIENT_CLASSES`.
-    """
-    import ultralytics
-
-    class _FakeYolo:
-        def __init__(self, _weights_path: str) -> None:
-            self.names = {0: "person", 1: "car"}  # missing most salient classes
-
-    monkeypatch.setattr(ultralytics, "YOLO", _FakeYolo)
-
-    detector = Yolo11Detector(model_id="yolo11s.pt", conf=0.35, iou=0.45, imgsz=640, device="cpu")
-    with pytest.raises(ValueError, match="salient"):
-        await detector.initialize()
-    assert detector.health().state.value == "unhealthy"

@@ -40,6 +40,29 @@ of launch context. The env var mirrors the `SENTINEL_` settings prefix
 without adding a field to the frozen `Settings` class (S1 is closed here).
 """
 
+_CUDA_CONTEXT_OVERHEAD_MIB = 300
+"""Fixed tax added on top of `torch.cuda.memory_reserved()` in `warmup()`.
+
+`torch.cuda.memory_allocated()` — the naive choice — only counts currently
+live tensors; it excludes the caching allocator's reserved pool entirely.
+`memory_reserved()` is materially closer to reality (it *is* memory the
+driver has actually handed to this process), but it still misses the CUDA
+context itself — created on first kernel launch, ~150-300 MiB, held for the
+life of the process — and cuDNN/cuBLAS workspace buffers. Both of those are
+real and visible to `nvidia-smi`, but no torch-level API surfaces the
+context's true size.
+
+This constant is therefore a deliberate, documented over-estimate rather
+than a measured value. `capabilities().vram_mib` feeds `plan_residency()`
+(`sentinel_ai/domain/policy/vram_budget.py`), which does hard
+admission-control arithmetic against the total VRAM budget: the planner
+evicting one model too early because this estimate ran high is recoverable;
+an OOM mid-escalation because it ran low is not. Measured on an RTX 4060 with
+YOLO11s at imgsz=640: `memory_allocated()` 68 MiB, `memory_reserved()` 132
+MiB, real `nvidia-smi` delta ~281 MiB — i.e. even `memory_reserved()` alone
+undershoots by ~150 MiB, which is what this constant is covering.
+"""
+
 
 def select_device() -> str:
     """Return "cuda" if a CUDA device is visible, else "cpu".
@@ -137,7 +160,8 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
         import torch
 
         if torch.cuda.is_available():
-            self._vram_mib = int(torch.cuda.memory_allocated(self._device) // (1024 * 1024))
+            reserved_mib = torch.cuda.memory_reserved(self._device) // (1024 * 1024)
+            self._vram_mib = int(reserved_mib) + _CUDA_CONTEXT_OVERHEAD_MIB
         self._state = LifecycleState.HEALTHY
 
     async def detect(self, frame: FrameData) -> tuple[Detection, ...]:
@@ -174,6 +198,7 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
 
     async def shutdown(self) -> None:
         self._model = None
+        self._vram_mib = 0
         import torch
 
         if torch.cuda.is_available():
