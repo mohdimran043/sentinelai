@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
@@ -123,6 +124,52 @@ class EngineService:
         )
 
     async def stop(self) -> None:
+        """Unwind in phase order, and dead-letter the queue if we are cut short.
+
+        A cancelled `stop()` **stays** cut short: the `CancelledError` propagates, the
+        remaining phases do not run, and this never degrades into a slow graceful
+        shutdown. What it must not do is take the queue down with it. Spec §9 says an
+        anomaly event is never lost to an infrastructure failure, and a forced shutdown
+        — uvicorn's `--timeout-graceful-shutdown`, a supervisor kill, a timed-out ASGI
+        lifespan — is one: an operator who SIGTERMs the service does not thereby consent
+        to losing the anomaly it was midway through recording. So on the way out,
+        whatever is still queued or in flight is spilled to the same `DeadLetterSpool`
+        the drain-cap path already uses, and is recoverable from disk afterwards.
+
+        See `_unwind` for the phase ordering itself and `_spill_to_dead_letter` for why
+        the spill is safe to run from a cancelled coroutine.
+        """
+        try:
+            await self._unwind()
+        except asyncio.CancelledError as cancellation:
+            await self._spill_to_dead_letter(cancellation)
+            raise
+
+    async def _spill_to_dead_letter(self, reason: BaseException) -> None:
+        """Dead-letter whatever the cancelled shutdown was still holding.
+
+        Cancellation can arrive in any phase, so the worker may well still be running
+        and `abandon_pending()` may not be called against a live worker — it empties the
+        queue, and racing the worker for the same request could publish and dead-letter
+        it twice. Hence cancel-then-await here before spilling. That await is wrapped
+        rather than left bare because the caller is already being cancelled: a second
+        cancellation delivered while we wait must not cost us the spill, which is the
+        whole point of being here.
+
+        This cannot itself turn into a slow shutdown. Cancelling a worker that is
+        awaiting a describe unwinds it at its next suspension point, and
+        `DeadLetterSpool.store` is a synchronous local write behind an `async def` — no
+        broker, no network, nothing that can hang. That is exactly why §9's last resort
+        is the right mechanism here and a publish attempt would not be.
+        """
+        task, self._scheduler_task = self._scheduler_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+        await self._scheduler.abandon_pending(reason)
+
+    async def _unwind(self) -> None:
         """Unwind in producer-then-consumer order, draining the queue in between.
 
         The order is the whole point. `CameraRunner.run()`'s `finally` deliberately

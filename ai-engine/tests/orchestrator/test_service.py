@@ -810,8 +810,32 @@ async def test_stop_drains_the_queue_rather_than_cancelling_the_worker_on_top_of
     assert publisher.events[0].description_unavailable is False
 
 
+class LingeringCameraTask:
+    """A camera task whose cleanup outlives its own cancellation, like
+    `CameraRunner.run()`'s `finally`.
+
+    Bounded yields rather than an unbounded wait, so a regression makes the tests
+    below *fail* rather than hang, and costs no wall-clock time either way.
+    """
+
+    def __init__(self) -> None:
+        self.running = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+
+    async def run(self) -> None:
+        self.running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cleanup_started.set()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            raise
+
+
 class TestStopUnderExternalCancellation:
-    """`stop()` must not silently skip its remaining phases when *it* is cancelled.
+    """`stop()` must not silently skip its remaining phases when *it* is cancelled,
+    and must not let the queue evaporate with it either.
 
     The ordering in `stop()` exists so a camera's `finally` can submit its preserved
     escalation while the scheduler worker is still alive. A blanket
@@ -823,33 +847,42 @@ class TestStopUnderExternalCancellation:
     --timeout-graceful-shutdown cancels the ASGI lifespan's shutdown task.
     """
 
-    async def test_cancelling_stop_propagates_instead_of_being_swallowed(self) -> None:
-        started = asyncio.Event()
-
-        async def lingering_cleanup() -> None:
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                # Cleanup that outlives its own cancellation, like CameraRunner's
-                # finally. Bounded yields, so the test cannot hang if the guard
-                # regresses — it fails instead.
-                for _ in range(20):
-                    await asyncio.sleep(0)
-                raise
-
+    @staticmethod
+    def _build(
+        vlm: VisionLanguageModel, dead_letter: FakeFailedEventSink
+    ) -> tuple[EngineService, VlmScheduler, FakePublisher]:
         registry = ModelRegistry()
+        registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+        registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+        resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+        publisher = FakePublisher()
+        scheduler = VlmScheduler(
+            vlm=vlm,
+            publisher=publisher,
+            admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+            resident_set=resident_set,
+            vlm_model_key="qwen25vl3b",
+            dead_letter=dead_letter,
+            maxsize=4,
+            timeout_seconds=5.0,
+            clock=clock,
+        )
         service = EngineService(
             cameras={},
             registry=registry,
-            resident_set=ResidentSet(registry, total_mib=8192, reserved_mib=2048),
-            scheduler=None,  # type: ignore[arg-type]
-            required_model_keys=(),
-            clock=lambda: 0.0,
+            resident_set=resident_set,
+            scheduler=scheduler,
+            required_model_keys=("yolo11s", "qwen25vl3b"),
+            clock=clock,
         )
-        camera_task = asyncio.create_task(lingering_cleanup())
+        return service, scheduler, publisher
+
+    async def test_cancelling_stop_propagates_instead_of_being_swallowed(self) -> None:
+        camera = LingeringCameraTask()
+        service, _scheduler, _publisher = self._build(FakeVisionLLM(), FakeFailedEventSink())
+        camera_task = asyncio.create_task(camera.run())
         service._camera_tasks = [camera_task]
-        await started.wait()
+        await camera.running.wait()
 
         stop_task = asyncio.create_task(service.stop())
         await asyncio.sleep(0)
@@ -860,3 +893,147 @@ class TestStopUnderExternalCancellation:
 
         with contextlib.suppress(asyncio.CancelledError):
             await camera_task
+
+    async def test_a_cancelled_stop_dead_letters_what_it_was_still_holding(self) -> None:
+        """D2. A forced shutdown is an infrastructure failure, and spec §9 says an
+        anomaly event does not get lost to one.
+
+        `stop()` used to re-raise the `CancelledError` and stop there: the escalation
+        the worker was midway through describing, and everything behind it in the queue,
+        went with it — counted in `escalations`, never published, never counted in
+        `escalations_dropped`, absent from every telemetry read. That is C3's signature
+        for a third time, now through the forced-shutdown door, and it is the ordinary
+        outcome of `--timeout-graceful-shutdown 2`, which the team's own live runs used.
+
+        The cut-short contract is unchanged and asserted here: the `CancelledError`
+        still reaches the caller and the remaining phases still do not run (the drain
+        never happens, so nothing is published — a graceful shutdown would have
+        published both). What changes is that the two escalations are recoverable from
+        the dead-letter spool instead of gone.
+
+        The cancellation is delivered while `stop()` is suspended in phase 2, on a
+        camera whose cleanup outlives it — the exact shape the `cancelling()`
+        bookkeeping above exists for, and the phase where the worker is still alive and
+        still holding the queue.
+        """
+        dead_letter = FakeFailedEventSink()
+        vlm = NeverReturningVlm()
+        service, scheduler, publisher = self._build(vlm, dead_letter)
+        await service.start()
+
+        in_flight = an_escalation_request()
+        handle = FakeClipHandle("cam-1", uuid4())
+        still_queued = replace(an_escalation_request(), clip=handle)
+        assert scheduler.submit(in_flight)
+        assert scheduler.submit(still_queued)
+        await asyncio.wait_for(vlm.started.wait(), timeout=5.0)
+
+        camera = LingeringCameraTask()
+        camera_task = asyncio.create_task(camera.run())
+        service._camera_tasks = [camera_task]
+        await camera.running.wait()
+
+        stop_task = asyncio.create_task(service.stop())
+        # Cancel only once stop() is genuinely suspended on the camera, rather than
+        # after a guessed number of loop turns.
+        await asyncio.wait_for(camera.cleanup_started.wait(), timeout=5.0)
+        stop_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await camera_task
+
+        assert publisher.events == [], (
+            "the cut-short contract stands: a cancelled stop() does not become a slow "
+            "graceful shutdown that drains and publishes"
+        )
+        assert scheduler.abandoned == 2
+        assert {event.event_id for event in dead_letter.events} == {
+            in_flight.event_id,
+            still_queued.event_id,
+        }, "both the mid-describe escalation and the queued one must survive on disk"
+        assert all(event.description_unavailable for event in dead_letter.events), (
+            "no VLM ever spoke for these, and the event must say so"
+        )
+        assert handle.aborted is True, (
+            "a clip riding on an abandoned request leaks a PyAV container and a temp file"
+        )
+
+    async def test_the_spill_never_runs_against_a_worker_that_is_still_alive(self) -> None:
+        """`abandon_pending()` empties the queue, so it races the worker for the same
+        request unless the worker is cancelled and awaited first — its own docstring
+        says so, and nothing enforced it on this path.
+
+        The race is invisible while every abandoned request's `abort()` returns without
+        suspending, which is true of `FakeClipHandle` and false of the real one:
+        `MinioClipWriter`'s abort closes a PyAV container and removes a temp object.
+        One suspension inside the spill is enough to hand the loop back to a worker that
+        was never cancelled, which then finishes its describe and publishes the very
+        event the spill has already written to the dead-letter spool — a duplicate on
+        the broker *and* a spool file an operator has to triage by hand.
+
+        So: a describe with many suspension points, and an abort with more, and the
+        assertion that no event came out of both doors. Fails against a
+        `_spill_to_dead_letter` that dead-letters before cancelling, with the in-flight
+        event published and dead-lettered at once. Every yield is `asyncio.sleep(0)` —
+        no wall-clock time.
+        """
+
+        class SlowVlm(VisionLanguageModel):
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+
+            async def describe(self, request: VisionRequest) -> SceneDescription:
+                self.started.set()
+                for _ in range(200):
+                    await asyncio.sleep(0)
+                return SceneDescription(
+                    description="A person is loitering by the gate.",
+                    threat_value=0.6,
+                    suggested_action="Dispatch a patrol.",
+                )
+
+        class YieldingClipHandle(FakeClipHandle):
+            """An abort that suspends, like every real one."""
+
+            async def abort(self) -> None:
+                for _ in range(400):
+                    await asyncio.sleep(0)
+                await super().abort()
+
+        dead_letter = FakeFailedEventSink()
+        vlm = SlowVlm()
+        service, scheduler, publisher = self._build(vlm, dead_letter)
+        await service.start()
+
+        in_flight = an_escalation_request()
+        still_queued = replace(an_escalation_request(), clip=YieldingClipHandle("cam-1", uuid4()))
+        assert scheduler.submit(in_flight)
+        assert scheduler.submit(still_queued)
+        await asyncio.wait_for(vlm.started.wait(), timeout=5.0)
+
+        camera = LingeringCameraTask()
+        camera_task = asyncio.create_task(camera.run())
+        service._camera_tasks = [camera_task]
+        await camera.running.wait()
+
+        stop_task = asyncio.create_task(service.stop())
+        await asyncio.wait_for(camera.cleanup_started.wait(), timeout=5.0)
+        stop_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await camera_task
+
+        dead_lettered = {event.event_id for event in dead_letter.events}
+        published = {event.event_id for event in publisher.events}
+        assert dead_lettered == {in_flight.event_id, still_queued.event_id}
+        assert published & dead_lettered == set(), (
+            "an event delivered twice — once to the broker and once to the spool — is "
+            f"the race the cancel-then-await exists to close; published {published}"
+        )
+        assert published == set(), "the worker was cancelled before it could publish"
