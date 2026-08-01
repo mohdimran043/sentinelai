@@ -10,7 +10,7 @@ from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
-from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError
+from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError, _IdleSweeper
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from tests.fakes.io import FakePublisher, FakeSource
@@ -124,3 +124,102 @@ async def test_describe_now_of_a_known_camera_delegates_to_its_runner(
     event_id = await service.describe_now("cam-1")
     await service.stop()
     assert event_id is not None
+
+
+class TestIdleSweeperUnit:
+    """`_IdleSweeper` owns no task/queue state of its own — like `_ReconnectLoop`
+    (Task 14, adapters/sources/rtsp.py) it is a plain "wait, then act" sequencer,
+    unit-testable with an injected clock and sleep: no real wall-clock time, no
+    scheduler task, no eviction logic (that is `ResidentSet`'s, covered in
+    test_resident_set.py)."""
+
+    async def test_sweeps_on_the_injected_interval_using_the_injected_clock(self) -> None:
+        """Fails against a sweeper that calls `sweep` immediately without sleeping, one
+        that sleeps a fixed amount regardless of `interval_seconds`, or one that never
+        reads the clock at all."""
+        sweeps: list[float] = []
+        calls = 0
+
+        async def sweep(now: float) -> None:
+            nonlocal calls
+            calls += 1
+            sweeps.append(now)
+
+        clock_values = iter([10.0, 20.0, 30.0])
+
+        def clock() -> float:
+            return next(clock_values)
+
+        sleeps: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        sweeper = _IdleSweeper(sweep, interval_seconds=7.5, clock=clock, sleep=fake_sleep)
+        await sweeper.run_forever(should_stop=lambda: calls >= 3)
+
+        assert sleeps == pytest.approx([7.5, 7.5, 7.5])
+        assert sweeps == pytest.approx([10.0, 20.0, 30.0])
+
+    async def test_never_sweeps_once_should_stop_is_already_true(self) -> None:
+        calls = 0
+
+        async def sweep(_now: float) -> None:
+            nonlocal calls
+            calls += 1
+
+        async def fake_sleep(_seconds: float) -> None:
+            raise AssertionError("should_stop() was already true; sleep must not be called")
+
+        sweeper = _IdleSweeper(sweep, interval_seconds=60.0, clock=lambda: 0.0, sleep=fake_sleep)
+        await sweeper.run_forever(should_stop=lambda: True)
+        assert calls == 0
+
+
+async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> None:
+    """Closes the gap Task 7 deferred: without this wiring, `ResidentSet.sweep_idle`
+    (tested in isolation in test_resident_set.py) never actually runs in a live
+    `EngineService`, so the 600s VLM idle-unload never fires. Fails against a
+    `start()` that loads models but never schedules a sweep at all."""
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    vlm_runtime = FakeModelRuntime("qwen25vl3b", vram_mib=4400)
+    registry.register(VLM_SPEC, vlm_runtime)
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    publisher = FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=FakeVisionLLM(),
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+
+    elapsed = {"now": 0.0}
+
+    def ticking_clock() -> float:
+        return elapsed["now"]
+
+    async def fake_sleep(seconds: float) -> None:
+        elapsed["now"] += seconds
+        await asyncio.sleep(0)  # cooperative yield; zero wall-clock time
+
+    service = EngineService(
+        cameras={},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=ticking_clock,
+        idle_sweep_interval_seconds=100.0,
+        sleep=fake_sleep,
+    )
+    await service.start()
+    for _ in range(50):
+        await asyncio.sleep(0)
+    await service.stop()
+
+    assert vlm_runtime.shutdown_calls >= 1
+    assert resident_set.resident() == frozenset({"yolo11s"})
