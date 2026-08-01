@@ -5,6 +5,7 @@ import {
   toneForLiveness,
   toneForModelState,
   toneForSeverity,
+  worseTone,
 } from '@/lib/severity'
 
 describe('toneForSeverity', () => {
@@ -64,6 +65,27 @@ describe('cameraLiveness', () => {
   it('is stale once past the staleness window', () => {
     const lastFrameAt = now / 1000 - (STALE_AFTER_SECONDS + 1)
     expect(cameraLiveness(lastFrameAt, now)).toBe('stale')
+  })
+})
+
+describe('worseTone', () => {
+  it('picks breach over anything else', () => {
+    expect(worseTone('breach', 'nominal')).toBe('breach')
+    expect(worseTone('nominal', 'breach')).toBe('breach')
+    expect(worseTone('breach', 'caution')).toBe('breach')
+  })
+
+  it('picks caution over nominal or inert', () => {
+    expect(worseTone('caution', 'nominal')).toBe('caution')
+    expect(worseTone('inert', 'caution')).toBe('caution')
+  })
+
+  it('picks nominal over inert', () => {
+    expect(worseTone('inert', 'nominal')).toBe('nominal')
+  })
+
+  it('is stable when both sides agree', () => {
+    expect(worseTone('inert', 'inert')).toBe('inert')
   })
 })
 

@@ -81,3 +81,18 @@ export function toneForLiveness(liveness: CameraLiveness): Tone {
       return 'inert'
   }
 }
+
+const TONE_RANK: Record<Tone, number> = { inert: 0, nominal: 1, caution: 2, breach: 3 }
+
+/**
+ * Combines two independent tones into the one accent a single tile can show,
+ * by picking whichever is more urgent on the escalation ramp (breach beats
+ * caution beats nominal beats inert). For a camera tile this lets liveness
+ * ("is it alive") and latest severity ("does it need attention") disagree
+ * without one silently masking the other — a live camera with a critical
+ * event still reads as breach, and a stale camera with no events still reads
+ * as caution rather than being overwritten back to inert.
+ */
+export function worseTone(a: Tone, b: Tone): Tone {
+  return TONE_RANK[a] >= TONE_RANK[b] ? a : b
+}
