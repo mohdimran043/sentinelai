@@ -29,5 +29,16 @@ jobs:
       - name: Typecheck
         run: mypy
 
+      # `-W error` is deliberately *not* a flag here. `filterwarnings = ["error"]` in
+      # ai-engine/pyproject.toml applies it to every invocation — CI's, a developer's,
+      # an IDE's — so the policy cannot be undone by forgetting to type something. The
+      # `httpx2` dependency and the `supervision>=0.24,<0.28` pin both exist only
+      # because a warning is fatal under it, and until now nothing in CI enforced that.
+      #
+      # Spec §3.2's OpenAPI drift check is also part of this step, not a separate one:
+      # tests/test_openapi_contract.py compares contracts/openapi/ai-engine.yaml against
+      # the live app and fails when they disagree.
       - name: Test (CPU only)
-        run: pytest -v -m "not gpu and not integration" --cov=sentinel_ai --cov-report=term-missing
+        run: >-
+          pytest -v -m "not gpu and not integration"
+          --cov=sentinel_ai --cov-report=term-missing --cov-fail-under=85

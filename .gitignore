@@ -11,6 +11,9 @@ build/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 datasets/**
 !datasets/*.sh
 !datasets/*.md

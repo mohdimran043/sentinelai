@@ -22,6 +22,7 @@ from sentinel_ai.domain.entities import BBox, SceneState, Track
 from sentinel_ai.ports.frame_source import FrameData
 from sentinel_ai.ports.model_runtime import ModelRuntime
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
+from tests.gpu_warnings import BITSANDBYTES_UNALIGNED_KERNEL
 
 
 def _scene(tracks: tuple[Track, ...] = ()) -> SceneState:
@@ -205,6 +206,7 @@ def test_parse_response_never_raises_on_empty_text() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.filterwarnings(BITSANDBYTES_UNALIGNED_KERNEL)
 async def test_real_describer_loads_warms_up_and_reports_health() -> None:
     """End-to-end lifecycle on the real GPU: Branch B (bitsandbytes NF4 on the
     unquantised checkpoint — see phase1b-spike-result.md). Also proves
@@ -248,6 +250,7 @@ async def test_real_describer_loads_warms_up_and_reports_health() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.filterwarnings(BITSANDBYTES_UNALIGNED_KERNEL)
 async def test_real_describer_produces_a_real_description_with_no_model_identity_leak() -> None:
     """Runs actual inference on a real photo, not a blank frame, and checks
     the *content* of the result: a describer that always returned a fixed

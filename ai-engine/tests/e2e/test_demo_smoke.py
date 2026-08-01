@@ -26,6 +26,7 @@ from sentinel_ai.orchestrator.scheduler import VlmScheduler
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from tests.fakes.io import FakeFailedEventSink, FakePublisher
+from tests.gpu_warnings import BITSANDBYTES_UNALIGNED_KERNEL
 
 AVENUE_CLIP = Path(__file__).resolve().parents[3] / "datasets" / "avenue" / "avenue_01.mp4"
 
@@ -35,6 +36,7 @@ VLM_SPEC = ModelSpec(model_key="qwen25vl3b", vram_mib=2766, priority=50, idle_un
 
 @pytest.mark.gpu
 @pytest.mark.integration
+@pytest.mark.filterwarnings(BITSANDBYTES_UNALIGNED_KERNEL)
 async def test_full_pipeline_produces_a_real_event_with_real_models() -> None:
     if not AVENUE_CLIP.exists():
         pytest.skip(f"run datasets/download_sample.sh first — {AVENUE_CLIP} not found")

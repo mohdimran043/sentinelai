@@ -46,6 +46,11 @@ dev = [
     # suite's `-W error` that warning becomes a collection-time exception, so
     # httpx2 is a real dependency here, not a nicety.
     "httpx2>=2.0",
+    # `sentinel_ai.openapi_export` renders the spec §3.2 contract, and
+    # `tests/test_openapi_contract.py` fails the build when the committed copy has
+    # drifted. Dev-only on purpose: the engine never reads or writes YAML at runtime,
+    # so the import is inside the render function rather than at module scope.
+    "pyyaml>=6.0",
 ]
 
 [build-system]
@@ -122,3 +127,11 @@ markers = [
     "gpu: requires a CUDA GPU and downloaded model weights (deselect with -m 'not gpu')",
     "integration: requires docker-compose core services running",
 ]
+filterwarnings = ["error"]
+# Here rather than as a `-W error` flag on the command line, because a flag is only
+# enforced by whoever remembers to type it. This is the policy that justifies the
+# `httpx2` dependency and the `supervision>=0.24,<0.28` pin, both of which exist
+# solely because a warning under it is fatal; CI ran without the flag, so either pin
+# could have been silently undone by a passing build. The only exemption in the tree
+# is a per-test `filterwarnings` mark on the three GPU tests that load Qwen through
+# bitsandbytes — see `tests/gpu_warnings.py` for exactly what it covers and why.
