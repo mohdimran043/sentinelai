@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
-from sentinel_ai.orchestrator.event_history import CameraEventHistory
+from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
@@ -17,7 +17,7 @@ from sentinel_ai.ports.model_runtime import HealthReport
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["EngineService", "UnknownCameraError"]
+__all__ = ["EngineNotComposedError", "EngineService", "UnknownCameraError"]
 
 _DEFAULT_IDLE_SWEEP_INTERVAL_SECONDS = 60.0
 """How often `ResidentSet.sweep_idle` is polled, not the idle-unload window itself
@@ -76,6 +76,22 @@ class UnknownCameraError(KeyError):
     def __init__(self, camera_id: str) -> None:
         super().__init__(f"unknown camera: {camera_id}")
         self.camera_id = camera_id
+
+
+class EngineNotComposedError(RuntimeError):
+    """Raised for a request that arrives before the engine has been composed.
+
+    Lives here beside `UnknownCameraError` because `main.ComposedService` raises both
+    and the API layer maps both, and the API layer may not import the composition root.
+
+    Only `subscribe_events()` needs it: the read-only endpoints can answer an
+    uncomposed engine honestly (no cameras, no models) and the per-camera ones already
+    have `UnknownCameraError`, but "a live stream over a ring that does not exist yet"
+    has no honest empty value — an open stream that can never carry anything is
+    indistinguishable, to a console, from a quiet site. The API turns this into a 503,
+    which is what it is: try again shortly. Unreachable through uvicorn, which
+    completes lifespan startup before it serves a request.
+    """
 
 
 class EngineService:
@@ -295,6 +311,27 @@ class EngineService:
         """
         self._get_runner(camera_id)
         return self._scheduler.event_history(camera_id)
+
+    def subscribe_events(self) -> EventSubscription:
+        """A live handle on every camera's recent-event ring, for `GET /events/stream`.
+
+        Site-wide rather than per camera, and so takes no camera id and cannot 404: a
+        console watching a building wants one connection, not one per camera, and the
+        entries carry `camera_id` for the caller to split on.
+        """
+        return self._scheduler.subscribe_events()
+
+    def close_event_streams(self) -> int:
+        """End every live stream; returns how many there were.
+
+        Deliberately **not** part of `stop()`. That method's phase ordering exists to
+        get the last escalations published, and those publishes assemble events that
+        the streams should still carry — closing them from inside it would cut the
+        console off from precisely the shutdown-time events spec §9 goes to such
+        lengths to preserve. The API lifespan calls this after `stop()` returns, and
+        in a `finally`, so a cut-short shutdown still releases its readers.
+        """
+        return self._scheduler.close_event_streams()
 
     def health(self) -> dict[str, HealthReport]:
         return self._registry.health()

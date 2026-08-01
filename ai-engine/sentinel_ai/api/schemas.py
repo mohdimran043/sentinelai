@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from sentinel_ai.domain.zone import Zone, ZoneKind
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, RecentEvent
 from sentinel_ai.pipeline.runner import CameraTelemetry
 
@@ -35,10 +36,29 @@ class CameraStatus(BaseModel):
     discontinuities: int
     last_frame_at: float | None
     last_escalation_at: float | None
+    zone: Zone | None = Field(
+        default=None,
+        description=(
+            "Which space this camera watches — the field cameras are grouped by. Null "
+            "means ungrouped: nobody has assigned this camera a zone. Null is not a "
+            "group; do not render it as one alongside the real zones."
+        ),
+    )
+    zone_kind: ZoneKind | None = Field(
+        default=None,
+        description=(
+            "The coarse grouping `zone` falls into, derived from it and never stored "
+            "separately, so the two cannot disagree. Null exactly when `zone` is null."
+        ),
+    )
 
     @classmethod
     def from_telemetry(cls, telemetry: CameraTelemetry) -> CameraStatus:
         return cls(
+            zone=telemetry.zone,
+            # Derived here rather than carried, so no configuration can make the fine
+            # and coarse groupings contradict each other on the wire.
+            zone_kind=None if telemetry.zone is None else telemetry.zone.kind,
             camera_id=telemetry.camera_id,
             frames_seen=telemetry.frames_seen,
             frames_dropped=telemetry.frames_dropped,
@@ -79,11 +99,45 @@ LatestDescriptionState = Literal["none", "available", "unavailable"]
 
 
 class RecentEventEntry(BaseModel):
-    """One event as the console sees it. A projection of the published anomaly event,
-    not the event itself: `clip_uri` is absent because a clip is attached after the
-    event is assembled and this view is written at assembly."""
+    """One event as the console sees it — a projection of the published anomaly event,
+    not the event itself.
+
+    The same shape is served three ways: in `GET /cameras/{camera_id}/events`, in the
+    `backlog` array that opens `GET /events/stream`, and in each live frame on that
+    stream. One shape on purpose, so a console can merge all three into one list
+    keyed by `event_id`, keeping the copy with the highest `sequence`.
+    """
 
     event_id: UUID
+    camera_id: str = Field(
+        description=(
+            "Which camera produced this. Redundant on the per-camera endpoint, and "
+            "essential on `/events/stream`, which carries every camera's events."
+        )
+    )
+    sequence: int = Field(
+        description=(
+            "This version's position in the engine's write order for the recent-event "
+            "ring — a de-duplication key, never a sort key. An event can be sent more "
+            "than once with the same `event_id`: it is re-sent when something about it "
+            "changes, currently when its clip finishes uploading and `clip_uri` "
+            "appears. The copy with the higher `sequence` is the newer one; two copies "
+            "with the same `sequence` are the same copy. Per process and monotonic — "
+            "it restarts from zero when the engine does, exactly like the ring itself, "
+            "so never persist it or compare it across a restart."
+        )
+    )
+    clip_uri: str | None = Field(
+        description=(
+            "Where this event's clip was written, or null. Null covers three different "
+            "situations and is not by itself evidence of any one of them: no clip was "
+            "being recorded, the clip has not finished uploading yet (it lands shortly "
+            "after the event, and the event is then re-sent on the stream with a higher "
+            "`sequence`), or the clip failed to write. An event is never withheld "
+            "because its clip failed — spec §9 — so a null here says nothing at all "
+            "about whether the event happened."
+        )
+    )
     occurred_at: float = Field(
         description=(
             "Unix epoch seconds (UTC, fractional). Sort and plot on this — it is the "
@@ -120,6 +174,9 @@ class RecentEventEntry(BaseModel):
     def from_recent_event(cls, event: RecentEvent) -> RecentEventEntry:
         return cls(
             event_id=event.event_id,
+            camera_id=event.camera_id,
+            sequence=event.sequence,
+            clip_uri=event.clip_uri,
             occurred_at=event.occurred_at,
             source_timestamp=event.source_timestamp,
             reason=event.reason.value,

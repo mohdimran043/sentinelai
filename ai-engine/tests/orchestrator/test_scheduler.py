@@ -283,6 +283,40 @@ async def test_a_clip_is_finished_and_its_uri_attached() -> None:
     assert handle.finished is True
 
 
+async def test_the_console_ring_learns_the_clip_uri_too() -> None:
+    """T3. The published event has carried the clip URI since Task 12; the ring did
+    not, because it is written at assembly and the clip is attached after. A console
+    that cannot link an event to its footage has to guess at the store's key layout."""
+    writer = FakeClipWriter()
+    handle = await writer.open("cam-1", uuid4(), fps=10.0)
+    async with Worker(new_scheduler()) as scheduler:
+        scheduler.submit(a_request(clip=handle))
+        await scheduler.drain()
+
+    latest = scheduler.event_history("cam-1").latest
+    assert latest is not None
+    assert latest.clip_uri == f"s3://sentinel-clips/cam-1/{handle.event_id}.mp4"
+
+
+async def test_a_clip_that_fails_leaves_the_ring_entry_present_and_uri_less() -> None:
+    """Spec §9's rule survives T3 intact: the event is recorded at assembly, *before*
+    the clip is attempted, so a clip that never finishes costs the console its link to
+    the footage and nothing else. Recording after the attach instead would delete this
+    event from the console entirely — the one an operator most needs to see.
+    """
+    writer = FakeClipWriter(finish_error=OSError("minio unreachable"))
+    handle = await writer.open("cam-1", uuid4(), fps=10.0)
+    publisher = FakePublisher()
+    async with Worker(new_scheduler(publisher=publisher)) as scheduler:
+        scheduler.submit(a_request(clip=handle))
+        await scheduler.drain()
+
+    latest = scheduler.event_history("cam-1").latest
+    assert latest is not None, "§9: a failed clip must never cost the event"
+    assert latest.clip_uri is None, "and it must not claim a clip that was never written"
+    assert publisher.events[0].clip_uri is None
+
+
 async def test_no_clip_leaves_clip_uri_none() -> None:
     publisher = FakePublisher()
     async with Worker(new_scheduler(publisher=publisher)) as scheduler:

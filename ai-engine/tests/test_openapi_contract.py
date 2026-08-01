@@ -24,10 +24,34 @@ def test_the_document_covers_the_endpoints_phase_1c_consumes() -> None:
         "/cameras/{camera_id}/telemetry",
         "/cameras/{camera_id}/events",
         "/cameras/{camera_id}/describe",
+        "/events/stream",
     }
     assert set(paths["/cameras/{camera_id}/describe"]) == {"post"}
     assert set(paths["/cameras/{camera_id}/telemetry"]) == {"get"}
     assert set(paths["/cameras/{camera_id}/events"]) == {"get"}
+    assert set(paths["/events/stream"]) == {"get"}
+
+
+def test_the_stream_is_declared_as_an_event_stream_not_as_json() -> None:
+    """A generated client that believes `/events/stream` returns
+    `application/json` will try to decode the whole body as one document and hang
+    until the stream ends — which, for a stream, is the point at which it is no longer
+    useful."""
+    responses = openapi_document()["paths"]["/events/stream"]["get"]["responses"]
+    assert set(responses["200"]["content"]) == {"text/event-stream"}
+    assert "503" in responses, "the engine-not-ready answer a client will actually meet"
+
+
+def test_the_stream_contract_says_what_a_long_disconnect_costs() -> None:
+    """The ring behind the stream is bounded and volatile. An integrator who reads
+    only the contract must still learn that reconnecting gives them the current
+    window and not everything they missed."""
+    operation = openapi_document()["paths"]["/events/stream"]["get"]
+    text = f"{operation['summary']} {operation['description']}".lower()
+    assert "not the event store" in text
+    assert "rabbitmq" in text
+    assert "backlog" in text
+    assert "last-event-id" in text
 
 
 def test_the_events_endpoint_disclaims_being_the_event_store_in_the_contract() -> None:

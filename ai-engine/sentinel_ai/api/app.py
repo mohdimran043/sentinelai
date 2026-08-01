@@ -18,7 +18,17 @@ def create_app(service: EngineServiceProtocol) -> FastAPI:
         try:
             yield
         finally:
-            await service.stop()
+            try:
+                await service.stop()
+            finally:
+                # After `stop()`, so the escalations its ordering exists to publish
+                # still reach a console that is watching; in a `finally`, so a
+                # `stop()` that is itself cancelled — uvicorn's
+                # `--timeout-graceful-shutdown` does exactly that — still releases
+                # every reader instead of leaving them parked on a dead engine. It is
+                # synchronous and cannot be interrupted, and it does not swallow the
+                # cancellation aimed at `stop()`, which stays cut short.
+                service.close_event_streams()
 
     app = FastAPI(title="SentinelAI AI Engine", lifespan=lifespan)
     app.state.service = service

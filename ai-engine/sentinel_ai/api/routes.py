@@ -8,6 +8,7 @@ from typing import Annotated, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from sentinel_ai.api.schemas import (
     CameraEventsResponse,
@@ -17,8 +18,9 @@ from sentinel_ai.api.schemas import (
     HealthResponse,
     ModelHealth,
 )
-from sentinel_ai.orchestrator.event_history import CameraEventHistory
-from sentinel_ai.orchestrator.service import UnknownCameraError
+from sentinel_ai.api.sse import SSE_HEADERS, SSE_MEDIA_TYPE, event_stream_body
+from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
+from sentinel_ai.orchestrator.service import EngineNotComposedError, UnknownCameraError
 from sentinel_ai.pipeline.runner import CameraTelemetry
 from sentinel_ai.ports.model_runtime import HealthReport
 
@@ -34,6 +36,8 @@ class EngineServiceProtocol(Protocol):
     def cameras(self) -> tuple[CameraTelemetry, ...]: ...
     def telemetry(self, camera_id: str) -> CameraTelemetry: ...
     def event_history(self, camera_id: str) -> CameraEventHistory: ...
+    def subscribe_events(self) -> EventSubscription: ...
+    def close_event_streams(self) -> int: ...
     def health(self) -> dict[str, HealthReport]: ...
     async def describe_now(self, camera_id: str) -> UUID: ...
 
@@ -122,6 +126,77 @@ async def get_camera_events(camera_id: str, service: ServiceDep) -> CameraEvents
         # {"detail": "'unknown camera: cam-x'"}.
         raise HTTPException(status_code=404, detail=f"unknown camera: {exc.camera_id}") from exc
     return CameraEventsResponse.from_history(history)
+
+
+@router.get(
+    "/events/stream",
+    summary="Live event stream (SSE) over the same volatile ring — NOT the event store",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": (
+                "An open `text/event-stream`. Frames: `event: backlog` once, carrying a "
+                "JSON array of RecentEventEntry (oldest first, possibly empty); then "
+                "`event: anomaly`, one RecentEventEntry each, as they are assembled; "
+                "`event: overflow` if this client fell too far behind, after which the "
+                "stream ends and reconnecting is the recovery; and `: keepalive` comment "
+                "lines on an idle stream. No `id:` field is sent and `Last-Event-ID` is "
+                "not honoured — see the description."
+            ),
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+        503: {"description": "The engine has not finished starting; retry shortly."},
+    },
+)
+async def stream_events(service: ServiceDep) -> StreamingResponse:
+    """Every camera's anomaly events, pushed as they happen (spec §6.2, bridged).
+
+    **The same volatile, bounded, in-memory ring `GET /cameras/{camera_id}/events`
+    serves — not the event store and not an audit trail.** The durable record is the
+    anomaly event published to RabbitMQ and written down by the Phase 1C consumer.
+    Everything this stream can send is held in engine memory, is lost on restart, and
+    is silently evicted once a camera has produced more than `capacity` events.
+
+    **What a reconnect can and cannot give you.** Every connection opens with a
+    `backlog` frame holding what the ring currently has, then continues live. There is
+    no gap between the two and no duplicate across them. But the ring is bounded, so a
+    client that was disconnected long enough for a camera to produce more than its
+    ring holds **has permanently missed those events on this endpoint** — they are in
+    RabbitMQ, and this endpoint will never show them. That is why no `id:` field is
+    sent and `Last-Event-ID` is not honoured: resuming from an offset the engine may
+    no longer hold would promise a continuity it cannot keep. Reconnect, take the new
+    backlog as the current window, and go to the store for anything older.
+
+    **Duplicates and updates.** An `event_id` may arrive more than once: an event is
+    re-sent when something about it changes, currently when its clip finishes and
+    `clip_uri` appears. Merge by `event_id`, keeping the copy with the higher
+    `sequence`. Two copies with the same `sequence` are the same copy.
+
+    **Falling behind.** A client that stops reading is buffered up to a fixed bound
+    and then cut off with an `overflow` frame rather than being allowed to grow the
+    engine's memory. Reconnect; the fresh backlog is more current than the queue that
+    was dropped.
+
+    **Shutdown.** The engine closes every stream as it shuts down, so a client sees a
+    clean end of response rather than a connection that hangs until a proxy times it
+    out.
+    """
+    try:
+        subscription = service.subscribe_events()
+    except EngineNotComposedError as exc:
+        # Only reachable if a request is served before lifespan startup finished,
+        # which uvicorn does not do. A 503 rather than an empty stream: a stream that
+        # can never carry anything looks exactly like a quiet site.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return StreamingResponse(
+        # Subscribed above, in the handler; the body below runs later, once Starlette
+        # starts the response. That gap is real, and `EventSubscription` is built for
+        # it — registration happens now so nothing written in between is lost, and the
+        # backlog's watermark discards the copies that would otherwise be duplicated.
+        event_stream_body(subscription),
+        media_type=SSE_MEDIA_TYPE,
+        headers=SSE_HEADERS,
+    )
 
 
 @router.post("/cameras/{camera_id}/describe", response_model=DescribeResponse)

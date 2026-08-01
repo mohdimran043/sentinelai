@@ -101,6 +101,7 @@ from sentinel_ai.config import get_settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, SceneState
 from sentinel_ai.domain.policy.escalation import GateState, decide, force
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
@@ -130,6 +131,15 @@ class CameraTelemetry:
     discontinuities: int
     last_frame_at: float | None
     last_escalation_at: float | None
+    zone: Zone | None = None
+    """Which zone this camera watches, or None when nobody has grouped it (T1).
+
+    Static configuration riding on a counters record, deliberately: `GET /cameras` is
+    built from these snapshots, so a console that groups cameras reads the grouping
+    from the same object it reads the liveness from — one request, and no way for the
+    two to describe different sets of cameras. Defaulted so that every existing
+    construction site keeps working and an ungrouped camera stays representable.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,11 +202,17 @@ class CameraRunner:
         clip_writer: ClipWriter | None,
         preroll: PreRollBuffer,
         detect_every_n_frames: int = 1,
+        zone: Zone | None = None,
     ) -> None:
         if detect_every_n_frames < 1:
             raise ValueError(f"detect_every_n_frames must be >= 1, got {detect_every_n_frames}")
         self._camera_id = camera_id
         self._camera_label = camera_label
+        # Carried, never read by the pipeline: the runner is the only per-camera object
+        # the API can reach, so the zone travels here to reach `telemetry()`. Behaviour
+        # does not branch on it — a zone changes how a console groups a camera, not how
+        # this loop watches one.
+        self._zone = zone
         self._source = source
         self._detector = detector
         self._tracker = tracker
@@ -292,6 +308,7 @@ class CameraRunner:
             discontinuities=self._discontinuities,
             last_frame_at=self._last_frame_at,
             last_escalation_at=self._last_escalation_at,
+            zone=self._zone,
         )
 
     # -- stage 1: frame arrival, with backpressure -----------------------------------

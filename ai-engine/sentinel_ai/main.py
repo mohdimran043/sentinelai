@@ -29,6 +29,7 @@ A JSON file, path from `SENTINEL_CAMERAS_FILE` (default `./cameras.json`). See
           "id": "avenue_01",
           "label": "Avenue (demo)",
           "url": "rtsp://localhost:8554/avenue_01",
+          "zone": "corridor",
           "profile": {"cooldown_seconds": 5.0}
         }
       ]
@@ -36,7 +37,11 @@ A JSON file, path from `SENTINEL_CAMERAS_FILE` (default `./cameras.json`). See
 
 `id` and `url` are required; `label` defaults to `id`; `profile` overrides any
 `CameraProfile` field and is validated against that dataclass's own field names, so a
-typo fails at startup rather than silently doing nothing. A `url` with an `rtsp://` or
+typo fails at startup rather than silently doing nothing. `zone` is optional and
+constrained to `sentinel_ai.domain.zone.Zone` — omit it and the camera is ungrouped,
+which is a legitimate deployment and not a config error; give it a value this process
+does not know and startup fails, because a typo'd zone is a camera the operator meant
+to group and silently did not. A `url` with an `rtsp://` or
 `rtsps://` scheme builds an `RtspSource`; anything else is taken as a path to a video
 file and builds a `FileSource`, which is what makes a replay deployment (and the
 end-to-end demo over a downloaded clip) the same code path as a live camera.
@@ -83,12 +88,17 @@ from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.app import create_app
 from sentinel_ai.config import Settings, get_settings
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
-from sentinel_ai.orchestrator.event_history import CameraEventHistory
+from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
-from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError
+from sentinel_ai.orchestrator.service import (
+    EngineNotComposedError,
+    EngineService,
+    UnknownCameraError,
+)
 from sentinel_ai.pipeline.runner import CameraRunner, CameraTelemetry
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from sentinel_ai.ports.clip_writer import ClipWriter
@@ -146,6 +156,13 @@ class CameraConfig:
     label: str
     url: str
     profile: CameraProfile
+    zone: Zone | None = None
+    """Which space this camera watches, or None when nobody has grouped it.
+
+    Optional, and its absence is *not* a configuration error: every camera file
+    written before zones existed keeps loading, and an ungrouped camera is a true
+    statement about a deployment rather than a broken one. A zone that is *present and
+    unknown* is a different thing — see `_zone_from`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +207,32 @@ def _profile_from(camera_id: str, raw: Mapping[str, Any]) -> CameraProfile:
         # CameraProfile.__post_init__ enforces its own invariants; surfacing them as
         # a CameraConfigError keeps every startup configuration failure one type.
         raise CameraConfigError(f"camera {camera_id!r}: invalid profile: {exc}") from exc
+
+
+def _zone_from(camera_id: str, raw: Any) -> Zone | None:
+    """Absent means ungrouped; present-but-unknown means the file is wrong.
+
+    Keeping those two apart is the whole contract of this field. Silently downgrading
+    `"hallway"` to ungrouped would produce a console that looks right and quietly
+    leaves a camera out of the group the operator put it in — the same class of
+    failure `_profile_from`'s unknown-field check exists to prevent — while treating
+    the absent case as an error would make every pre-zone camera file unloadable for
+    no gain.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'zone' must be a string or absent, got {type(raw).__name__}"
+        )
+    try:
+        return Zone(raw)
+    except ValueError:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: unknown zone {raw!r}; "
+            f"valid zones are {[zone.value for zone in Zone]}, or omit the field to "
+            f"leave the camera ungrouped"
+        ) from None
 
 
 def load_cameras(path: Path) -> tuple[CameraConfig, ...]:
@@ -244,6 +287,7 @@ def load_cameras(path: Path) -> tuple[CameraConfig, ...]:
                 label=label,
                 url=url,
                 profile=_profile_from(camera_id, raw_profile),
+                zone=_zone_from(camera_id, entry.get("zone")),
             )
         )
     return tuple(configs)
@@ -497,6 +541,7 @@ def compose(
             clip_writer=clip_writer,
             preroll=PreRollBuffer(preroll_seconds=settings.clip_preroll_seconds),
             detect_every_n_frames=settings.detect_every_n_frames,
+            zone=config.zone,
         )
         for config in cameras
     }
@@ -609,6 +654,21 @@ class ComposedService:
         if self._composition is None:
             raise UnknownCameraError(camera_id)
         return self._composition.service.event_history(camera_id)
+
+    def subscribe_events(self) -> EventSubscription:
+        if self._composition is None:
+            # No ring exists yet, so there is nothing to subscribe *to*. An open stream
+            # that can never carry anything is indistinguishable from a quiet site, so
+            # the API answers 503 instead. See `EngineNotComposedError`.
+            raise EngineNotComposedError(
+                "the engine has not finished starting; no event stream is available yet"
+            )
+        return self._composition.service.subscribe_events()
+
+    def close_event_streams(self) -> int:
+        # Zero, not an error: the lifespan calls this unconditionally on the way out,
+        # including after a startup that never composed anything.
+        return 0 if self._composition is None else self._composition.service.close_event_streams()
 
     def health(self) -> dict[str, HealthReport]:
         return {} if self._composition is None else self._composition.service.health()

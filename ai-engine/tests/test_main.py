@@ -33,6 +33,7 @@ from sentinel_ai.api.routes import EngineServiceProtocol
 from sentinel_ai.config import Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, Event, ThreatScore
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.main import (
     BrokerLink,
     CameraConfig,
@@ -168,6 +169,60 @@ class TestCameraConfig:
         del entry[missing]
         with pytest.raises(CameraConfigError, match=f"'{missing}'"):
             load_cameras(write_cameras(tmp_path, {"cameras": [entry]}))
+
+
+class TestCameraZone:
+    """T1. A zone groups cameras; its absence groups nothing and breaks nothing."""
+
+    def test_a_zone_reaches_the_camera_record_as_the_enum(self, tmp_path: Path) -> None:
+        path = write_cameras(
+            tmp_path,
+            {"cameras": [{"id": "cam-1", "url": "rtsp://host/one", "zone": "corridor"}]},
+        )
+        (camera,) = load_cameras(path)
+        assert camera.zone is Zone.CORRIDOR
+
+    def test_a_camera_without_a_zone_is_ungrouped_not_a_config_error(self, tmp_path: Path) -> None:
+        """Every camera file written before zones existed must keep loading. An
+        ungrouped camera is a camera nobody has grouped yet, which is a fact about the
+        deployment; the loader's fail-loud is for input it genuinely cannot build."""
+        path = write_cameras(tmp_path, {"cameras": [{"id": "cam-1", "url": "rtsp://host/one"}]})
+        (camera,) = load_cameras(path)
+        assert camera.zone is None
+
+    def test_an_explicit_null_zone_is_the_same_as_omitting_it(self, tmp_path: Path) -> None:
+        """`GET /cameras` renders an ungrouped camera as `"zone": null`; a config that
+        is round-tripped through that shape must load again."""
+        path = write_cameras(
+            tmp_path, {"cameras": [{"id": "cam-1", "url": "rtsp://host/one", "zone": None}]}
+        )
+        (camera,) = load_cameras(path)
+        assert camera.zone is None
+
+    def test_an_unknown_zone_fails_loud_and_names_the_vocabulary(self, tmp_path: Path) -> None:
+        """The crisp distinction: *absent* is ungrouped, *wrong* is unbuildable. An
+        operator who typed `hallway` meant to group that camera and did not; silently
+        dropping it to ungrouped hides the typo behind a plausible-looking console."""
+        path = write_cameras(
+            tmp_path, {"cameras": [{"id": "cam-1", "url": "rtsp://host/one", "zone": "hallway"}]}
+        )
+        with pytest.raises(CameraConfigError, match=r"unknown zone 'hallway'.*corridor"):
+            load_cameras(path)
+
+    def test_a_non_string_zone_fails_loud(self, tmp_path: Path) -> None:
+        path = write_cameras(
+            tmp_path, {"cameras": [{"id": "cam-1", "url": "rtsp://host/one", "zone": 3}]}
+        )
+        with pytest.raises(CameraConfigError, match="zone"):
+            load_cameras(path)
+
+    def test_the_shipped_example_shows_both_a_grouped_and_an_ungrouped_camera(self) -> None:
+        """The example is the documentation an operator copies. It has to show that the
+        field is optional as well as what it looks like when set."""
+        example = Path(__file__).resolve().parents[1] / "cameras.example.json"
+        zones = [camera.zone for camera in load_cameras(example)]
+        assert Zone.CORRIDOR in zones
+        assert None in zones
 
 
 class TestSourceSelection:
@@ -508,6 +563,31 @@ class TestCompose:
     def test_every_configured_camera_becomes_a_runner(self, tmp_path: Path) -> None:
         composition, _ = composed(tmp_path)
         assert [t.camera_id for t in composition.service.cameras()] == ["cam-1"]
+
+    def test_a_configured_zone_survives_composition_and_reaches_the_api(
+        self, tmp_path: Path
+    ) -> None:
+        """T1's whole point. A zone in the file that stops at `CameraConfig` groups
+        nothing: `GET /cameras` is built from `CameraRunner.telemetry()`, so the value
+        has to be carried through composition to be visible at all."""
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+        )
+        cameras = (
+            CameraConfig("cam-1", "Camera One", str(ASSET), _profile("cam-1"), Zone.DAYROOM),
+            CameraConfig("cam-2", "Camera Two", str(ASSET), _profile("cam-2")),
+        )
+        composition = compose(
+            settings,
+            cameras,
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        assert [t.zone for t in composition.service.cameras()] == [Zone.DAYROOM, None]
 
     def test_the_scheduler_is_wired_to_the_same_resident_set_the_service_owns(
         self, tmp_path: Path

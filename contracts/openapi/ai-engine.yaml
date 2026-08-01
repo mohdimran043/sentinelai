@@ -107,6 +107,19 @@ components:
           - type: number
           - type: 'null'
           title: Last Frame At
+        zone:
+          anyOf:
+          - $ref: '#/components/schemas/Zone'
+          - type: 'null'
+          description: "Which space this camera watches \u2014 the field cameras are grouped by. Null\
+            \ means ungrouped: nobody has assigned this camera a zone. Null is not a group; do not render\
+            \ it as one alongside the real zones."
+        zone_kind:
+          anyOf:
+          - $ref: '#/components/schemas/ZoneKind'
+          - type: 'null'
+          description: The coarse grouping `zone` falls into, derived from it and never stored separately,
+            so the two cannot disagree. Null exactly when `zone` is null.
       required:
       - camera_id
       - frames_seen
@@ -186,12 +199,28 @@ components:
       title: ModelHealth
       type: object
     RecentEventEntry:
-      description: 'One event as the console sees it. A projection of the published anomaly event,
-
-        not the event itself: `clip_uri` is absent because a clip is attached after the
-
-        event is assembled and this view is written at assembly.'
+      description: "One event as the console sees it \u2014 a projection of the published anomaly event,\n\
+        not the event itself.\n\nThe same shape is served three ways: in `GET /cameras/{camera_id}/events`,\
+        \ in the\n`backlog` array that opens `GET /events/stream`, and in each live frame on that\nstream.\
+        \ One shape on purpose, so a console can merge all three into one list\nkeyed by `event_id`, keeping\
+        \ the copy with the highest `sequence`."
       properties:
+        camera_id:
+          description: Which camera produced this. Redundant on the per-camera endpoint, and essential
+            on `/events/stream`, which carries every camera's events.
+          title: Camera Id
+          type: string
+        clip_uri:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: "Where this event's clip was written, or null. Null covers three different situations\
+            \ and is not by itself evidence of any one of them: no clip was being recorded, the clip has\
+            \ not finished uploading yet (it lands shortly after the event, and the event is then re-sent\
+            \ on the stream with a higher `sequence`), or the clip failed to write. An event is never\
+            \ withheld because its clip failed \u2014 spec \xA79 \u2014 so a null here says nothing at\
+            \ all about whether the event happened."
+          title: Clip Uri
         description:
           description: "The scene description \u2014 unless `description_unavailable` is true, in which\
             \ case this is a metadata-derived stand-in and not a description of the scene."
@@ -220,6 +249,16 @@ components:
           description: Which of the seven escalation triggers fired.
           title: Reason
           type: string
+        sequence:
+          description: "This version's position in the engine's write order for the recent-event ring\
+            \ \u2014 a de-duplication key, never a sort key. An event can be sent more than once with\
+            \ the same `event_id`: it is re-sent when something about it changes, currently when its clip\
+            \ finishes uploading and `clip_uri` appears. The copy with the higher `sequence` is the newer\
+            \ one; two copies with the same `sequence` are the same copy. Per process and monotonic \u2014\
+            \ it restarts from zero when the engine does, exactly like the ring itself, so never persist\
+            \ it or compare it across a restart."
+          title: Sequence
+          type: integer
         severity:
           description: The band `threat_score` falls in.
           title: Severity
@@ -247,6 +286,9 @@ components:
           type: array
       required:
       - event_id
+      - camera_id
+      - sequence
+      - clip_uri
       - occurred_at
       - source_timestamp
       - reason
@@ -285,6 +327,35 @@ components:
       - type
       title: ValidationError
       type: object
+    Zone:
+      description: 'The space a camera watches. The recorder''s `space_type` vocabulary, exactly.
+
+
+        Deliberately the recorder''s four-camera vocabulary rather than a new one: the two
+
+        systems watch the same building, and a console that shows both must not have to
+
+        translate. Extending it is a one-line addition here plus its entry in `_KINDS`,
+
+        which `tests/domain/test_zone.py` requires for every member.'
+      enum:
+      - room
+      - corridor
+      - dayroom
+      title: Zone
+      type: string
+    ZoneKind:
+      description: 'The coarse privacy/behaviour split a `Zone` falls into.
+
+
+        Derived from `Zone`, never stored: see this module''s docstring. `StrEnum` so it
+
+        serialises as `"room"` / `"common_area"` with no encoder of its own.'
+      enum:
+      - room
+      - common_area
+      title: ZoneKind
+      type: string
 info:
   title: SentinelAI AI Engine
   version: 0.1.0
@@ -390,6 +461,45 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Get Camera Telemetry
+  /events/stream:
+    get:
+      description: "Every camera's anomaly events, pushed as they happen (spec \xA76.2, bridged).\n\n\
+        **The same volatile, bounded, in-memory ring `GET /cameras/{camera_id}/events`\nserves \u2014\
+        \ not the event store and not an audit trail.** The durable record is the\nanomaly event published\
+        \ to RabbitMQ and written down by the Phase 1C consumer.\nEverything this stream can send is held\
+        \ in engine memory, is lost on restart, and\nis silently evicted once a camera has produced more\
+        \ than `capacity` events.\n\n**What a reconnect can and cannot give you.** Every connection opens\
+        \ with a\n`backlog` frame holding what the ring currently has, then continues live. There is\n\
+        no gap between the two and no duplicate across them. But the ring is bounded, so a\nclient that\
+        \ was disconnected long enough for a camera to produce more than its\nring holds **has permanently\
+        \ missed those events on this endpoint** \u2014 they are in\nRabbitMQ, and this endpoint will\
+        \ never show them. That is why no `id:` field is\nsent and `Last-Event-ID` is not honoured: resuming\
+        \ from an offset the engine may\nno longer hold would promise a continuity it cannot keep. Reconnect,\
+        \ take the new\nbacklog as the current window, and go to the store for anything older.\n\n**Duplicates\
+        \ and updates.** An `event_id` may arrive more than once: an event is\nre-sent when something\
+        \ about it changes, currently when its clip finishes and\n`clip_uri` appears. Merge by `event_id`,\
+        \ keeping the copy with the higher\n`sequence`. Two copies with the same `sequence` are the same\
+        \ copy.\n\n**Falling behind.** A client that stops reading is buffered up to a fixed bound\nand\
+        \ then cut off with an `overflow` frame rather than being allowed to grow the\nengine's memory.\
+        \ Reconnect; the fresh backlog is more current than the queue that\nwas dropped.\n\n**Shutdown.**\
+        \ The engine closes every stream as it shuts down, so a client sees a\nclean end of response rather\
+        \ than a connection that hangs until a proxy times it\nout."
+      operationId: stream_events_events_stream_get
+      responses:
+        '200':
+          content:
+            text/event-stream:
+              schema:
+                type: string
+          description: "An open `text/event-stream`. Frames: `event: backlog` once, carrying a JSON array\
+            \ of RecentEventEntry (oldest first, possibly empty); then `event: anomaly`, one RecentEventEntry\
+            \ each, as they are assembled; `event: overflow` if this client fell too far behind, after\
+            \ which the stream ends and reconnecting is the recovery; and `: keepalive` comment lines\
+            \ on an idle stream. No `id:` field is sent and `Last-Event-ID` is not honoured \u2014 see\
+            \ the description."
+        '503':
+          description: The engine has not finished starting; retry shortly.
+      summary: "Live event stream (SSE) over the same volatile ring \u2014 NOT the event store"
   /health:
     get:
       operationId: get_health_health_get

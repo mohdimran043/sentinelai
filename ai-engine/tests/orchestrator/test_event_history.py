@@ -171,6 +171,78 @@ def test_the_history_snapshot_does_not_change_under_later_recording() -> None:
     assert snapshot.latest.occurred_at == 1.0
 
 
+class TestClipUri:
+    """T3. The ring is written at assembly, before the clip exists; the URI has to
+    reach it afterwards or the console can never link an event to its footage."""
+
+    def test_an_event_starts_with_no_clip_uri(self) -> None:
+        """Assembly precedes `_attach_clip`, and that ordering is load-bearing: spec
+        §9 requires the event to be recorded even when the clip never finishes."""
+        log = RecentEventLog(capacity=3)
+        log.record(_event())
+        assert log.history("cam-1").events[0].clip_uri is None
+
+    def test_attaching_a_clip_backfills_the_entry_that_is_already_there(self) -> None:
+        log = RecentEventLog(capacity=3)
+        event = _event(occurred_at=5.0)
+        log.record(event)
+
+        assert log.attach_clip("cam-1", event.event_id, "s3://clips/a.mp4") is True
+
+        (entry,) = log.history("cam-1").events
+        assert entry.clip_uri == "s3://clips/a.mp4"
+        assert entry.event_id == event.event_id
+        assert entry.occurred_at == 5.0, "back-filling must not rewrite anything else"
+
+    def test_the_backfill_does_not_append_a_second_copy_or_reorder_the_ring(self) -> None:
+        """A ring that grows an entry per clip would double-count every event on the
+        console's chart, and would evict twice as fast as its documented bound."""
+        log = RecentEventLog(capacity=10)
+        events = [_event(occurred_at=float(index)) for index in range(3)]
+        for event in events:
+            log.record(event)
+
+        log.attach_clip("cam-1", events[0].event_id, "s3://clips/first.mp4")
+
+        entries = log.history("cam-1").events
+        assert [entry.event_id for entry in entries] == [event.event_id for event in events]
+        assert [entry.clip_uri for entry in entries] == ["s3://clips/first.mp4", None, None]
+
+    def test_the_backfill_bumps_the_sequence_so_a_live_client_sees_the_update(self) -> None:
+        """The updated entry is a *new version* of the same event, not a duplicate of
+        it. A client that already holds the pre-clip copy must be able to tell it is
+        looking at something newer — see `TestLiveStream`."""
+        log = RecentEventLog(capacity=3)
+        event = _event()
+        log.record(event)
+        before = log.history("cam-1").events[0].sequence
+
+        log.attach_clip("cam-1", event.event_id, "s3://clips/a.mp4")
+
+        assert log.history("cam-1").events[0].sequence > before
+
+    def test_attaching_to_an_event_that_has_aged_out_is_a_no_op(self) -> None:
+        """The ring is bounded and silently lossy by design; a late clip for an
+        evicted event must not resurrect it, and must not raise into the worker."""
+        log = RecentEventLog(capacity=1)
+        first = _event(occurred_at=1.0)
+        log.record(first)
+        log.record(_event(occurred_at=2.0))
+
+        assert log.attach_clip("cam-1", first.event_id, "s3://clips/gone.mp4") is False
+        assert len(log.history("cam-1").events) == 1
+        assert log.history("cam-1").events[0].occurred_at == 2.0
+
+    def test_a_clip_only_lands_on_its_own_cameras_ring(self) -> None:
+        log = RecentEventLog(capacity=3)
+        event = _event("cam-1")
+        log.record(event)
+        log.record(_event("cam-2"))
+
+        assert log.attach_clip("cam-2", event.event_id, "s3://clips/a.mp4") is False
+        assert log.history("cam-2").events[0].clip_uri is None
+
+
 def test_a_capacity_below_one_is_rejected() -> None:
     """Zero would silently discard every event and report an always-empty console."""
     with pytest.raises(ValueError, match="capacity"):

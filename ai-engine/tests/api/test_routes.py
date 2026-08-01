@@ -11,7 +11,13 @@ from fastapi.testclient import TestClient
 
 from sentinel_ai.api.app import create_app
 from sentinel_ai.domain.entities import EscalationReason, Severity
-from sentinel_ai.orchestrator.event_history import CameraEventHistory, RecentEvent
+from sentinel_ai.domain.zone import Zone
+from sentinel_ai.orchestrator.event_history import (
+    CameraEventHistory,
+    EventSubscription,
+    RecentEvent,
+    RecentEventLog,
+)
 from sentinel_ai.orchestrator.service import UnknownCameraError
 from sentinel_ai.pipeline.runner import CameraTelemetry
 from sentinel_ai.ports.model_runtime import HealthReport, LifecycleState
@@ -34,6 +40,16 @@ class _FakeEngineService:
         self._capacity = capacity
         self.started = False
         self.stopped = False
+        # A real log, so the two stream methods below are not a second implementation
+        # of the thing they stand in for. `tests/api/test_event_stream.py` is where the
+        # stream itself is exercised.
+        self._log = RecentEventLog(capacity=capacity)
+
+    def subscribe_events(self) -> EventSubscription:
+        return self._log.subscribe()
+
+    def close_event_streams(self) -> int:
+        return self._log.close_all()
 
     def event_history(self, camera_id: str) -> CameraEventHistory:
         if camera_id not in self._cameras:
@@ -67,7 +83,7 @@ class _FakeEngineService:
         return self._describe_result
 
 
-def _telemetry(camera_id: str = "cam-1") -> CameraTelemetry:
+def _telemetry(camera_id: str = "cam-1", *, zone: Zone | None = None) -> CameraTelemetry:
     return CameraTelemetry(
         camera_id=camera_id,
         frames_seen=100,
@@ -78,6 +94,7 @@ def _telemetry(camera_id: str = "cam-1") -> CameraTelemetry:
         discontinuities=1,
         last_frame_at=12.5,
         last_escalation_at=10.0,
+        zone=zone,
     )
 
 
@@ -120,7 +137,50 @@ def test_camera_telemetry_returns_the_expected_shape() -> None:
         "discontinuities": 1,
         "last_frame_at": 12.5,
         "last_escalation_at": 10.0,
+        "zone": None,
+        "zone_kind": None,
     }
+
+
+class TestCameraZone:
+    """T1 on the wire: `GET /cameras` is what a console groups by."""
+
+    def test_cameras_are_grouped_by_zone_with_the_kind_derived(self) -> None:
+        service = _FakeEngineService(
+            cameras=(
+                _telemetry("room-2a", zone=Zone.ROOM),
+                _telemetry("corridor-1", zone=Zone.CORRIDOR),
+                _telemetry("dayroom-1", zone=Zone.DAYROOM),
+            )
+        )
+        with TestClient(create_app(service)) as client:
+            cameras = client.get("/cameras").json()["cameras"]
+
+        assert [(c["camera_id"], c["zone"], c["zone_kind"]) for c in cameras] == [
+            ("room-2a", "room", "room"),
+            ("corridor-1", "corridor", "common_area"),
+            ("dayroom-1", "dayroom", "common_area"),
+        ]
+
+    def test_an_ungrouped_camera_is_null_rather_than_a_group_called_unknown(self) -> None:
+        """Null says "nobody has grouped this camera". A sentinel string would make
+        every ungrouped camera a member of one made-up zone, which a console then draws
+        as a real group."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        with TestClient(create_app(service)) as client:
+            (camera,) = client.get("/cameras").json()["cameras"]
+
+        assert camera["zone"] is None
+        assert camera["zone_kind"] is None
+
+    def test_the_contract_constrains_the_zone_to_the_known_vocabulary(self) -> None:
+        """A generated Go client should get an enum, not a free string: the whole
+        reason the field is constrained is that two operators typing the same idea have
+        to produce the same group."""
+        schema = create_app(_FakeEngineService()).openapi()["components"]["schemas"]
+        zone = schema["Zone"]
+        assert set(zone["enum"]) == {"room", "corridor", "dayroom"}
+        assert set(schema["ZoneKind"]["enum"]) == {"room", "common_area"}
 
 
 def test_camera_telemetry_for_an_unknown_camera_is_404() -> None:
@@ -165,10 +225,14 @@ def _recent_event(
     severity: Severity = Severity.LOW,
     description: str = "A person walks past the door.",
     description_unavailable: bool = False,
+    clip_uri: str | None = None,
+    sequence: int = 1,
 ) -> RecentEvent:
     return RecentEvent(
         event_id=uuid4(),
         camera_id=camera_id,
+        sequence=sequence,
+        clip_uri=clip_uri,
         occurred_at=occurred_at,
         source_timestamp=occurred_at - 90.0,
         reason=EscalationReason.NEW_SALIENT_TRACK,
@@ -268,6 +332,27 @@ class TestCameraEvents:
         assert body["latest_description_state"] != "none", "the model failing is not silence"
         assert body["latest"] is not None
         assert body["latest"]["description_unavailable"] is True
+
+    def test_an_event_carries_the_clip_uri_so_a_notification_can_link_to_it(self) -> None:
+        """T3. Without this the camera page can show that something happened and can
+        show what the model said about it, but cannot offer the footage."""
+        events = (_recent_event(clip_uri="s3://sentinel-clips/cam-1/abc.mp4"),)
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), events=events)
+        with TestClient(create_app(service)) as client:
+            body = client.get("/cameras/cam-1/events").json()
+
+        assert body["events"][0]["clip_uri"] == "s3://sentinel-clips/cam-1/abc.mp4"
+        assert body["latest"]["clip_uri"] == "s3://sentinel-clips/cam-1/abc.mp4"
+
+    def test_an_event_whose_clip_failed_says_null_rather_than_omitting_the_field(self) -> None:
+        """`clip_uri: null` is a real answer — the event happened and there is no
+        footage — and a console must be able to tell it from a field it forgot to
+        read."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), events=(_recent_event(),))
+        with TestClient(create_app(service)) as client:
+            body = client.get("/cameras/cam-1/events").json()
+
+        assert body["events"][0]["clip_uri"] is None
 
     def test_events_for_an_unknown_camera_is_404(self) -> None:
         service = _FakeEngineService()

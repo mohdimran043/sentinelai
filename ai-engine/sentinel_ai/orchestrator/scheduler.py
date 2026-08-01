@@ -89,6 +89,7 @@ from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import (
     RECENT_EVENTS_PER_CAMERA,
     CameraEventHistory,
+    EventSubscription,
     RecentEventLog,
 )
 from sentinel_ai.orchestrator.resident_set import ResidentSet
@@ -353,6 +354,20 @@ class VlmScheduler:
         """
         return self._recent.history(camera_id)
 
+    def subscribe_events(self) -> EventSubscription:
+        """A live client's handle on the same ring `event_history` snapshots.
+
+        Registered here and now, before the caller takes its backlog: see
+        `EventSubscription` for why that order is what makes the handover gapless.
+        """
+        return self._recent.subscribe()
+
+    def close_event_streams(self) -> int:
+        """End every live stream; returns how many there were. Called at shutdown so a
+        subscriber parked on an engine that has stopped producing is released rather
+        than left waiting."""
+        return self._recent.close_all()
+
     async def _process(self, request: EscalationRequest) -> None:
         await self._admission.acquire(self._clock())
         try:
@@ -604,6 +619,17 @@ class VlmScheduler:
         )
 
     async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:
+        """Finish the clip and put its URI on the event — and on the console's copy.
+
+        The ring is written at assembly, before this runs, which is deliberate and
+        stays that way: spec §9 requires the event to survive a clip that never
+        finishes, and it does — the failure path below leaves both the published event
+        and the ring entry with `clip_uri=None`. Only the success path writes again,
+        back-filling the one entry that is already there. See
+        `orchestrator/event_history.py` for why that is a rewrite rather than a second
+        append, and for the sequence bump that lets a live subscriber tell the update
+        apart from a redelivery.
+        """
         if request.clip is None:
             return event
         try:
@@ -620,4 +646,13 @@ class VlmScheduler:
             # always safe — and without it every failed clip leaks a file handle.
             await request.clip.abort()
             return event
+        if not self._recent.attach_clip(event.camera_id, event.event_id, clip_uri):
+            # The ring wrapped between assembly and upload. Bounded and volatile by
+            # construction, so this is a lost console link, never a lost event.
+            logger.debug(
+                "clip %s arrived after event %s had aged out of camera %s's ring",
+                clip_uri,
+                event.event_id,
+                event.camera_id,
+            )
         return replace(event, clip_uri=clip_uri)

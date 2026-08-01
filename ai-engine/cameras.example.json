@@ -3,7 +3,8 @@
     {
       "id": "avenue_01",
       "label": "Avenue (demo)",
-      "url": "rtsp://localhost:8554/avenue_01"
+      "url": "rtsp://localhost:8554/avenue_01",
+      "zone": "corridor"
     },
     {
       "id": "replay_01",
