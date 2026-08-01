@@ -199,8 +199,19 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
     async def shutdown(self) -> None:
         self._model = None
         self._vram_mib = 0
+        import gc
+
         import torch
 
+        # gc.collect() before empty_cache() is load-bearing, not tidiness: an
+        # nn.Module graph is full of reference cycles, so dropping the last
+        # reference does not free it under CPython refcounting alone — it needs
+        # a collection pass before the caching allocator has anything to hand
+        # back to the driver. Measured on Qwen2.5-VL in Task 13: empty_cache()
+        # alone left ~2.4 GB reserved after shutdown, and gc.collect() first
+        # dropped it to ~54 MiB. The 600 s idle-unload in ResidentSet only
+        # reclaims VRAM if this genuinely releases it.
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self._state = LifecycleState.UNLOADED
