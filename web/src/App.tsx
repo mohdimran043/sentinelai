@@ -8,6 +8,9 @@ import { SectionNotBuiltPage } from '@/routes/recorder/SectionNotBuiltPage'
 import { AlertsPage } from '@/routes/recorder/AlertsPage'
 import { ModelsPage } from '@/routes/recorder/ModelsPage'
 import { ConfigurePage } from '@/routes/recorder/ConfigurePage'
+import { CamerasPage } from '@/routes/recorder/CamerasPage'
+import { NotificationsPage } from '@/routes/recorder/NotificationsPage'
+import { StoragePage } from '@/routes/recorder/StoragePage'
 
 /**
  * Two products, two route namespaces.
@@ -36,6 +39,9 @@ export function App() {
           <Route path="/recorder/alerts" element={<AlertsPage />} />
           <Route path="/recorder/models" element={<ModelsPage />} />
           <Route path="/recorder/configure" element={<ConfigurePage />} />
+          <Route path="/recorder/storage" element={<StoragePage />} />
+          <Route path="/recorder/cameras" element={<CamerasPage />} />
+          <Route path="/recorder/notifications" element={<NotificationsPage />} />
           {/* Sections with a built screen get their own route above this one.
               Everything else falls through to a page that says so out loud. */}
           <Route path="/recorder/:section" element={<SectionNotBuiltPage />} />

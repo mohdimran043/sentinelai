@@ -73,7 +73,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'storage',
     label: 'Storage',
-    built: false,
+    built: true,
     endpoints: ['GET /api/storage/untracked'],
     summary:
       'Footage on disk that the segment index has no record of, per camera, with byte totals and the recorder’s explanation of why none of it is ever deleted automatically.',

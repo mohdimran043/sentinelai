@@ -8,6 +8,7 @@ import type {
   RecorderAlertsResponse,
   RecorderModelsResponse,
   RecorderSettingsResponse,
+  RecorderUntrackedResponse,
 } from '@/recorder/recorder.types'
 
 /**
@@ -319,4 +320,64 @@ export const REAL_SETTINGS: RecorderSettingsResponse = {
     online_acknowledged: false,
   },
   wired: false,
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/storage/untracked — captured live 2026-08-01
+ * ------------------------------------------------------------------ */
+
+export const REAL_STORAGE: RecorderUntrackedResponse = {
+  cameras: [
+    {
+      camera_id: 'corridor_1',
+      dir: '/var/tmp/sentinel-wall/preroll/corridor_1',
+      count: 0,
+      total_bytes: 0,
+      sample: null,
+      truncated: false,
+    },
+    {
+      camera_id: 'dayroom_1',
+      dir: '/var/tmp/sentinel-wall/preroll/dayroom_1',
+      count: 0,
+      total_bytes: 0,
+      sample: null,
+      truncated: false,
+    },
+    {
+      camera_id: 'room_2a',
+      dir: '/var/tmp/sentinel-wall/preroll/room_2a',
+      count: 0,
+      total_bytes: 0,
+      sample: null,
+      truncated: false,
+    },
+    {
+      camera_id: 'room_4b',
+      dir: '/var/tmp/sentinel-wall/preroll/room_4b',
+      count: 3,
+      total_bytes: 84,
+      sample: [
+        {
+          path: '/var/tmp/sentinel-wall/preroll/room_4b/room_4b_1785502196892950204.mp4',
+          size_bytes: 28,
+          modified_ns: 1785502196899459663,
+        },
+        {
+          path: '/var/tmp/sentinel-wall/preroll/room_4b/room_4b_1785502277303285389.mp4',
+          size_bytes: 28,
+          modified_ns: 1785502277307621050,
+        },
+        {
+          path: '/var/tmp/sentinel-wall/preroll/room_4b/room_4b_1785580404648961122.mp4',
+          size_bytes: 28,
+          modified_ns: 1785580405161197947,
+        },
+      ],
+      truncated: false,
+    },
+  ],
+  note: 'Footage on disk that the segment index does not account for. It is never deleted automatically: an un-indexed file is one the system has lost its record of, which is exactly when its contents are least safe to assume are worthless. Reclaiming the space is a deliberate act.',
+  total_bytes: 84,
+  total_count: 3,
 }
