@@ -56,6 +56,22 @@ class ModelRuntime(ABC):
     async def shutdown(self) -> None: ...
 
     @abstractmethod
+    def mark_unhealthy(self, detail: str) -> None:
+        """Record a fault the *orchestrator* observed, so `health()` reflects it.
+
+        A runtime sets `UNHEALTHY` itself for failures it can see from the inside —
+        a load that raised, a checkpoint that would not download. It cannot see the
+        ones that only make sense a layer out: spec §9's VLM-OOM row requires the
+        model be marked unhealthy after a describe has run out of VRAM *twice*, and
+        "twice" is knowledge the scheduler holds, not the runtime.
+
+        Abstract rather than a defaulted no-op on purpose: a silently unimplemented
+        `mark_unhealthy` would leave `/health` reporting a model as fine while the
+        orchestrator had already given up on it, which is the state this exists to
+        prevent.
+        """
+
+    @abstractmethod
     def health(self) -> HealthReport: ...
 
     @abstractmethod

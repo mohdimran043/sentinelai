@@ -414,6 +414,10 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def mark_unhealthy(self, detail: str) -> None:
+        self._state = LifecycleState.UNHEALTHY
+        self._health_detail = detail
+
     def health(self) -> HealthReport:
         return HealthReport(state=self._state, detail=self._health_detail, vram_mib=self._vram_mib)
 

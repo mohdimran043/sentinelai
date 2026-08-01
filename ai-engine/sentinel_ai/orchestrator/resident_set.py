@@ -52,6 +52,37 @@ class ResidentSet:
         for key in required:
             self._last_used_at[key] = now
 
+    async def evict(self, key: str) -> bool:
+        """Unload one model now, whatever the plan says. Returns whether it was resident.
+
+        Spec §9's VLM-OOM row calls for an eviction before the retry, and
+        `plan_residency` cannot express it: the planner only evicts to make room for a
+        *load*, and after an OOM the model is already resident — from the planner's
+        point of view nothing needs to change. Reloading it is nevertheless the one
+        thing that helps, because `ModelRuntime.shutdown()` runs `gc.collect()` and
+        `torch.cuda.empty_cache()`, which is what actually hands a fragmented
+        allocator pool back to the driver.
+
+        Bookkeeping stays here rather than in the caller so `_resident` and
+        `_last_used_at` cannot drift from what is really on the card.
+        """
+        if key not in self._resident:
+            return False
+        await self._registry.get(key).shutdown()
+        self._resident.discard(key)
+        self._last_used_at.pop(key, None)
+        return True
+
+    def mark_unhealthy(self, key: str, detail: str) -> None:
+        """Record an orchestrator-observed fault on a model's own health report.
+
+        Routed through here rather than by handing the scheduler a `ModelRegistry`:
+        the resident set is already the scheduler's one handle on model lifecycle,
+        and a second one would be a second place that could disagree about which
+        models exist.
+        """
+        self._registry.get(key).mark_unhealthy(detail)
+
     async def sweep_idle(self, now: float) -> None:
         """Idle-evict only: `ensure` with nothing required (spec §5.4's 600s VLM
         idle-unload)."""

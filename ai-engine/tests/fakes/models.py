@@ -135,6 +135,7 @@ class FakeModelRuntime(ModelRuntime):
         self.initialize_calls = 0
         self.warmup_calls = 0
         self.shutdown_calls = 0
+        self.unhealthy_details: list[str] = []
         self.predict_calls: list[object] = []
 
     async def initialize(self) -> None:
@@ -156,9 +157,14 @@ class FakeModelRuntime(ModelRuntime):
         self.shutdown_calls += 1
         self._state = LifecycleState.UNLOADED
 
+    def mark_unhealthy(self, detail: str) -> None:
+        self._state = LifecycleState.UNHEALTHY
+        self.unhealthy_details.append(detail)
+
     def health(self) -> HealthReport:
         vram = self._vram_mib if self._state != LifecycleState.UNLOADED else 0
-        return HealthReport(state=self._state, vram_mib=vram)
+        detail = self.unhealthy_details[-1] if self.unhealthy_details else ""
+        return HealthReport(state=self._state, detail=detail, vram_mib=vram)
 
     def version(self) -> str:
         return "fake-1"

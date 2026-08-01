@@ -29,6 +29,15 @@ sweep's window mean "idle" rather than "600s since boot". It goes through
 `ResidentSet` rather than calling `ModelRuntime.initialize()` directly so that
 `plan_residency`'s admission arithmetic and eviction bookkeeping stay authoritative.
 
+VLM out-of-memory
+-----------------
+Spec §9 gives this failure its own row — *evict LRU, retry once, mark unhealthy,
+pipeline continues detection-only* — because it is the one the camera can survive if
+it is handled and cannot if it is not. `_describe_surviving_one_oom` implements it,
+and only it: every other describe failure is one bad escalation and takes the §9
+fallback below. See that method for why the model evicted is the VLM and not the
+literal least-recently-used one.
+
 Clock
 -----
 `clock` here is *real elapsed time* — `time.monotonic` in production. It has to be:
@@ -43,6 +52,7 @@ must not be conflated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -55,7 +65,7 @@ from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher
 from sentinel_ai.ports.frame_source import FrameData
-from sentinel_ai.ports.vision_llm import VisionLanguageModel, VisionRequest
+from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +98,29 @@ _UNAVAILABLE_THREAT_VALUE = 0.5
 description, and 0.5 neither over- nor under-states it for downstream triage."""
 
 _UNAVAILABLE_ACTION = "Review the clip when available."
+
+_OOM_TYPE_NAMES = frozenset({"OutOfMemoryError", "CudaOutOfMemoryError", "OutOfMemory"})
+"""Class names that mean "the accelerator ran out of memory".
+
+Matched by *name* across the MRO rather than by importing `torch.cuda.OutOfMemoryError`:
+this module is in the orchestrator layer and must keep running on a CI box with no
+`gpu` extra installed, where that import does not exist. Backed up by a substring
+check on the message, because several runtimes raise a plain `RuntimeError`
+("CUDA out of memory. Tried to allocate ...") rather than a distinct type.
+"""
+
+
+def _is_out_of_memory(error: BaseException) -> bool:
+    """Spec §9's VLM-OOM row applies to this failure and not to any other one.
+
+    Deliberately generous: treating an unrelated failure as an OOM costs one extra
+    reload, while missing a real OOM costs the recovery the spec requires.
+    """
+    if isinstance(error, MemoryError):
+        return True
+    if any(cls.__name__ in _OOM_TYPE_NAMES for cls in type(error).__mro__):
+        return True
+    return "out of memory" in str(error).lower()
 
 
 def _labels_and_tracks(scene: SceneState) -> tuple[tuple[str, ...], tuple[int, ...]]:
@@ -211,6 +244,65 @@ class VlmScheduler:
                 error,
             )
 
+    async def _run_vlm(self, vlm_request: VisionRequest) -> SceneDescription:
+        async with asyncio.timeout(self._timeout_seconds):
+            return await self._vlm.describe(vlm_request)
+
+    async def _describe_surviving_one_oom(self, vlm_request: VisionRequest) -> SceneDescription:
+        """Spec §9's VLM-OOM row: evict, retry once, mark unhealthy, carry on.
+
+        Only the OOM case takes this path. Everything else — a timeout, a malformed
+        reply, a load-state guard — is one bad describe and is handled by the caller's
+        §9 fallback; retrying those would just spend the GPU slot twice.
+
+        **Which model is evicted, and why it is not the LRU.** The spec says "evict
+        LRU". Taken literally here that evicts the *detector*: its idle clock is only
+        stamped at boot (the scheduler freshens the VLM's before every describe, and
+        nothing freshens the detector's), so the detector is permanently the
+        least-recently-used model. Unloading it would stop detection outright — the
+        exact opposite of the same row's "pipeline continues detection-only". So the
+        VLM is what gets evicted: it is the allocator that failed, and it is the only
+        eviction that frees VRAM without blinding the camera. With two models
+        configured these are the only two choices; a future third model would want a
+        genuine LRU pass over everything *except* the always-on detector.
+
+        The eviction is what makes the retry worth attempting: `shutdown()` runs
+        `gc.collect()` then `torch.cuda.empty_cache()` (measured at ~2.4 GB -> ~54 MiB
+        in Task 13), so the reload starts from a compacted pool rather than the
+        fragmented one that just failed.
+
+        A second OOM means the card genuinely cannot hold this model right now. The
+        model is evicted again and marked `UNHEALTHY`, so `/health` says so instead of
+        reporting the post-eviction `UNLOADED` an operator reads as *correctly idle*,
+        and the error is re-raised into the caller's §9 fallback so the event still
+        publishes with `description_unavailable=True`. Recovery is not permanent-off:
+        the next escalation's `_ensure_vlm_resident()` will try to load it again, and
+        succeeds if whatever else was on the card has gone. Detection never stopped.
+        """
+        try:
+            return await self._run_vlm(vlm_request)
+        except Exception as error:
+            if not _is_out_of_memory(error):
+                raise
+            logger.warning(
+                "vlm %s ran out of memory; evicting and retrying once: %s",
+                self._vlm_model_key,
+                error,
+            )
+        await self._resident_set.evict(self._vlm_model_key)
+        try:
+            await self._resident_set.ensure((self._vlm_model_key,), self._clock())
+            return await self._run_vlm(vlm_request)
+        except Exception as retry_error:
+            detail = f"out of memory on two consecutive describes: {retry_error}"
+            logger.error("vlm %s %s", self._vlm_model_key, detail)
+            # Evict *before* marking: `shutdown()` sets the runtime back to UNLOADED,
+            # so the other order would erase the very state this is recording.
+            with contextlib.suppress(Exception):
+                await self._resident_set.evict(self._vlm_model_key)
+            self._resident_set.mark_unhealthy(self._vlm_model_key, detail)
+            raise
+
     async def _describe(self, request: EscalationRequest) -> Event:
         labels, track_ids = _labels_and_tracks(request.scene)
         vlm_request = VisionRequest(
@@ -221,8 +313,7 @@ class VlmScheduler:
             reason_detail=request.detail,
         )
         try:
-            async with asyncio.timeout(self._timeout_seconds):
-                description = await self._vlm.describe(vlm_request)
+            description = await self._describe_surviving_one_oom(vlm_request)
             # Inside the guard on purpose. `SceneDescription.threat_value` is a bare
             # unvalidated float and `ThreatScore.from_value` rejects anything outside
             # [0, 1]; Task 13's Qwen adapter parses that number out of generated model

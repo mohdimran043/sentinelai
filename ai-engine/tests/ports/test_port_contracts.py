@@ -85,7 +85,7 @@ def test_every_port_is_abstract_and_cannot_be_instantiated(port: type) -> None:
         port()
 
 
-def test_model_runtime_exposes_the_seven_spec_section_10_methods() -> None:
+def test_model_runtime_exposes_the_spec_section_10_methods() -> None:
     required = {
         "initialize",
         "health",
@@ -94,9 +94,16 @@ def test_model_runtime_exposes_the_seven_spec_section_10_methods() -> None:
         "shutdown",
         "version",
         "capabilities",
+        # The eighth, added deliberately for spec §9's VLM-OOM row: the orchestrator
+        # has to be able to drive a runtime to UNHEALTHY after two consecutive
+        # out-of-memory describes, and "two consecutive" is knowledge only the
+        # scheduler has. Abstract rather than a defaulted no-op so an unimplemented
+        # one cannot leave `/health` reporting a model the orchestrator has given up
+        # on as fine.
+        "mark_unhealthy",
     }
-    # Equality, not a subset: an eighth abstract method added to the §10
-    # interface must be a deliberate, visible change to this test.
+    # Equality, not a subset: a ninth abstract method added to the §10 interface must
+    # be a deliberate, visible change to this test — as this eighth one was.
     assert required == set(ModelRuntime.__abstractmethods__)
 
 

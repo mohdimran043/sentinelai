@@ -19,14 +19,27 @@ from sentinel_ai.domain.entities import (
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
-from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
+from sentinel_ai.orchestrator.scheduler import (
+    EscalationRequest,
+    VlmScheduler,
+    _is_out_of_memory,
+)
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher
+from sentinel_ai.ports.model_runtime import LifecycleState
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
 from tests.fakes.models import FakeModelRuntime, FakeVisionLLM
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
+
+
+def _named_error(name: str) -> type[Exception]:
+    """A synthetic exception class with the given name, standing in for
+    `torch.cuda.OutOfMemoryError` — which cannot be imported here, since CI installs
+    no `gpu` extra and `_is_out_of_memory` matches on the class name for exactly that
+    reason."""
+    return type(name, (RuntimeError,), {})
 
 
 def clock() -> float:
@@ -262,6 +275,139 @@ async def test_a_full_queue_drops_and_counts_without_raising() -> None:
     assert scheduler.submit(a_request()) is True
     assert scheduler.submit(a_request()) is False
     assert scheduler.dropped == 1
+
+
+class OomVisionLLM(VisionLanguageModel):
+    """Raises an out-of-memory error for the first `fail_first` describes.
+
+    The error is a bare `RuntimeError` carrying torch's real message rather than a
+    `torch.cuda.OutOfMemoryError`: the CI box has no `gpu` extra, and torch itself
+    raises this shape from several call sites, so it is the harder case to detect.
+    """
+
+    def __init__(self, fail_first: int) -> None:
+        self.fail_first = fail_first
+        self.calls = 0
+
+    async def describe(self, request: VisionRequest) -> SceneDescription:
+        self.calls += 1
+        if self.calls <= self.fail_first:
+            raise RuntimeError(
+                "CUDA out of memory. Tried to allocate 512.00 MiB. GPU 0 has a total "
+                "capacity of 7.99 GiB of which 21.06 MiB is free."
+            )
+        return SceneDescription(
+            description="A person is standing near the door.",
+            threat_value=0.3,
+            suggested_action="Monitor.",
+        )
+
+
+class TestVlmOutOfMemory:
+    """Spec §9's VLM-OOM row: evict LRU -> retry once -> mark unhealthy -> pipeline
+    continues detection-only. None of the four clauses existed before; a CUDA OOM was
+    caught by the broad `except Exception`, degraded to `description_unavailable=True`
+    and forgotten, so the model stayed resident on a card it had just exhausted."""
+
+    async def test_an_oom_evicts_retries_once_and_publishes_a_real_description(self) -> None:
+        """The clause that keeps the description. Fails against the old scheduler with
+        `description_unavailable is True`, `vlm.calls == 1` and no eviction at all."""
+        resident_set = RecordingResidentSet()
+        vlm = OomVisionLLM(fail_first=1)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(vlm=vlm, publisher=publisher, resident_set=resident_set)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert vlm.calls == 2, "exactly one retry, not zero and not a loop"
+        assert resident_set.runtime.shutdown_calls == 1, "the eviction must actually unload"
+        assert resident_set.runtime.initialize_calls == 2, "and the retry must reload"
+        assert resident_set.resident() == frozenset({VLM_KEY})
+        assert publisher.events[0].description_unavailable is False
+        assert publisher.events[0].description == "A person is standing near the door."
+        assert resident_set.runtime.health().state is LifecycleState.HEALTHY
+
+    async def test_a_second_oom_marks_the_model_unhealthy_and_still_publishes(self) -> None:
+        """The clause that makes the fault visible. `/health` previously reported the
+        post-eviction `UNLOADED`, which an operator reads as *correctly idle* rather
+        than as a card that cannot hold the model."""
+        resident_set = RecordingResidentSet()
+        vlm = OomVisionLLM(fail_first=2)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(vlm=vlm, publisher=publisher, resident_set=resident_set)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert vlm.calls == 2, "one retry only — a second OOM is not retried again"
+        report = resident_set.runtime.health()
+        assert report.state is LifecycleState.UNHEALTHY
+        assert "out of memory on two consecutive describes" in report.detail
+        assert resident_set.resident() == frozenset(), "the model is off the card"
+        # Spec §9 all the same: the event survives, degraded.
+        assert len(publisher.events) == 1
+        assert publisher.events[0].description_unavailable is True
+
+    async def test_the_pipeline_keeps_going_and_can_recover(self) -> None:
+        """Detection-only is not "the VLM is off until restart":
+        the next escalation's `ensure()` reloads it, and if the card has room it
+        describes again."""
+        resident_set = RecordingResidentSet()
+        vlm = OomVisionLLM(fail_first=2)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(vlm=vlm, publisher=publisher, resident_set=resident_set)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert [e.description_unavailable for e in publisher.events] == [True, False]
+        assert resident_set.resident() == frozenset({VLM_KEY})
+        assert resident_set.runtime.health().state is LifecycleState.HEALTHY
+
+    async def test_a_non_oom_failure_is_not_retried(self) -> None:
+        """A timeout or a malformed reply is one bad escalation. Retrying it would
+        spend the process's only GPU slot twice for the same expected outcome, and
+        would evict a model that has nothing wrong with it."""
+        resident_set = RecordingResidentSet()
+        vlm = FakeVisionLLM(error=TimeoutError("vlm timed out"))
+        publisher = FakePublisher()
+        scheduler = new_scheduler(vlm=vlm, publisher=publisher, resident_set=resident_set)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert vlm.call_count == 1
+        assert resident_set.runtime.shutdown_calls == 0, "nothing was evicted"
+        assert resident_set.runtime.health().state is not LifecycleState.UNHEALTHY
+        assert publisher.events[0].description_unavailable is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            MemoryError("out of memory"),
+            RuntimeError("CUDA out of memory. Tried to allocate 512.00 MiB"),
+            _named_error("OutOfMemoryError")("CUDA driver ran dry"),
+        ],
+    )
+    def test_every_shape_a_cuda_oom_arrives_in_is_recognised(self, error: Exception) -> None:
+        """torch raises `torch.cuda.OutOfMemoryError` from some paths and a plain
+        `RuntimeError` with the same message from others, and this module cannot import
+        torch to check the type — CI has no `gpu` extra."""
+        assert _is_out_of_memory(error) is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [TimeoutError("vlm timed out"), ValueError("threat_value 1.4 out of range")],
+    )
+    def test_an_ordinary_failure_is_not_mistaken_for_an_oom(self, error: Exception) -> None:
+        assert _is_out_of_memory(error) is False
 
 
 class TestVlmResidency:
