@@ -161,7 +161,13 @@ class RabbitMQPublisher(EventPublisher):
     async def _publish_payload(self, routing_key: str, payload: Mapping[str, object]) -> None:
         assert self._exchange is not None
         message = aio_pika.Message(
-            body=json.dumps(payload).encode("utf-8"),
+            # `allow_nan=False` is defence in depth behind `event_codec`'s finite
+            # check: `json.dumps` otherwise emits the bare `NaN`/`Infinity` tokens,
+            # which are a Python extension and not JSON, and a strict Go consumer
+            # rejects the whole message. Better to fail here -- where the scheduler's
+            # dead-letter sink keeps the event -- than to put invalid bytes on a
+            # durable topic exchange.
+            body=json.dumps(payload, allow_nan=False).encode("utf-8"),
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             content_type="application/json",
         )
@@ -184,5 +190,5 @@ class RabbitMQPublisher(EventPublisher):
         base = f"{time.time_ns():020d}-{self._spool_seq:08d}-{event_id.hex}"
         final_path = self._spool_dir / f"{base}.json"
         tmp_path = self._spool_dir / f"{base}.json.tmp"
-        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
         tmp_path.replace(final_path)  # atomic rename on the same filesystem

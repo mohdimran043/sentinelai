@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from functools import lru_cache
+from math import isfinite
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -33,8 +34,35 @@ def _validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
+_FINITE_FIELDS = ("occurred_at", "threat_score")
+"""The two numeric fields on the wire. Both must be finite; see `_require_finite`."""
+
+
+def _require_finite(payload: Mapping[str, object]) -> None:
+    """Reject NaN and ±Infinity, which the JSON Schema cannot.
+
+    Draft 2020-12's `type: number` admits them — jsonschema is validating Python
+    floats, and `float("nan")` is a number — but they are not JSON. `json.dumps`
+    happily emits the bare tokens `NaN`, `Infinity` and `-Infinity`, which are a
+    Python extension: Go's `encoding/json` rejects all three outright, so a single
+    such event would break the Phase 1C consumer's decode loop rather than just
+    itself. Worse for `occurred_at` specifically, because every comparison against a
+    NaN is false, so it also defeats the "sort by occurred_at" ordering the consumer
+    is told to rely on.
+
+    Checked here rather than in `encode_event` so it holds in both directions: the
+    same guard covers a payload read back off the disk spool, where `json.loads`
+    would otherwise accept the tokens it should never have written.
+    """
+    for field in _FINITE_FIELDS:
+        value = payload.get(field)
+        if isinstance(value, int | float) and not isinstance(value, bool) and not isfinite(value):
+            raise ValueError(f"{field} must be a finite number, got {value!r}")
+
+
 def validate_payload(payload: Mapping[str, object]) -> None:
     _validator().validate(dict(payload))
+    _require_finite(payload)
 
 
 def encode_event(event: Event) -> dict[str, object]:
