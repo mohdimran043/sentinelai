@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from uuid import UUID
 
 import pytest
 
@@ -13,7 +15,8 @@ from sentinel_ai.orchestrator.scheduler import VlmScheduler
 from sentinel_ai.orchestrator.service import EngineService, UnknownCameraError, _IdleSweeper
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
-from tests.fakes.io import FakePublisher, FakeSource
+from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
+from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakePublisher, FakeSource
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
 DETECTOR_SPEC = ModelSpec(model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None)
@@ -174,6 +177,147 @@ class TestIdleSweeperUnit:
         sweeper = _IdleSweeper(sweep, interval_seconds=60.0, clock=lambda: 0.0, sleep=fake_sleep)
         await sweeper.run_forever(should_stop=lambda: True)
         assert calls == 0
+
+
+class EndlessSource(FrameSource):
+    """Frames and packets forever — i.e. every real camera.
+
+    Every other source in the suite ends on its own, which is exactly the condition
+    under which a shutdown cannot lose anything: by the time `stop()` is called there
+    is nothing in flight left to lose. A camera that is still recording when the
+    process is asked to exit is the ordinary case in production and the only one that
+    exercises `CameraRunner`'s abandon-the-clip-but-keep-the-event path.
+    """
+
+    def __init__(self, camera_id: str, fps: float = 10.0) -> None:
+        self._camera_id = camera_id
+        self._fps = fps
+        self.closed = False
+
+    def _frame(self, index: int) -> FrameData:
+        return FakeSource.make_frame(
+            self._camera_id, index, index / self._fps, value=0 if index % 2 == 0 else 200
+        )
+
+    def __aiter__(self) -> AsyncIterator[FrameData]:
+        async def frames() -> AsyncIterator[FrameData]:
+            index = 0
+            while True:
+                yield self._frame(index)
+                index += 1
+                await asyncio.sleep(0)
+
+        return frames()
+
+    def packets(self) -> AsyncIterator[EncodedPacket]:
+        async def stream() -> AsyncIterator[EncodedPacket]:
+            index = 0
+            while True:
+                yield EncodedPacket(
+                    camera_id=self._camera_id,
+                    data=f"packet-{index}".encode(),
+                    pts=index / self._fps,
+                    is_keyframe=True,
+                    codec="h264",
+                )
+                index += 1
+                await asyncio.sleep(0)
+
+        return stream()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ClipOpenSignallingWriter(FakeClipWriter):
+    """Announces the moment a clip starts recording, so the test can stop the service
+    at a precisely known state instead of counting event-loop ticks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clip_open = asyncio.Event()
+
+    async def open(self, camera_id: str, event_id: UUID, fps: float) -> FakeClipHandle:
+        handle = await super().open(camera_id, event_id, fps)
+        self.clip_open.set()
+        return handle
+
+
+async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec §9 across the shutdown seam (C3).
+
+    `CameraRunner.run()`'s `finally` calls `_abandon_open_clip()`, which discards the
+    partial clip file and re-submits its escalation with `clip=None` precisely so the
+    event is not lost. `stop()` used to cancel every task in one synchronous pass with
+    the scheduler worker at index 0, so that submit reached a queue whose only consumer
+    was already cancelled: the event was counted in `escalations`, never published, and
+    never counted in `escalations_dropped` either, because `put_nowait` succeeded.
+
+    Fails against that ordering with `escalations=2, published=1` — the clip-owning
+    event, which is the most recent one and the one with evidence attached, is the one
+    that goes missing.
+    """
+    from sentinel_ai.config import Settings
+    from sentinel_ai.pipeline import runner as runner_module
+
+    # Long enough that the clip is still recording when stop() arrives.
+    monkeypatch.setattr(
+        runner_module, "get_settings", lambda: Settings(clip_postroll_seconds=600.0)
+    )
+
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    publisher = FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=FakeVisionLLM(),
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    writer = ClipOpenSignallingWriter()
+    runner = CameraRunner(
+        camera_id="cam-1",
+        camera_label="Front Door",
+        source=EndlessSource("cam-1"),
+        detector=FakeDetector(script=[()]),
+        tracker=FakeTracker(),
+        motion=MotionAnalyzer(),
+        profile=CameraProfile(camera_id="cam-1"),
+        scheduler=scheduler,
+        clip_writer=writer,
+        preroll=PreRollBuffer(preroll_seconds=3.0),
+        clock=clock,
+    )
+    service = EngineService(
+        cameras={"cam-1": runner},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=clock,
+    )
+
+    await service.start()
+    await asyncio.wait_for(writer.clip_open.wait(), timeout=5.0)
+    await service.stop()
+
+    handle = writer.handles[0]
+    assert handle.aborted is True, "test setup: the clip must still have been recording"
+    assert handle.finished is False
+    assert service.telemetry("cam-1").escalations_dropped == 0
+    assert {event.event_id for event in publisher.events} == {handle.event_id}, (
+        "the escalation the runner's shutdown path preserved must reach the publisher"
+    )
+    assert len(publisher.events) == service.telemetry("cam-1").escalations, (
+        "every escalation the camera counted must have been published"
+    )
 
 
 async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> None:

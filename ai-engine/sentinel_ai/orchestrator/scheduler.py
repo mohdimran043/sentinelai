@@ -136,7 +136,14 @@ class VlmScheduler:
                 self._queue.task_done()
 
     async def drain(self) -> None:
-        """Await completion of queued work — tests only."""
+        """Await completion of everything currently queued.
+
+        Two callers: tests, and `EngineService.stop()`, which drains between
+        cancelling the cameras and cancelling this worker so that the escalations a
+        runner submits from its shutdown path are actually published (spec §9). It
+        only ever returns once the queue is empty, so the shutdown caller bounds it
+        with a timeout rather than trusting the VLM to finish.
+        """
         await self._queue.join()
 
     @property
