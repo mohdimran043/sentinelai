@@ -27,7 +27,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'cameras',
     label: 'Cameras',
-    built: false,
+    built: true,
     endpoints: ['GET /api/cameras', 'GET /api/status'],
     summary:
       'The full camera record the recorder holds: mode, space type, source, resolution, mask file, pre-roll, capacity, and the audio and face-recognition flags — several of which the recorder itself says are stored but read by nothing.',

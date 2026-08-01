@@ -88,6 +88,17 @@ export interface RecorderStatusResponse {
 }
 
 /* ------------------------------------------------------------------ *
+ * POST /api/cameras/{camera_id}/start and /stop
+ * ------------------------------------------------------------------ *
+ * NOT PROBED: unlike every GET in this file, calling one of these live would
+ * itself stop or start a real running recorder worker, so no response body
+ * was captured. `recorderClient.ts` trusts a 2xx by HTTP status alone and does
+ * not parse or type its body; the one fact the UI relies on afterward is a
+ * fresh GET /api/status. There is deliberately no response type declared
+ * here — see the "anything NOT observed is not declared" rule above.
+ */
+
+/* ------------------------------------------------------------------ *
  * GET /api/alerts
  * ------------------------------------------------------------------ */
 

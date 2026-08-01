@@ -6,10 +6,14 @@
 import type {
   RecorderAlert,
   RecorderAlertsResponse,
+  RecorderCamera,
+  RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
   RecorderModelsResponse,
   RecorderSettingsResponse,
+  RecorderStatusResponse,
   RecorderUntrackedResponse,
+  RecorderWorkerStatus,
 } from '@/recorder/recorder.types'
 
 /**
@@ -456,4 +460,178 @@ export const REAL_CAPABILITIES: RecorderCapabilitiesResponse = {
         'elevated_watch, capacity, audio_enabled, face_recognition_enabled and ignored_zones are validated, stored and reported — and acted on by NOTHING in this slice. Setting elevated_watch does not cause a camera to be watched more closely, because nothing yet watches for anything. The schema lands early so a deployment is not configured against one shape and then silently reinterpreted when welfare logic arrives.',
     },
   ],
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/cameras — captured live 2026-08-01, 4 cameras
+ * ------------------------------------------------------------------ */
+
+export const REAL_CAMERAS: RecorderCamerasResponse = {
+  cameras: [
+    {
+      id: 'room_4b',
+      name: 'Room 4B',
+      mode: 'room',
+      space_type: 'room',
+      source: 'v4l2:/dev/video0',
+      width: 1280,
+      height: 720,
+      fps: 15,
+      mask_path: '/var/tmp/sentinel-wall/masks/room_4b.json',
+      preroll_seconds: 300,
+      elevated_watch: false,
+      capacity: 0,
+      audio_enabled: false,
+      face_recognition_enabled: false,
+      ignored_zones: [],
+    },
+    {
+      id: 'corridor_1',
+      name: 'Corridor 1',
+      mode: 'common_area',
+      space_type: 'corridor',
+      source: 'rtsp://10.0.0.99:554/nothing-here',
+      width: 1280,
+      height: 720,
+      fps: 15,
+      mask_path: '',
+      preroll_seconds: 300,
+      elevated_watch: false,
+      capacity: 0,
+      audio_enabled: false,
+      face_recognition_enabled: false,
+      ignored_zones: [],
+    },
+    {
+      id: 'room_2a',
+      name: 'Room 2A',
+      mode: 'room',
+      space_type: 'room',
+      source: 'rtsp://10.0.0.98:554/nothing-here',
+      width: 1280,
+      height: 720,
+      fps: 15,
+      mask_path: '',
+      preroll_seconds: 300,
+      elevated_watch: false,
+      capacity: 0,
+      audio_enabled: false,
+      face_recognition_enabled: false,
+      ignored_zones: [],
+    },
+    {
+      id: 'dayroom_1',
+      name: 'Dayroom 1',
+      mode: 'common_area',
+      space_type: 'dayroom',
+      source: 'rtsp://10.0.0.97:554/nothing-here',
+      width: 1280,
+      height: 720,
+      fps: 15,
+      mask_path: '',
+      preroll_seconds: 300,
+      elevated_watch: false,
+      capacity: 0,
+      audio_enabled: false,
+      face_recognition_enabled: false,
+      ignored_zones: [],
+    },
+  ],
+  context_note:
+    'elevated_watch, capacity, audio_enabled, face_recognition_enabled and ignored_zones are stored and validated. Nothing in this slice reads them. Setting elevated_watch does not cause a camera to be watched more closely.',
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/status — captured live 2026-08-01, same instant as REAL_CAMERAS.
+ * One real camera (room_4b) reads UNDERLIT rather than LOST at this capture;
+ * the brief's "one real camera is currently LOST" is reflected in the other
+ * three, captured moments apart as the corridor/room_2a/dayroom feeds (which
+ * have no real source behind them) aged past the outage threshold.
+ * ------------------------------------------------------------------ */
+
+export const REAL_STATUS: RecorderStatusResponse = {
+  cameras: [
+    {
+      camera_id: 'corridor_1',
+      mode: 'common_area',
+      integrity_state: 'LOST',
+      running: true,
+      failed: false,
+      restarts: 0,
+      last_frame_age_ms: -1,
+      frames_dropped: 0,
+    },
+    {
+      camera_id: 'dayroom_1',
+      mode: 'common_area',
+      integrity_state: 'LOST',
+      running: true,
+      failed: false,
+      restarts: 0,
+      last_frame_age_ms: -1,
+      frames_dropped: 0,
+    },
+    {
+      camera_id: 'room_2a',
+      mode: 'room',
+      integrity_state: 'LOST',
+      running: true,
+      failed: false,
+      restarts: 0,
+      last_frame_age_ms: -1,
+      frames_dropped: 0,
+    },
+    {
+      camera_id: 'room_4b',
+      mode: 'room',
+      integrity_state: 'UNDERLIT',
+      running: true,
+      failed: false,
+      restarts: 0,
+      last_frame_age_ms: 0,
+      frames_dropped: 98893490696,
+    },
+  ],
+  server_time_ns: 1785580431295388577,
+}
+
+/**
+ * Synthetic camera/status builders for `CamerasPage` tests that need more
+ * variety than one live capture provides — a camera the recorder is not
+ * reporting worker status for, a stopped worker, a failed one with restarts.
+ * Field shapes mirror `REAL_CAMERAS/REAL_STATUS` exactly.
+ */
+export function makeCamera(overrides: Partial<RecorderCamera> = {}): RecorderCamera {
+  return {
+    id: 'test_cam',
+    name: 'Test Camera',
+    mode: 'room',
+    space_type: 'room',
+    source: 'v4l2:/dev/video0',
+    width: 1280,
+    height: 720,
+    fps: 15,
+    mask_path: '',
+    preroll_seconds: 300,
+    elevated_watch: false,
+    capacity: 0,
+    audio_enabled: false,
+    face_recognition_enabled: false,
+    ignored_zones: [],
+    ...overrides,
+  }
+}
+
+export function makeStatus(overrides: Partial<RecorderWorkerStatus> = {}): RecorderWorkerStatus {
+  return {
+    camera_id: 'test_cam',
+    mode: 'room',
+    integrity_state: 'HEALTHY',
+    running: true,
+    failed: false,
+    restarts: 0,
+    last_frame_age_ms: 500,
+    frames_dropped: 0,
+    ...overrides,
+  }
 }

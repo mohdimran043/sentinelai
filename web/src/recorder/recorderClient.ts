@@ -51,24 +51,31 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (!response.ok) {
-    // The recorder's 404 body is `{"error": "no such endpoint: GET /api/x"}` —
-    // an `error` key, not the engine's `detail`. Read both so neither product's
-    // message is swallowed into a bare status code.
-    let detail = response.statusText
-    try {
-      const body: unknown = await response.json()
-      if (body && typeof body === 'object') {
-        const record = body as Record<string, unknown>
-        const message = record.error ?? record.detail
-        if (message !== undefined) detail = String(message)
-      }
-    } catch {
-      // Body wasn't JSON — keep statusText.
-    }
-    throw new RecorderHttpError(response.status, detail)
+    throw await toHttpError(response)
   }
 
   return (await response.json()) as T
+}
+
+/**
+ * The recorder's 404 body is `{"error": "no such endpoint: GET /api/x"}` — an
+ * `error` key, not the engine's `detail`. Read both so neither product's
+ * message is swallowed into a bare status code. Shared by `request` (which
+ * always expects a JSON body back) and `postCameraAction` (which does not).
+ */
+async function toHttpError(response: Response): Promise<RecorderHttpError> {
+  let detail = response.statusText
+  try {
+    const body: unknown = await response.json()
+    if (body && typeof body === 'object') {
+      const record = body as Record<string, unknown>
+      const message = record.error ?? record.detail
+      if (message !== undefined) detail = String(message)
+    }
+  } catch {
+    // Body wasn't JSON — keep statusText.
+  }
+  return new RecorderHttpError(response.status, detail)
 }
 
 export function getRecorderStatus(): Promise<RecorderStatusResponse> {
@@ -112,4 +119,49 @@ export function getRecorderSettings(): Promise<RecorderSettingsResponse> {
 
 export function getRecorderUntrackedStorage(): Promise<RecorderUntrackedResponse> {
   return request<RecorderUntrackedResponse>('/storage/untracked')
+}
+
+/**
+ * `GET /api/snapshot/{camera_id}?t=...` — a live JPEG frame (verified: 200,
+ * `image/jpeg`, ~5.6 KB). Not fetched through `request`: this is consumed
+ * directly as an `<img src>`, never parsed as JSON. `cacheBust` should change
+ * on every render an operator expects a fresher frame — `CamerasPage` uses
+ * `GET /api/status`'s own `server_time_ns`, so the thumbnail turns over on the
+ * same cadence as the worker-status poll rather than running a second timer.
+ */
+export function recorderSnapshotUrl(cameraId: string, cacheBust: number): string {
+  return `${RECORDER_BASE_URL}/snapshot/${encodeURIComponent(cameraId)}?t=${cacheBust}`
+}
+
+/**
+ * `POST /api/cameras/{camera_id}/start` and `/stop` — worker lifecycle
+ * control. Probing this live (unlike every GET above) would itself stop or
+ * start a real running recorder worker, so its response body was never
+ * captured and is deliberately not parsed or trusted: a non-2xx throws exactly
+ * as every other recorder call does (via `toHttpError`), and a 2xx resolves
+ * with nothing. The caller (`useRecorderCameraAction`) refetches
+ * `GET /api/status` to learn what actually happened.
+ */
+async function postCameraAction(cameraId: string, action: 'start' | 'stop'): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(
+      `${RECORDER_BASE_URL}/cameras/${encodeURIComponent(cameraId)}/${action}`,
+      { method: 'POST', headers: { Accept: 'application/json' } },
+    )
+  } catch (cause) {
+    throw new RecorderUnreachableError(cause)
+  }
+
+  if (!response.ok) {
+    throw await toHttpError(response)
+  }
+}
+
+export function startRecorderCamera(cameraId: string): Promise<void> {
+  return postCameraAction(cameraId, 'start')
+}
+
+export function stopRecorderCamera(cameraId: string): Promise<void> {
+  return postCameraAction(cameraId, 'stop')
 }

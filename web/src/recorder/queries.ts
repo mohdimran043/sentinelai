@@ -1,4 +1,10 @@
-import { useQuery, type UseQueryResult } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseMutationResult,
+  type UseQueryResult,
+} from '@tanstack/react-query'
 import {
   getRecorderAlerts,
   getRecorderCapabilities,
@@ -8,6 +14,8 @@ import {
   getRecorderStatus,
   getRecorderUntrackedStorage,
   listRecorderCameras,
+  startRecorderCamera,
+  stopRecorderCamera,
 } from '@/recorder/recorderClient'
 import type {
   RecorderAlertsResponse,
@@ -110,5 +118,40 @@ export function useRecorderUntrackedStorage(): UseQueryResult<RecorderUntrackedR
     queryKey: ['recorder', 'storage', 'untracked'],
     queryFn: getRecorderUntrackedStorage,
     retry: 1,
+  })
+}
+
+export interface RecorderCameraActionVariables {
+  cameraId: string
+  action: 'start' | 'stop'
+}
+
+/**
+ * Worker lifecycle control. Deliberately one shared mutation rather than one
+ * per camera row: `CamerasPage` reads `mutation.variables` to know which row
+ * (if any) is mid-action, so only one camera can be acted on at a time and the
+ * pending/outcome UI never has to be duplicated per row.
+ *
+ * No `retry` (the mutation default already has none via `renderWithProviders`'
+ * QueryClient in tests, and the default QueryClient elsewhere): retrying a
+ * start/stop automatically is the one thing that must never happen silently —
+ * an operator who clicked once must not risk the recorder seeing two calls.
+ *
+ * On success, only `['recorder', 'status']` is invalidated. `['recorder',
+ * 'cameras']` is the registry (name, mode, source, ...); starting or stopping
+ * a worker cannot change any of that, only its running state.
+ */
+export function useRecorderCameraAction(): UseMutationResult<
+  void,
+  Error,
+  RecorderCameraActionVariables
+> {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ cameraId, action }: RecorderCameraActionVariables) =>
+      action === 'start' ? startRecorderCamera(cameraId) : stopRecorderCamera(cameraId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['recorder', 'status'] })
+    },
   })
 }
