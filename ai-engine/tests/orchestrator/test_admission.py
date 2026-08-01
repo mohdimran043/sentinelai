@@ -154,3 +154,33 @@ async def test_the_first_acquire_of_a_gates_life_never_waits(
     await gate.acquire(now=0.0)
 
     assert slept == []
+
+
+class TestSlotLifetimeUnderFailure:
+    async def test_cancelling_during_the_interval_sleep_does_not_leak_the_slot(self) -> None:
+        """The slot is taken before the deficit is paid, so a cancellation inside that
+        sleep must hand it back — otherwise a concurrency-1 gate wedges the GPU forever.
+        Reachable at shutdown, and more so now that the interval is enforced correctly.
+        """
+        gate = AdmissionGate(concurrency=1, min_interval_seconds=60.0)
+        await gate.acquire(now=0.0)
+        gate.release(now=0.0)
+
+        # Second acquire owes a 60 s deficit, so it parks in the sleep.
+        waiting = asyncio.create_task(gate.acquire(now=1.0))
+        await asyncio.sleep(0)
+        assert not waiting.done(), "expected the caller to be parked paying the deficit"
+
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+        assert gate.in_flight == 0, "cancellation leaked the in-flight count"
+        # The real proof: the slot is genuinely reusable, not merely counted as free.
+        await asyncio.wait_for(gate.acquire(now=1000.0), timeout=1.0)
+        assert gate.in_flight == 1
+
+    async def test_an_unmatched_release_is_rejected(self) -> None:
+        gate = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+        with pytest.raises(RuntimeError, match="without a matching acquire"):
+            gate.release(now=0.0)

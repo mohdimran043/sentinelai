@@ -40,21 +40,34 @@ class AdmissionGate:
         await self._semaphore.acquire()
         self._in_flight += 1
         admitted_at = now
-        if self._last_acquired_at is not None:
-            deficit = self._min_interval_seconds - (now - self._last_acquired_at)
-            if deficit > 0:
-                await _sleep(deficit)
-                # The origin the *next* caller measures its deficit from must be the
-                # instant this call was actually admitted, not the clock read it took
-                # before paying the deficit off. Recording the stale `now` here makes
-                # the following caller's interval look already-elapsed, so every second
-                # admission slips through unspaced and the gate admits at ~2x its
-                # configured rate.
-                admitted_at = now + deficit
+        try:
+            if self._last_acquired_at is not None:
+                deficit = self._min_interval_seconds - (now - self._last_acquired_at)
+                if deficit > 0:
+                    await _sleep(deficit)
+                    # The origin the *next* caller measures its deficit from must be the
+                    # instant this call was actually admitted, not the clock read it took
+                    # before paying the deficit off. Recording the stale `now` here makes
+                    # the following caller's interval look already-elapsed, so every second
+                    # admission slips through unspaced and the gate admits at ~2x its
+                    # configured rate.
+                    admitted_at = now + deficit
+        except BaseException:
+            # The slot is taken before the deficit is paid, so a cancellation inside that
+            # sleep would otherwise leak it forever — and with a non-zero interval the
+            # worker spends real time in there, so shutdown lands in this window routinely.
+            # A leaked slot on a concurrency-1 gate wedges the GPU permanently.
+            self._in_flight -= 1
+            self._semaphore.release()
+            raise
         self._last_acquired_at = admitted_at
 
     def release(self, now: float) -> None:
         del now  # no release-side interval policy today; kept for symmetry with acquire
+        if self._in_flight == 0:
+            # Over-releasing would raise the effective concurrency above the configured
+            # limit and silently let two calls onto one GPU.
+            raise RuntimeError("AdmissionGate.release() called without a matching acquire()")
         self._in_flight -= 1
         self._semaphore.release()
 
