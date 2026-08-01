@@ -30,7 +30,7 @@ view) — a different boundary from the published event.
 from __future__ import annotations
 
 import json
-import re
+import logging
 from typing import Any
 
 import numpy as np
@@ -46,9 +46,32 @@ from sentinel_ai.ports.model_runtime import (
 )
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 
+logger = logging.getLogger(__name__)
+
 _AWQ_SUFFIX = "-AWQ"
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 _FALLBACK_ACTION = "Review the clip manually — automated threat assessment unavailable."
+_FALLBACK_DESCRIPTION = (
+    "Automated description unavailable — the vision model's reply did not match "
+    "the expected format."
+)
+"""Fixed stand-in for `SceneDescription.description` on the malformed-response
+fallback path (Task 13 review, finding F1).
+
+The pre-fix code used the model's raw text verbatim here (truncated to 500
+chars) while `suggested_action` on the same path already used the fixed
+`_FALLBACK_ACTION` — an asymmetry that let raw, unfiltered model output reach
+`SceneDescription`, then `Event`, then RabbitMQ, then the operator UI. Spec
+§3.3 requires published events carry no model identity, and a model confused
+enough to ignore the JSON instruction is exactly the model most likely to
+answer in first person ("As Qwen2.5-VL, I can see..."). Sanitising the raw
+text instead of replacing it was considered and rejected: it would require
+enumerating every way a model might name itself, an open-ended problem,
+whereas a fixed fallback cannot leak by construction. The cost is losing
+whatever real scene detail the raw text might have carried on this
+(malformed-response) path only; the raw text is still logged at DEBUG level
+in `_parse_response` for operators — logs are operator-facing infrastructure,
+not the published event, so that is not a spec §3.3 concern.
+"""
 
 _RESPONSE_INSTRUCTIONS = (
     "Respond with ONLY a JSON object of this exact shape, no other text:\n"
@@ -125,23 +148,62 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _extract_json_block(text: str) -> str | None:
+    """Find the first balanced `{...}` block in `text`, or `None`.
+
+    Task 13 review ("also worth doing"): the original approach used
+    `re.compile(r"\\{.*\\}", re.DOTALL).search(...)`, which is greedy across
+    the *entire* response — any incidental `{`/`}` appearing after a
+    perfectly valid JSON object (e.g. the model tacking on a trailing aside
+    like "note: {see above}") gets swallowed into the match, breaking
+    `json.loads` and causing a spurious fall-through to the fallback path.
+    Scanning for the first *balanced* pair starting at the first `{` is
+    precise regardless of what follows it.
+
+    Known limitation: this is a brace counter, not a JSON-string-aware
+    scanner, so a `{` or `}` appearing inside a quoted string value (e.g.
+    `{"description": "a sign reading {DANGER}"}`) would miscount and either
+    truncate the match or fail to close it. Not currently exercised by any
+    observed model output on this box; a real occurrence would still fall
+    through safely to the fixed fallback rather than crash or leak, per
+    `_parse_response`'s contract.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
 def _parse_response(raw_text: str) -> SceneDescription:
     """Parse the model's reply, tolerating one that ignores the JSON
     instruction — a formatting slip must never crash the pipeline (spec §9).
 
     Any failure — no JSON block found, invalid JSON, wrong types, a missing
     required key — falls through to a fixed, safe `SceneDescription` built
-    from the raw text verbatim, never an exception. This is a different
-    failure mode from the scheduler's `description_unavailable=True` path
-    (S14): that one fires on timeout/OOM (infrastructure failure); this one
-    fires on a malformed *success* (a formatting slip), and callers must not
-    conflate the two.
+    from `_FALLBACK_DESCRIPTION`/`_FALLBACK_ACTION`, never the raw text and
+    never an exception (see `_FALLBACK_DESCRIPTION`'s docstring for why the
+    raw text is not used here — spec §3.3, Task 13 review finding F1). The
+    raw text is logged at DEBUG so the failure stays diagnosable to an
+    operator without ever reaching the published `Event`. This whole path is
+    a different failure mode from the scheduler's `description_unavailable=True`
+    path (S14): that one fires on timeout/OOM (infrastructure failure); this
+    one fires on a malformed *success* (a formatting slip), and callers must
+    not conflate the two.
     """
     candidate = raw_text.strip()
-    match = _JSON_BLOCK.search(candidate)
-    if match is not None:
+    json_block = _extract_json_block(candidate)
+    if json_block is not None:
         try:
-            payload = json.loads(match.group(0))
+            payload = json.loads(json_block)
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict):
@@ -161,9 +223,13 @@ def _parse_response(raw_text: str) -> SceneDescription:
                     threat_value=_clamp01(float(threat_value)),
                     suggested_action=suggested_action.strip(),
                 )
-    fallback_description = candidate[:500] if candidate else "The vision model returned no text."
+    logger.warning(
+        "vision model reply did not match the expected JSON schema; falling back to a "
+        "fixed description (raw reply logged at DEBUG, never published — spec §3.3)"
+    )
+    logger.debug("raw vision model reply that failed to parse: %r", candidate)
     return SceneDescription(
-        description=fallback_description, threat_value=0.5, suggested_action=_FALLBACK_ACTION
+        description=_FALLBACK_DESCRIPTION, threat_value=0.5, suggested_action=_FALLBACK_ACTION
     )
 
 
@@ -312,38 +378,67 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
         self._model = None
         self._processor = None
         self._vram_mib = 0
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._release_vram_sync)
+        self._state = LifecycleState.UNLOADED
+
+    def _release_vram_sync(self) -> None:
+        """`gc.collect()` before `empty_cache()` is not decorative: a
+        `nn.Module` graph (the multi-billion-parameter Qwen2.5-VL model
+        included) is full of reference cycles, so dropping `self._model`'s
+        refcount to zero does not free it immediately under CPython's
+        refcounting alone — it needs a GC cycle to be collected before the
+        caching allocator has anything to return to the driver. Measured on
+        this box: `empty_cache()` alone left ~2.4 GB reserved after
+        shutdown; adding `gc.collect()` first dropped that to ~54 MiB. The
+        600s idle-unload (ResidentSet, Task 7) depends on this being a real
+        reclaim, not a nominal one — a stale ~2.4 GB reservation would starve
+        `plan_residency()`'s admission control of the VRAM it thinks it just
+        got back.
+
+        Task 13 review finding F2: this runs on a worker thread via
+        `shutdown()`'s `run_in_executor`, matching the pattern `describe()`
+        already establishes for `_generate_sync`. A full `gc.collect()` pass
+        blocks whatever thread calls it for its entire duration; running it
+        directly in the coroutine body would stall every other camera's
+        pipeline sharing this event loop for that long, and `ResidentSet`'s
+        600s idle-unload can fire while those pipelines are still running.
+        """
         import gc
 
         import torch
 
-        # `gc.collect()` before `empty_cache()` is not decorative: a
-        # `nn.Module` graph (the multi-billion-parameter Qwen2.5-VL model
-        # included) is full of reference cycles, so dropping `self._model`'s
-        # refcount to zero does not free it immediately under CPython's
-        # refcounting alone — it needs a GC cycle to be collected before the
-        # caching allocator has anything to return to the driver. Measured on
-        # this box: `empty_cache()` alone left ~2.4 GB reserved after
-        # shutdown; adding `gc.collect()` first dropped that to ~54 MiB. The
-        # 600s idle-unload (ResidentSet, Task 7) depends on this being a real
-        # reclaim, not a nominal one — a stale ~2.4 GB reservation would starve
-        # `plan_residency()`'s admission control of the VRAM it thinks it just
-        # got back.
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self._state = LifecycleState.UNLOADED
 
     def health(self) -> HealthReport:
         return HealthReport(state=self._state, detail=self._health_detail, vram_mib=self._vram_mib)
 
     def version(self) -> str:
+        """Reports the checkpoint Branch B actually loads (Task 13 review
+        finding F3), not the configured `-AWQ` id — `_base_checkpoint` is the
+        same stripping `initialize()` uses, so this can never drift from
+        what is really resident.
+        """
         import transformers
 
-        return f"transformers=={transformers.__version__} model={self._model_id}"
+        return f"transformers=={transformers.__version__} model={_base_checkpoint(self._model_id)}"
 
     def capabilities(self) -> Capabilities:
+        """`model_key` reports the checkpoint actually loaded (Task 13
+        review finding F3): Branch B always loads the unquantised checkpoint
+        via `_base_checkpoint`, never the configured `-AWQ` repo, so
+        reporting the raw `self._model_id` here would let an operator
+        reading `health()`/`capabilities()` reasonably — and wrongly —
+        conclude AWQ is active. This is orchestrator-internal (the
+        registry's health view), a different boundary from the published
+        `Event` (spec §3.3), so it does not conflict with F1.
+        """
         return Capabilities(
-            model_key=self._model_id,
+            model_key=_base_checkpoint(self._model_id),
             kind="vision",
             labels=frozenset(),
             vram_mib=self._vram_mib,

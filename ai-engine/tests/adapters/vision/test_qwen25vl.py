@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from sentinel_ai.adapters.vision.qwen25vl import (
+    _FALLBACK_DESCRIPTION,
     Qwen25VLDescriber,
     _base_checkpoint,
     _build_text_prompt,
@@ -111,8 +112,13 @@ def test_parse_response_clamps_a_negative_threat_value() -> None:
 
 
 def test_parse_response_falls_back_on_prose_with_no_json() -> None:
+    """F1 (Task 13 review): the fallback path must use the fixed
+    `_FALLBACK_DESCRIPTION`, never the raw text verbatim — see
+    `test_parse_response_never_leaks_a_model_name_via_the_fallback_description`
+    for why (spec §3.3: raw model text is not safe to publish unfiltered).
+    """
     result = _parse_response("There is a person near the entrance, nothing concerning.")
-    assert result.description == "There is a person near the entrance, nothing concerning."
+    assert result.description == _FALLBACK_DESCRIPTION
     assert 0.0 <= result.threat_value <= 1.0
     assert result.suggested_action
 
@@ -120,20 +126,76 @@ def test_parse_response_falls_back_on_prose_with_no_json() -> None:
 def test_parse_response_falls_back_on_json_missing_a_required_key() -> None:
     raw = '{"description": "X", "suggested_action": "Y"}'
     result = _parse_response(raw)
-    assert result.description == raw
+    assert result.description == _FALLBACK_DESCRIPTION
     assert 0.0 <= result.threat_value <= 1.0
 
 
 def test_parse_response_falls_back_on_wrong_typed_threat_value() -> None:
     """threat_value as a string, not a number — a parser that did not check
     types (e.g. blindly `float()`-cast whatever key it found) would either
-    raise or silently coerce; this must instead hit the safe fallback path
-    with the raw text preserved verbatim.
+    raise or silently coerce; this must instead hit the safe fallback path,
+    with the fixed `_FALLBACK_DESCRIPTION` used in place of the raw text
+    (F1, Task 13 review).
     """
     raw = '{"description": "X", "threat_value": "high", "suggested_action": "Y"}'
     result = _parse_response(raw)
-    assert result.description == raw
+    assert result.description == _FALLBACK_DESCRIPTION
     assert 0.0 <= result.threat_value <= 1.0
+
+
+def test_parse_response_never_leaks_a_model_name_via_the_fallback_description() -> None:
+    """F1 (Task 13 review, Critical): the pre-fix code used
+    `description=candidate[:500]` on the malformed-response fallback path —
+    the model's raw, unfiltered text verbatim — while `suggested_action` on
+    the same path already used the fixed `_FALLBACK_ACTION`. A model
+    confused enough to ignore the JSON-only instruction is exactly the model
+    most likely to answer in first person ("As Qwen2.5-VL, I can see...").
+    Spec §3.3 requires published events carry no model identity, and that
+    string would otherwise flow into `SceneDescription.description`, then
+    `Event`, then RabbitMQ, then the operator UI.
+
+    This must fail against the pre-fix code (which puts "qwen" straight into
+    `result.description`) and pass after the fix (fixed
+    `_FALLBACK_DESCRIPTION`, no raw text).
+    """
+    raw = "As Qwen2.5-VL, I can see a person standing near the entrance."
+    result = _parse_response(raw)
+    assert "qwen" not in result.description.lower()
+    assert result.description == _FALLBACK_DESCRIPTION
+
+
+def test_parse_response_recovers_a_json_block_followed_by_trailing_braces() -> None:
+    """Also worth doing (Task 13 review): the original greedy
+    `re.compile(r"\\{.*\\}", re.DOTALL)` regex spans from the first `{` to the
+    *last* `}` in the whole response, so incidental braces after a valid
+    JSON object (e.g. a trailing aside) get swallowed into the match and
+    break `json.loads` — a spurious fall-through that, after F1, means
+    losing the parsed description entirely even though the model's JSON was
+    perfectly valid. The balanced-brace scanner recovers the first complete
+    object regardless of what follows it.
+    """
+    raw = (
+        '{"description": "Ok.", "threat_value": 0.1, "suggested_action": "None."} '
+        "note: {no further action needed}"
+    )
+    result = _parse_response(raw)
+    assert result.description == "Ok."
+    assert result.threat_value == 0.1
+
+
+def test_capabilities_reports_the_checkpoint_actually_loaded_not_the_awq_variant() -> None:
+    """F3 (Task 13 review): Branch B always loads the unquantised checkpoint
+    via `_base_checkpoint`, regardless of the configured `-AWQ` model id. An
+    operator reading `capabilities()`/`health()` — the boundary explicitly
+    designated as the correct place for model identity (spec §3.3) — must
+    see the checkpoint that is actually resident, not the one merely
+    configured, or they would reasonably conclude AWQ is active when it
+    never is. No GPU/torch import needed: `capabilities()` is pure.
+    """
+    describer = Qwen25VLDescriber(
+        model_id="Qwen/Qwen2.5-VL-3B-Instruct-AWQ", max_new_tokens=64, device="cpu"
+    )
+    assert describer.capabilities().model_key == "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
 def test_parse_response_never_raises_on_empty_text() -> None:
@@ -165,7 +227,10 @@ async def test_real_describer_loads_warms_up_and_reports_health() -> None:
     assert describer.capabilities().vram_mib > 0
     # Spec §3.3: the registry's health view may carry the model id, but the
     # thing it measures (VRAM) must not be confused with an Event field.
-    assert describer.capabilities().model_key == "Qwen/Qwen2.5-VL-3B-Instruct-AWQ"
+    # F3 (Task 13 review): reports the checkpoint Branch B actually loads
+    # (unquantised), not the configured "-AWQ" id, matching `_base_checkpoint`.
+    assert describer.capabilities().model_key == "Qwen/Qwen2.5-VL-3B-Instruct"
+    assert "-AWQ" not in describer.version()
 
     reserved_before_shutdown = torch.cuda.memory_reserved() // (1024 * 1024)
 
