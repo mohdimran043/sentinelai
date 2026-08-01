@@ -22,6 +22,7 @@ from sentinel_ai.domain.entities import (
     Track,
 )
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.event_history import RECENT_EVENTS_PER_CAMERA
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import (
@@ -134,9 +135,10 @@ def a_request(
     reason: EscalationReason = EscalationReason.PERIODIC_SUMMARY,
     tracks: tuple[Track, ...] = (),
     timestamp: float = 12.5,
+    camera_id: str = "cam-1",
 ) -> EscalationRequest:
     scene = SceneState(
-        camera_id="cam-1",
+        camera_id=camera_id,
         frame_index=0,
         timestamp=timestamp,
         detections=(Detection("person", 0.9, BOX),),
@@ -145,13 +147,13 @@ def a_request(
         scene_signature=(1.0,),
     )
     return EscalationRequest(
-        camera_id="cam-1",
+        camera_id=camera_id,
         event_id=uuid4(),
         reason=reason,
         detail="initial scene summary",
         scene=scene,
-        keyframe=FakeSource.make_frame("cam-1", 0, 0.0),
-        profile=CameraProfile(camera_id="cam-1"),
+        keyframe=FakeSource.make_frame(camera_id, 0, 0.0),
+        profile=CameraProfile(camera_id=camera_id),
         camera_label="Front Door",
         history=(),
         clip=clip,
@@ -198,6 +200,7 @@ def new_scheduler(
     dead_letter: FailedEventSink | None = None,
     clock: Callable[[], float] = clock,
     wall_clock: Callable[[], float] = wall_clock,
+    recent_events_per_camera: int = RECENT_EVENTS_PER_CAMERA,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -217,6 +220,7 @@ def new_scheduler(
         timeout_seconds=timeout_seconds,
         clock=clock,
         wall_clock=wall_clock,
+        recent_events_per_camera=recent_events_per_camera,
     )
 
 
@@ -994,3 +998,113 @@ class TestEventTimestamps:
             "two cameras observed moments apart must land moments apart, not ~14 "
             "hours apart (one uptime) as the process-wide anchor produced"
         )
+
+
+class TestTheRecentEventHistory:
+    """The console's bounded per-camera ring, written where the `Event` is built.
+
+    `_assemble` is deliberately the one place in the system that constructs an
+    `Event` (S14), and the ring hangs off it rather than off `_publish` precisely so
+    that the events an operator most needs to see in the console — the §9 degraded
+    one, and the one a cancelled shutdown dead-lettered — are in it. Two of the
+    tests below are exactly that difference: they fail against a ring written on the
+    publish path, because on that path no event was ever published.
+    """
+
+    async def test_a_published_event_is_retained_for_the_console(self) -> None:
+        scheduler = new_scheduler()
+        async with Worker(scheduler) as running:
+            running.submit(a_request())
+            await running.drain()
+
+        history = scheduler.event_history("cam-1")
+        assert len(history.events) == 1
+        latest = history.latest
+        assert latest is not None
+        assert latest.description == "A person is standing near the door."
+        assert latest.threat_score == pytest.approx(0.3)
+        assert latest.severity.value == "low"
+        assert latest.occurred_at == pytest.approx(wall_clock())
+        assert latest.description_unavailable is False
+
+    async def test_an_unknown_camera_has_an_empty_history_rather_than_raising(self) -> None:
+        """The scheduler knows nothing about which camera ids are configured — that
+        is `EngineService`'s job, and it is what turns an unknown id into a 404. Here
+        the answer is simply an empty snapshot."""
+        history = new_scheduler().event_history("never-heard-of-it")
+        assert history.events == ()
+        assert history.latest is None
+
+    async def test_a_degraded_event_the_vlm_never_described_is_still_retained(self) -> None:
+        """A §9 fallback event reaches the ring, and reaches it still flagged.
+
+        The flag is the point. Drop it in the projection and the console shows a
+        metadata stand-in — "periodic_summary: motion (...)" — as though the model
+        had looked at the scene and said that.
+        """
+        vlm = FakeVisionLLM(error=RuntimeError("model not loaded"))
+        scheduler = new_scheduler(vlm=vlm)
+        async with Worker(scheduler) as running:
+            running.submit(a_request())
+            await running.drain()
+
+        latest = scheduler.event_history("cam-1").latest
+        assert latest is not None
+        assert latest.description_unavailable is True
+        assert latest.description == "periodic_summary: motion (initial scene summary)", (
+            "the §9 stand-in built from cheap signals, not a scene description"
+        )
+
+    async def test_an_event_a_cancelled_shutdown_abandoned_is_still_retained(self) -> None:
+        """`abandon_pending` dead-letters the escalations a shutdown cut short; they
+        are never published. A ring written on the publish path holds nothing here,
+        so this test fails against that design and passes against recording at
+        assembly."""
+        scheduler = new_scheduler()
+        scheduler.submit(a_request())
+        assert await scheduler.abandon_pending(RuntimeError("shutdown")) == 1
+
+        history = scheduler.event_history("cam-1")
+        assert len(history.events) == 1, "an abandoned event is exactly what the console needs"
+        assert history.events[0].description_unavailable is True
+
+    async def test_the_shipped_default_bound_is_enforced_end_to_end(self) -> None:
+        """The ring the *production* scheduler builds, not a test-sized one.
+
+        A capacity-3 ring test says nothing about whether the shipped default is
+        wired in or whether it is enforced at all. This drives more events than the
+        default bound through a scheduler constructed exactly as `main.compose`
+        constructs it, and fails against an unbounded list.
+        """
+        overflow = 5
+        total = RECENT_EVENTS_PER_CAMERA + overflow
+        scheduler = new_scheduler(maxsize=total)
+        async with Worker(scheduler) as running:
+            for index in range(total):
+                assert running.submit(a_request(timestamp=float(index))) is True
+            await running.drain()
+
+        history = scheduler.event_history("cam-1")
+        assert history.capacity == RECENT_EVENTS_PER_CAMERA
+        assert len(history.events) == RECENT_EVENTS_PER_CAMERA, (
+            f"{total} events went in and the ring kept {len(history.events)}: the bound "
+            "is not enforced, which is the leak this ring exists to avoid"
+        )
+        assert history.events[0].source_timestamp == pytest.approx(float(overflow)), (
+            "the oldest entries are the ones evicted"
+        )
+        assert history.latest is not None
+        assert history.latest.source_timestamp == pytest.approx(float(total - 1))
+
+    async def test_a_busy_camera_cannot_evict_a_quiet_camera_s_history(self) -> None:
+        """Through the real scheduler, not just the log: a global ring wired in here
+        would drop `cam-quiet`'s single event long before `cam-busy` finished."""
+        scheduler = new_scheduler(maxsize=32, recent_events_per_camera=3)
+        async with Worker(scheduler) as running:
+            running.submit(a_request(camera_id="cam-quiet", timestamp=0.0))
+            for index in range(10):
+                running.submit(a_request(camera_id="cam-busy", timestamp=float(index + 1)))
+            await running.drain()
+
+        assert len(scheduler.event_history("cam-quiet").events) == 1
+        assert len(scheduler.event_history("cam-busy").events) == 3

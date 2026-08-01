@@ -86,6 +86,11 @@ from uuid import UUID
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, ThreatScore
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.event_history import (
+    RECENT_EVENTS_PER_CAMERA,
+    CameraEventHistory,
+    RecentEventLog,
+)
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
@@ -175,6 +180,7 @@ class VlmScheduler:
         timeout_seconds: float,
         clock: Callable[[], float],
         wall_clock: Callable[[], float] = time.time,
+        recent_events_per_camera: int = RECENT_EVENTS_PER_CAMERA,
     ) -> None:
         self._vlm = vlm
         self._publisher = publisher
@@ -193,6 +199,11 @@ class VlmScheduler:
         # One anchor per camera, established lazily from that camera's own first
         # event rather than once for the whole process — see `_to_epoch`.
         self._camera_anchors: dict[str, tuple[float, float]] = {}
+        # A volatile console cache, not the event store — see
+        # `orchestrator/event_history.py`. It lives here rather than beside the
+        # publisher because it must capture events the publisher never sees: a
+        # dead-lettered one, and one a cancelled shutdown abandoned.
+        self._recent = RecentEventLog(recent_events_per_camera)
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
         self._publish_failures = 0
@@ -330,6 +341,17 @@ class VlmScheduler:
         (`publish_failures`), and conflating it would hide the one number an operator
         needs to see after a `docker compose down` cut a queue short."""
         return self._abandoned
+
+    def event_history(self, camera_id: str) -> CameraEventHistory:
+        """This camera's bounded, volatile console history — see
+        `orchestrator/event_history.py`, and note that it is not the event store.
+
+        An unconfigured camera id is not this object's concern and yields an empty
+        snapshot; `EngineService` is what turns an unknown camera into an
+        `UnknownCameraError`, so an unknown camera 404s and a quiet one returns an
+        empty list.
+        """
+        return self._recent.history(camera_id)
 
     async def _process(self, request: EscalationRequest) -> None:
         await self._admission.acquire(self._clock())
@@ -511,9 +533,16 @@ class VlmScheduler:
         Every path — a good describe, a failed one, and a shutdown that abandoned the
         escalation before it was ever described — comes through here, precisely so no
         error path can produce a differently-shaped event, or none at all.
+
+        Which is also why the console's recent-event ring is written here and nowhere
+        else: hanging it off the publish path instead would omit exactly the events an
+        operator most needs to see in the console — the §9 degraded one, and the one a
+        cancelled shutdown dead-lettered rather than published. The ring is bounded,
+        per camera, and volatile; see `orchestrator/event_history.py` for the bound and
+        for why `clip_uri` (attached later, in `_attach_clip`) is not carried in it.
         """
         labels, track_ids = _labels_and_tracks(request.scene)
-        return Event(
+        event = Event(
             event_id=request.event_id,
             camera_id=request.camera_id,
             occurred_at=self._to_epoch(request.camera_id, request.scene.timestamp),
@@ -526,6 +555,8 @@ class VlmScheduler:
             track_ids=track_ids,
             description_unavailable=description_unavailable,
         )
+        self._recent.record(event)
+        return event
 
     def _unavailable_event(self, request: EscalationRequest) -> Event:
         """Spec §9's degraded event: everything the metadata already knows, and an

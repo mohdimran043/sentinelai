@@ -84,6 +84,7 @@ from sentinel_ai.api.app import create_app
 from sentinel_ai.config import Settings, get_settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.event_history import CameraEventHistory
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
@@ -600,6 +601,14 @@ class ComposedService:
         if self._composition is None:
             raise UnknownCameraError(camera_id)
         return self._composition.service.telemetry(camera_id)
+
+    def event_history(self, camera_id: str) -> CameraEventHistory:
+        # Same honesty as `telemetry` above: before `start()` there are no cameras at
+        # all, so every id is unknown. Returning an empty history instead would tell a
+        # console that a camera exists and has simply been quiet.
+        if self._composition is None:
+            raise UnknownCameraError(camera_id)
+        return self._composition.service.event_history(camera_id)
 
     def health(self) -> dict[str, HealthReport]:
         return {} if self._composition is None else self._composition.service.health()

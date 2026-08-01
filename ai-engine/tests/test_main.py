@@ -45,6 +45,7 @@ from sentinel_ai.main import (
     load_cameras,
     refresh_specs_from_capabilities,
 )
+from sentinel_ai.orchestrator.event_history import RECENT_EVENTS_PER_CAMERA
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.service import UnknownCameraError
 from sentinel_ai.pipeline.runner import CameraRunner
@@ -556,6 +557,10 @@ class TestComposedService:
         with pytest.raises(UnknownCameraError):
             service.telemetry("cam-1")
         with pytest.raises(UnknownCameraError):
+            # Not an empty history: before `start()` there are no cameras at all, and
+            # an empty list would tell a console the camera exists and has been quiet.
+            service.event_history("cam-1")
+        with pytest.raises(UnknownCameraError):
             await service.describe_now("cam-1")
 
     async def test_start_composes_then_starts_and_stop_closes_the_publisher(
@@ -636,7 +641,9 @@ class TestComposedService:
         finally:
             await service.stop()
 
-    def test_the_module_level_app_is_a_fastapi_app_with_the_four_endpoints(self) -> None:
+    def test_the_module_level_app_is_a_fastapi_app_with_the_read_and_write_endpoints(
+        self,
+    ) -> None:
         """`uvicorn sentinel_ai.main:app` needs something to serve, and importing this
         module must not read a camera file, open a socket or touch the GPU."""
         assert isinstance(main.app, FastAPI)
@@ -645,6 +652,7 @@ class TestComposedService:
             "/health",
             "/cameras",
             "/cameras/{camera_id}/telemetry",
+            "/cameras/{camera_id}/events",
             "/cameras/{camera_id}/describe",
         } <= paths
 
@@ -691,3 +699,14 @@ class TestTheAssembledSystemRuns:
         assert len(spooled) == telemetry.escalations, "no escalation may go unpublished"
         for path in spooled:
             validate_payload(json.loads(path.read_text(encoding="utf-8")))
+
+        # The console's recent-event ring, through production composition rather than
+        # a hand-wired scheduler: this is what proves `GET /cameras/{id}/events` will
+        # actually have something to serve in the assembled system.
+        history = composition.service.event_history("cam-1")
+        assert len(history.events) == len(spooled), (
+            "every assembled event must be in the console ring, not just the published ones"
+        )
+        assert history.latest is not None
+        assert history.latest.description, "the live panel needs a description to show"
+        assert history.capacity == RECENT_EVENTS_PER_CAMERA

@@ -125,6 +125,44 @@ async def test_telemetry_of_an_unknown_camera_raises(monkeypatch: pytest.MonkeyP
         service.telemetry("cam-404")
 
 
+async def test_event_history_of_an_unknown_camera_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The history lives on the scheduler, which is shared by every camera and knows
+    nothing about which ids are configured — so without the service's own guard an id
+    nobody ever heard of would return a cheerful empty list instead of the 404 every
+    other camera route gives. This fails against a straight delegation."""
+    service, _publisher = build_service(monkeypatch)
+    with pytest.raises(UnknownCameraError, match="cam-404"):
+        service.event_history("cam-404")
+
+
+async def test_event_history_of_a_configured_but_quiet_camera_is_empty_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different question with a different answer: this camera exists and has
+    simply not escalated. Collapsing it into the 404 above would make "unknown
+    camera" and "nothing has happened" the same response."""
+    service, _publisher = build_service(monkeypatch)
+    history = service.event_history("cam-1")
+    assert history.camera_id == "cam-1"
+    assert history.events == ()
+    assert history.latest is None
+
+
+async def test_event_history_of_a_known_camera_carries_what_the_scheduler_assembled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _publisher = build_service(monkeypatch)
+    await service.start()
+    await _run_to_quiescence()
+    await service.describe_now("cam-1")
+    await service.stop()
+
+    history = service.event_history("cam-1")
+    assert len(history.events) >= 1
+    assert history.latest is not None
+    assert history.latest.camera_id == "cam-1"
+
+
 async def test_describe_now_of_an_unknown_camera_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     service, _publisher = build_service(monkeypatch)
     with pytest.raises(UnknownCameraError, match="cam-404"):

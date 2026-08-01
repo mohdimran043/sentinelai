@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
+from sentinel_ai.orchestrator.event_history import CameraEventHistory
 from sentinel_ai.orchestrator.registry import ModelRegistry
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
@@ -278,6 +279,22 @@ class EngineService:
 
     def telemetry(self, camera_id: str) -> CameraTelemetry:
         return self._get_runner(camera_id).telemetry()
+
+    def event_history(self, camera_id: str) -> CameraEventHistory:
+        """The console's bounded, volatile view of what this camera recently produced.
+
+        Not the event store — RabbitMQ plus the Phase 1C consumer is that; see
+        `orchestrator/event_history.py`.
+
+        `_get_runner` is called for its side effect: the history lives on the
+        scheduler, which is shared by every camera and knows nothing about which ids
+        are configured, so without this an id nobody ever heard of would return a
+        cheerful empty list instead of the 404 every other camera route gives. A
+        *configured* camera that has simply not escalated yet still returns an empty
+        list, which is a different answer to a different question.
+        """
+        self._get_runner(camera_id)
+        return self._scheduler.event_history(camera_id)
 
     def health(self) -> dict[str, HealthReport]:
         return self._registry.health()

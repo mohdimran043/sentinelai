@@ -3,6 +3,77 @@
 # `tests/test_openapi_contract.py` fails the build when it does.
 components:
   schemas:
+    CameraEventsResponse:
+      description: 'A **volatile, bounded, in-memory view for the operator console. Not the event
+
+        store, and not an audit trail.**
+
+
+        The durable record of what happened is RabbitMQ plus the Phase 1C consumer that
+
+        writes it down. This endpoint reads an in-process ring that (a) is emptied by any
+
+        restart of the engine, and (b) silently discards a camera''s oldest entry once that
+
+        camera has produced more than `capacity` events. An absent event here therefore
+
+        means "not in the last `capacity` events of this process run" and never "did not
+
+        happen". Do not reconcile against it, do not report from it, and do not use it to
+
+        establish that nothing occurred.'
+      properties:
+        camera_id:
+          title: Camera Id
+          type: string
+        capacity:
+          description: "The per-camera ring bound. Once `returned` reaches it, every new event silently\
+            \ evicts the oldest \u2014 published here so a console can say how much history it is not\
+            \ showing."
+          title: Capacity
+          type: integer
+        events:
+          description: "Retained events, oldest first \u2014 plot them in this order."
+          items:
+            $ref: '#/components/schemas/RecentEventEntry'
+          title: Events
+          type: array
+        latest:
+          anyOf:
+          - $ref: '#/components/schemas/RecentEventEntry'
+          - type: 'null'
+          description: The most recent event, i.e. the last element of `events`, lifted out for the live
+            scene panel. Read from the same snapshot as `events`, so the panel and the chart can never
+            disagree about which event is newest. Null exactly when `latest_description_state` is 'none'.
+        latest_description_state:
+          description: Whether the live panel has a real description ('available'), a stand-in because
+            the vision model could not answer ('unavailable'), or nothing at all yet ('none').
+          enum:
+          - none
+          - available
+          - unavailable
+          title: Latest Description State
+          type: string
+        returned:
+          description: How many events this response carries.
+          title: Returned
+          type: integer
+        volatile:
+          const: true
+          default: true
+          description: 'Always true, and present so it cannot be overlooked: this history is held in engine
+            memory only and does not survive a restart. The event store is elsewhere.'
+          title: Volatile
+          type: boolean
+      required:
+      - camera_id
+      - capacity
+      - returned
+      - latest_description_state
+      - latest
+      - events
+      title: CameraEventsResponse
+      type: object
     CameraStatus:
       properties:
         camera_id:
@@ -114,6 +185,80 @@ components:
       - vram_mib
       title: ModelHealth
       type: object
+    RecentEventEntry:
+      description: 'One event as the console sees it. A projection of the published anomaly event,
+
+        not the event itself: `clip_uri` is absent because a clip is attached after the
+
+        event is assembled and this view is written at assembly.'
+      properties:
+        description:
+          description: "The scene description \u2014 unless `description_unavailable` is true, in which\
+            \ case this is a metadata-derived stand-in and not a description of the scene."
+          title: Description
+          type: string
+        description_unavailable:
+          description: True when the vision model could not answer and this event was assembled from cheap
+            signals alone. Never conflate it with the absence of an event.
+          title: Description Unavailable
+          type: boolean
+        event_id:
+          format: uuid
+          title: Event Id
+          type: string
+        labels:
+          items:
+            type: string
+          title: Labels
+          type: array
+        occurred_at:
+          description: "Unix epoch seconds (UTC, fractional). Sort and plot on this \u2014 it is the same\
+            \ field, with the same meaning, as the published event's `occurred_at`."
+          title: Occurred At
+          type: number
+        reason:
+          description: Which of the seven escalation triggers fired.
+          title: Reason
+          type: string
+        severity:
+          description: The band `threat_score` falls in.
+          title: Severity
+          type: string
+        source_timestamp:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: The camera source's own timeline for the same instant. Correlates with a clip's
+            pts; meaningful only within one process run for one camera, so never sort or display on it.
+          title: Source Timestamp
+        suggested_action:
+          title: Suggested Action
+          type: string
+        threat_score:
+          description: The threat value, 0.0 to 1.0.
+          maximum: 1.0
+          minimum: 0.0
+          title: Threat Score
+          type: number
+        track_ids:
+          items:
+            type: integer
+          title: Track Ids
+          type: array
+      required:
+      - event_id
+      - occurred_at
+      - source_timestamp
+      - reason
+      - threat_score
+      - severity
+      - description
+      - suggested_action
+      - description_unavailable
+      - labels
+      - track_ids
+      title: RecentEventEntry
+      type: object
     ValidationError:
       properties:
         ctx:
@@ -180,6 +325,47 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Describe Camera Now
+  /cameras/{camera_id}/events:
+    get:
+      description: "Recent anomaly events for one camera, plus the latest scene description.\n\n**This\
+        \ is a volatile, bounded, in-memory view for the operator console. It is not\nthe event store\
+        \ and it is not an audit trail.** The durable record is the anomaly\nevent published to RabbitMQ\
+        \ and written down by the Phase 1C consumer. What this\nendpoint reads is a per-camera ring inside\
+        \ the running engine that is emptied by\nany restart and that silently discards the oldest entry\
+        \ once the camera has\nproduced more than `capacity` events. The absence of an event here means\
+        \ \"not in\nthe last `capacity` events of this process run\" \u2014 never \"did not happen\".\
+        \ Anyone\nreconciling a custodial incident must go to the store, not here.\n\nThe ring is per\
+        \ camera rather than global on purpose, so that a busy camera can\nonly evict its own history\
+        \ and never a quiet camera's.\n\n`latest` is the last element of `events`, lifted out for the\
+        \ live scene panel and\nread from the same snapshot, so the panel and the chart cannot disagree\
+        \ about\nwhich event is newest. `latest_description_state` distinguishes the three cases a\nconsole\
+        \ must not confuse: `none` (nothing assembled yet in this process),\n`available` (a real vision-model\
+        \ description), and `unavailable` (the vision model\ncould not answer, and `latest.description`\
+        \ is a metadata-derived stand-in rather\nthan a description of the scene).\n\nAn unknown camera\
+        \ is a 404, the same mapping every other camera route uses. A\nconfigured camera that has not\
+        \ escalated yet is a 200 with an empty `events` list."
+      operationId: get_camera_events_cameras__camera_id__events_get
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraEventsResponse'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: "Recent events for one camera (volatile console cache \u2014 NOT the event store)"
   /cameras/{camera_id}/telemetry:
     get:
       operationId: get_camera_telemetry_cameras__camera_id__telemetry_get
