@@ -7,6 +7,7 @@ import type {
   RecorderAlert,
   RecorderAlertsResponse,
   RecorderModelsResponse,
+  RecorderSettingsResponse,
 } from '@/recorder/recorder.types'
 
 /**
@@ -302,4 +303,20 @@ export function makeAlertsResponse(
     note: REAL_ALERTS.note,
     ...overrides,
   }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * GET /api/settings — captured live 2026-08-01
+ * ------------------------------------------------------------------ */
+
+export const REAL_SETTINGS: RecorderSettingsResponse = {
+  note: 'No model is running, so nothing reads the footage. The setting is recorded so the choice is explicit and auditable.',
+  online_warning:
+    'master-prompt.txt lists offsite model APIs under Skip ("send data offsite = compliance problem"). In a custodial setting, sending frames of detained people to a third party is a legal exposure.',
+  settings: {
+    inference_mode: 'local',
+    online_acknowledged: false,
+  },
+  wired: false,
 }

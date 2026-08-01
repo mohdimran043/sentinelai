@@ -1,7 +1,15 @@
 import { http, HttpResponse } from 'msw'
 import { RECORDER_BASE_URL } from '@/recorder/config'
-import { REAL_ALERTS, REAL_MODELS } from '@/recorder/mocks/fixtures'
-import type { RecorderAlertsResponse, RecorderModelsResponse } from '@/recorder/recorder.types'
+import {
+  REAL_ALERTS,
+  REAL_MODELS,
+  REAL_SETTINGS,
+} from '@/recorder/mocks/fixtures'
+import type {
+  RecorderAlertsResponse,
+  RecorderModelsResponse,
+  RecorderSettingsResponse,
+} from '@/recorder/recorder.types'
 
 /**
  * MSW handlers for the recorder API — **tests only**.
@@ -18,6 +26,9 @@ export const recorderAlertsHandler = (body: RecorderAlertsResponse) =>
 export const recorderModelsHandler = (body: RecorderModelsResponse) =>
   http.get(`${RECORDER_BASE_URL}/models`, () => HttpResponse.json(body))
 
+export const recorderSettingsHandler = (body: RecorderSettingsResponse) =>
+  http.get(`${RECORDER_BASE_URL}/settings`, () => HttpResponse.json(body))
+
 /** Make an endpoint fail the way the recorder does: a JSON body with an `error` key. */
 export const recorderErrorHandler = (path: string, status: number, error: string) =>
   http.get(`${RECORDER_BASE_URL}${path}`, () => HttpResponse.json({ error }, { status }))
@@ -30,4 +41,5 @@ export const recorderUnreachableHandler = (path: string) =>
 export const recorderHandlers = [
   recorderAlertsHandler(REAL_ALERTS),
   recorderModelsHandler(REAL_MODELS),
+  recorderSettingsHandler(REAL_SETTINGS),
 ]

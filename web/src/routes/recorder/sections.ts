@@ -42,7 +42,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'configure',
     label: 'Configure',
-    built: false,
+    built: true,
     endpoints: ['GET /api/settings'],
     summary:
       'Whether inference runs on this machine or offsite, whether sending frames offsite has been acknowledged, and the recorder’s warning about what that means in a custodial setting.',
