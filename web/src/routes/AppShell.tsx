@@ -55,6 +55,9 @@ export function AppShell() {
         <NavLink to="/dashboard" className={navLinkClass}>
           Dashboard
         </NavLink>
+        <NavLink to="/site-map" className={navLinkClass}>
+          Site map
+        </NavLink>
 
         <RailGroup>Recorder</RailGroup>
         {RECORDER_SECTIONS.map((section) => (

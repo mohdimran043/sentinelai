@@ -5,6 +5,9 @@ import type { RecentEventEntry } from '@/api/engineClient'
 function makeEvent(overrides: Partial<RecentEventEntry> = {}): RecentEventEntry {
   return {
     event_id: '11111111-1111-4111-8111-111111111111',
+    camera_id: 'avenue_01',
+    sequence: 1,
+    clip_uri: null,
     occurred_at: 0,
     source_timestamp: null,
     reason: 'new_salient_track',

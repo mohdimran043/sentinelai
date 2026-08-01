@@ -3,6 +3,7 @@ import { AppShell } from '@/routes/AppShell'
 import { LoginPage } from '@/routes/LoginPage'
 import { DashboardPage } from '@/routes/DashboardPage'
 import { CameraPage } from '@/routes/CameraPage'
+import { SiteMapPage } from '@/routes/SiteMapPage'
 import { RequireSession } from '@/routes/RequireSession'
 import { SectionNotBuiltPage } from '@/routes/recorder/SectionNotBuiltPage'
 import { AlertsPage } from '@/routes/recorder/AlertsPage'
@@ -35,6 +36,7 @@ export function App() {
           }
         >
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/site-map" element={<SiteMapPage />} />
           <Route path="/cameras/:cameraId" element={<CameraPage />} />
 
           <Route path="/recorder" element={<Navigate to="/recorder/alerts" replace />} />

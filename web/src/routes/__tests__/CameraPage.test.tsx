@@ -41,6 +41,9 @@ const telemetry: CameraStatus = {
 function makeEvent(overrides: Partial<RecentEventEntry> = {}): RecentEventEntry {
   return {
     event_id: '11111111-1111-4111-8111-111111111111',
+    camera_id: 'avenue_01',
+    sequence: 1,
+    clip_uri: null,
     occurred_at: Date.now() / 1000 - 30,
     source_timestamp: 12.5,
     reason: 'new_salient_track',
