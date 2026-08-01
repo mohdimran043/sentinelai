@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/Select'
 import { KvList } from '@/components/ui/Kv'
 import { formatCount, formatNanosDateTime, formatNanosPrecise } from '@/lib/format'
 import { useRecorderAlerts } from '@/recorder/queries'
+import { useRecorderAlertStream, type AlertStreamStatus } from '@/recorder/alertStream'
 import { toneForDeliveryStatus, toneForRecorderEventType } from '@/recorder/tone'
 import {
   ALL,
@@ -33,6 +34,7 @@ const PAGE_SIZE = 50
 
 export function AlertsPage() {
   const alerts = useRecorderAlerts()
+  const streamStatus = useRecorderAlertStream()
   const [query, setQuery] = useState<AlertQuery>(DEFAULT_ALERT_QUERY)
   const [pageIndex, setPageIndex] = useState(0)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -125,7 +127,10 @@ export function AlertsPage() {
           ) : null}
 
           <div className="mt-3.5 flex flex-wrap items-baseline justify-between gap-3">
-            <h2>Feed</h2>
+            <h2 className="flex items-center gap-2">
+              Feed
+              <AlertStreamIndicator status={streamStatus} />
+            </h2>
             <p className="muted readout m-0" data-testid="alert-count">
               {page.total === 0
                 ? `no alerts match · ${formatCount(allAlerts.length)} in the window`
@@ -212,6 +217,20 @@ export function AlertsPage() {
       ) : null}
     </>
   )
+}
+
+/**
+ * Reflects `GET /api/alerts/stream`'s own connection state, not this page's
+ * REST poll — the two are independent. `reconnecting` is deliberately the
+ * SAME tone as `connecting`: both mean "the feed is not live right now",
+ * which is the one fact this pill exists to surface, and the table below it
+ * still shows the last-known window either way, not a blank.
+ */
+function AlertStreamIndicator({ status }: { status: AlertStreamStatus }) {
+  if (status === 'live') {
+    return <Pill tone="nominal">live</Pill>
+  }
+  return <Pill tone="caution">{status === 'connecting' ? 'connecting…' : 'reconnecting…'}</Pill>
 }
 
 function AlertFilters({

@@ -1,8 +1,10 @@
+import { http, HttpResponse } from 'msw'
 import { describe, expect, it } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
 import { server } from '@/test/mswServer'
+import { RECORDER_BASE_URL } from '@/recorder/config'
 import { AlertsPage } from '@/routes/recorder/AlertsPage'
 import {
   recorderAlertsHandler,
@@ -11,6 +13,26 @@ import {
 } from '@/recorder/mocks/handlers'
 import { REAL_ALERTS, makeAlert, makeAlertsResponse } from '@/recorder/mocks/fixtures'
 import type { RecorderAlert } from '@/recorder/recorder.types'
+
+/** A controllable `text/event-stream` body a test can push chunks into on demand. */
+function controllableAlertStream() {
+  let controllerRef!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller
+    },
+  })
+  const encoder = new TextEncoder()
+  return {
+    stream,
+    push(text: string) {
+      controllerRef.enqueue(encoder.encode(text))
+    },
+    close() {
+      controllerRef.close()
+    },
+  }
+}
 
 /** Rows in the feed table, excluding the header row. */
 async function feedRows() {
@@ -289,5 +311,68 @@ describe('AlertsPage', () => {
     expect(
       await screen.findByText(/alert store unavailable/i, undefined, { timeout: 5000 }),
     ).toBeInTheDocument()
+  })
+})
+
+describe('AlertsPage — live alert stream', () => {
+  it('shows a live indicator once the stream connects', async () => {
+    renderWithProviders(<AlertsPage />)
+    await feedRows()
+    expect(await screen.findByText('live')).toBeInTheDocument()
+  })
+
+  it('merges a newly-streamed alert into the feed without duplicating the rows the REST fetch already delivered', async () => {
+    const alertStream = controllableAlertStream()
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/alerts/stream`, () => {
+        return new HttpResponse(alertStream.stream, {
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }),
+    )
+    renderWithProviders(<AlertsPage />)
+
+    const initialRows = await feedRows()
+    expect(initialRows).toHaveLength(REAL_ALERTS.alerts.length)
+
+    // The stream's own backlog re-describes the same alerts the REST fetch
+    // already rendered — this must not double them.
+    alertStream.push(`event: backlog\ndata: ${JSON.stringify(REAL_ALERTS.alerts)}\n\n`)
+    await waitFor(async () => {
+      expect(await feedRows()).toHaveLength(REAL_ALERTS.alerts.length)
+    })
+
+    // A genuinely new alert arrives live.
+    const liveAlert = makeAlert({ cameraId: 'room_4b', eventType: 'LOST', offsetSeconds: 999 })
+    alertStream.push(`data: ${JSON.stringify(liveAlert)}\n\n`)
+
+    await waitFor(async () => {
+      expect(await feedRows()).toHaveLength(REAL_ALERTS.alerts.length + 1)
+    })
+    const rows = await feedRows()
+    expect(cellsOfRows(rows, EVENT_COLUMN)).toContain('LOST')
+  })
+
+  it('does not clear the visible feed when the stream drops — the list stays, only the indicator changes', async () => {
+    const alertStream = controllableAlertStream()
+    server.use(
+      http.get(`${RECORDER_BASE_URL}/alerts/stream`, () => {
+        return new HttpResponse(alertStream.stream, {
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }),
+    )
+    renderWithProviders(<AlertsPage />)
+
+    await feedRows()
+    alertStream.push('event: backlog\ndata: []\n\n')
+    await screen.findByText('live')
+
+    alertStream.close()
+
+    await screen.findByText('reconnecting…')
+    // The rows already on screen are not a live guarantee — they are not a
+    // reason to blank the table while the feed re-establishes itself.
+    expect(await feedRows()).toHaveLength(REAL_ALERTS.alerts.length)
   })
 })
