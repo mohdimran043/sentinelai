@@ -82,7 +82,6 @@ async def test_full_pipeline_produces_a_real_event_with_real_models() -> None:
         scheduler=scheduler,
         clip_writer=None,
         preroll=PreRollBuffer(preroll_seconds=3.0),
-        clock=time.monotonic,
     )
     try:
         await runner.run()

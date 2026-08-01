@@ -63,7 +63,6 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         scheduler=scheduler,
         clip_writer=None,
         preroll=PreRollBuffer(preroll_seconds=3.0),
-        clock=clock,
     )
     service = EngineService(
         cameras={"cam-1": runner},
@@ -300,7 +299,6 @@ async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
         scheduler=scheduler,
         clip_writer=writer,
         preroll=PreRollBuffer(preroll_seconds=3.0),
-        clock=clock,
     )
     service = EngineService(
         cameras={"cam-1": runner},

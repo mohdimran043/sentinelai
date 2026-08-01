@@ -29,6 +29,30 @@ for them; a source that never suspends would otherwise run its entire stream ins
 single event-loop step, starving the consumer and turning every frame but the last into
 a drop.
 
+Time base
+---------
+There is exactly **one** clock per camera pipeline, and it is the source's:
+`FrameData.timestamp` and `EncodedPacket.pts`, which `FrameSource` guarantees are the
+same timeline as each other. `CameraRunner` deliberately takes no `Callable[[], float]`
+of its own. Every time-valued decision here reads the frame or packet that occasioned
+it — the gate's initial `TokenBucket` stamp comes from the first frame, `describe_now()`
+takes its `now` from the last processed scene, and a clip's post-roll deadline is
+compared against `packet.pts` and so must be computed from it.
+
+This is not stylistic. A runner that carried a second clock would compare the two
+without either being wrong on its own: `GateState.initial` would stamp
+`bucket.updated_at` from clock B while `decide()` refills against `scene.timestamp` on
+clock A, and once B reads ahead of A — guaranteed for `FileSource`, whose timeline
+starts at 0.0, against any `time.monotonic` runner clock — `TokenBucket.refilled`'s
+regressing-clock guard makes every refill a no-op. The camera spends its burst tokens
+and is then rate-limited into silence for the lifetime of the process. The same
+divergence stops any clip ever reaching its deadline, and since an already-recording
+clip only ever extends, the camera stops producing evidence too.
+
+The scheduler's clock is a genuinely different thing and stays: `AdmissionGate` spaces
+GPU admissions with `asyncio.sleep`, so it needs real elapsed time. The two agree only
+for a live RTSP source and must not be conflated.
+
 Clip lifecycle
 --------------
 Only the escalation that *opens* a clip ever carries its `ClipHandle` on an
@@ -69,7 +93,6 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
 
@@ -168,7 +191,6 @@ class CameraRunner:
         scheduler: VlmScheduler,
         clip_writer: ClipWriter | None,
         preroll: PreRollBuffer,
-        clock: Callable[[], float],
         detect_every_n_frames: int = 1,
     ) -> None:
         if detect_every_n_frames < 1:
@@ -183,7 +205,6 @@ class CameraRunner:
         self._scheduler = scheduler
         self._clip_writer = clip_writer
         self._preroll = preroll
-        self._clock = clock
         self._detect_every_n_frames = detect_every_n_frames
 
         # `clip_postroll_seconds` has no S11 constructor slot: it is a process-wide
@@ -191,7 +212,11 @@ class CameraRunner:
         # `CameraRunner` construction site.
         self._clip_postroll_seconds = get_settings().clip_postroll_seconds
 
-        self._gate_state = GateState.initial(profile, clock())
+        # Deferred to the first frame, which is the earliest point at which a time on
+        # the only timeline this pipeline has is available. `_on_discontinuity`
+        # already re-initialises it from `frame.timestamp`; this makes construction
+        # agree with it instead of seeding the token bucket from somewhere else.
+        self._gate_state: GateState | None = None
         self._history: deque[str] = deque(maxlen=_HISTORY_MAXLEN)
         self._active_clip: _ActiveClip | None = None
         self._clip_lock = asyncio.Lock()
@@ -234,11 +259,18 @@ class CameraRunner:
             await self._source.close()
 
     async def describe_now(self) -> UUID:
-        """USER_REQUESTED path (spec §6) — uses domain `force()`; returns the event id."""
+        """USER_REQUESTED path (spec §6) — uses domain `force()`; returns the event id.
+
+        `now` is the last processed scene's timestamp, not a separate clock reading:
+        `force()` writes it to `GateState.last_escalation_at`, which the cooldown then
+        compares against `scene.timestamp`, and the clip deadline derived from it is
+        compared against `packet.pts`. Both are the source's timeline. The guard below
+        already guarantees the value exists.
+        """
         scene, keyframe = self._last_scene, self._last_keyframe
-        if scene is None or keyframe is None:
+        if scene is None or keyframe is None or self._gate_state is None:
             raise RuntimeError(f"camera {self._camera_id!r} has not processed a frame yet")
-        now = self._clock()
+        now = scene.timestamp
         outcome = force(EscalationReason.USER_REQUESTED, self._gate_state, now)
         self._gate_state = outcome.state
         return await self._escalate(
@@ -285,6 +317,9 @@ class CameraRunner:
     # -- stages 2-5: detect, track, motion, gate -------------------------------------
 
     async def _process_frame(self, frame: FrameData) -> None:
+        if self._gate_state is None:
+            self._gate_state = GateState.initial(self._profile, frame.timestamp)
+
         detections = await self._detector.detect(frame)
         self._detections_run += 1
 

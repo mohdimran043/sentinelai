@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable, Iterator
+import inspect
+from collections.abc import AsyncIterator, Iterator
 from types import TracebackType
 from uuid import UUID
 
@@ -42,23 +43,24 @@ def patch_postroll(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
     )
 
 
-def frozen_clock(value: float = 0.0) -> Callable[[], float]:
-    """The runner's injected clock. Only `describe_now` and the gate's initial state
-    read it — every other timestamp comes off the frames themselves — so freezing it
-    keeps the tests independent of wall-clock time entirely."""
-    return lambda: value
-
-
-def alternating_source(camera_id: str, count: int, fps: float = 10.0) -> FakeSource:
+def alternating_source(
+    camera_id: str, count: int, fps: float = 10.0, origin: float = 0.0
+) -> FakeSource:
     """Frames whose luma alternates between two values.
 
     Consecutive escalations need distinguishable scenes: identical frames produce
     identical signatures, and the gate's duplicate-scene governor would suppress
     everything after the first escalation.
+
+    `origin` shifts the whole timeline. `RtspSource` stamps `FrameData.timestamp` from
+    `time.monotonic()`, so a real camera's first frame is at ~10**5, never 0.0 — and a
+    source timeline that starts at zero is a property of `FileSource` alone.
     """
     return FakeSource(
         [
-            FakeSource.make_frame(camera_id, index, index / fps, value=0 if index % 2 == 0 else 200)
+            FakeSource.make_frame(
+                camera_id, index, origin + index / fps, value=0 if index % 2 == 0 else 200
+            )
             for index in range(count)
         ]
     )
@@ -236,7 +238,6 @@ def make_runner(
         scheduler=scheduler,
         clip_writer=clip_writer,
         preroll=preroll or PreRollBuffer(preroll_seconds=3.0),
-        clock=frozen_clock(),
         detect_every_n_frames=detect_every_n_frames,
     )
 
@@ -873,3 +874,170 @@ class TestEstimatedClipFps:
         assert [fps for _camera, _event, fps in writer.opened] == [
             pytest.approx(runner_module._DEFAULT_FPS)
         ]
+
+
+class TestOneTimeBasePerCamera:
+    """C2. `CameraRunner` used to carry a second, injected `clock` alongside the
+    source's own timeline, with no documented relationship between them and no test
+    that could see them diverge — every runner in this file was built with
+    `clock=frozen_clock()` against frames that also start at 0.0, so the two were
+    accidentally aligned everywhere.
+
+    Diverged, the token bucket stops refilling forever. `GateState.initial` stamps
+    `bucket.updated_at` from the runner clock; `decide()` refills against
+    `scene.timestamp`. When the runner clock reads ahead of the source — which is
+    guaranteed for `FileSource`, whose timeline starts at 0.0, against any
+    `time.monotonic` runner clock — `elapsed` is negative on every frame and
+    `refilled()`'s regressing-clock guard returns the bucket unchanged. The camera
+    spends its burst tokens and then reports `suppressed_by="rate_budget"` forever.
+
+    Measured over 120 s of identical footage, varying only the clock:
+    13 escalations aligned, 2 with `clock=time.monotonic`.
+    """
+
+    def test_the_runner_takes_no_clock_of_its_own(self) -> None:
+        """The structural half of the fix, and the only guard that keeps it fixed.
+
+        Reconciling the two clocks for RTSP alone is not enough: `FileSource` stamps
+        from the file's own presentation timestamps, and no `Callable[[], float]` can
+        track a pump thread's position in a file. The only fix that covers both is for
+        the runner to have exactly one time base — the source's — which makes the
+        divergence unrepresentable rather than merely discouraged.
+        """
+        parameters = inspect.signature(CameraRunner.__init__).parameters
+        assert "clock" not in parameters, (
+            "a second time base in the runner is C2; every consumer must read "
+            "FrameData.timestamp / EncodedPacket.pts"
+        )
+
+    async def test_the_rate_budget_spends_and_refills_on_the_source_timeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A camera whose frames start at ~10**4 — i.e. every RTSP camera — must still
+        spend its burst and then earn tokens back at the configured rate.
+
+        `bucket_capacity=2` over `bucket_refill_seconds=10.0` is two calls up front and
+        one per ten seconds of *source* time thereafter; over sixteen seconds of footage
+        that is exactly three. This is a characterisation test, not a discriminator: it
+        pins that the budget governor reads the same timeline the gate does, so that a
+        future clock reintroduced anywhere on the decide path has something to fail.
+        The discriminating evidence for the bucket half of C2 could only ever be a
+        probe that varied `CameraRunner.clock`, and that parameter no longer exists.
+        """
+        patch_postroll(monkeypatch, seconds=60.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher, maxsize=16)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=160, fps=10.0, origin=10_000.0),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            profile=CameraProfile(
+                camera_id="cam-1",
+                min_track_frames=1,
+                cooldown_seconds=0.15,
+                bucket_capacity=2,
+                bucket_refill_seconds=10.0,
+            ),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        stamps = [event.occurred_at for event in publisher.events]
+        assert len(stamps) == 3, f"two burst tokens plus one refilled in 16 s, got {stamps}"
+        assert stamps[1] - stamps[0] < 1.0, "the two burst tokens are spent back to back"
+        assert stamps[2] - stamps[1] == pytest.approx(9.9, abs=0.2), (
+            "the third had to wait a full refill interval of source time"
+        )
+
+    async def test_describe_now_is_stamped_on_the_source_timeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`describe_now()` used to take its `now` from the runner clock and feed it to
+        `force()`, which writes it to `GateState.last_escalation_at` — the value the
+        cooldown then compares against `scene.timestamp`. One operator request was
+        therefore enough to put the gate's cooldown on a different clock from the gate's
+        own input, on top of stamping telemetry with a time no frame ever had.
+
+        The correct value is available and already required: the handler refuses to run
+        without `self._last_scene`, whose `timestamp` is by definition the newest point
+        on the source's timeline.
+        """
+        patch_postroll(monkeypatch, seconds=60.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await runner.describe_now()
+            await scheduler.drain()
+
+        assert runner.telemetry().last_escalation_at == pytest.approx(1.4), (
+            "the last frame's own timestamp, not a reading from a second clock"
+        )
+        assert publisher.events[0].occurred_at == pytest.approx(1.4)
+
+    async def test_the_clip_deadline_is_on_the_same_timeline_as_the_packets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_ActiveClip.deadline` is compared against `packet.pts`, so it has to be
+        computed on the packet timeline.
+
+        The gate path always did compute it that way (`_process_frame` passes
+        `now=frame.timestamp`), so the operator-request path is where the mismatch
+        actually lived: `describe_now()` took its `now` from the runner clock and handed
+        that to the same `deadline = now + postroll` arithmetic. Behind the source, as
+        here, the deadline is already in the past and the clip closes on the first live
+        packet instead of recording its post-roll — a stub of an evidence file for the
+        one request an operator explicitly made. Ahead of the source — a `FileSource`
+        replay against `time.monotonic` — the deadline is never reached, the clip is
+        never finished, and because an already-recording clip only ever extends, no
+        later escalation on that camera can record one either.
+
+        `describe_now()` has to be called while the camera is still running, since a
+        post-roll needs live packets after it. `vlm_enabled=False` keeps the gate silent
+        so the clip under test is unambiguously the operator's. The pre-roll is
+        deliberately tiny: the packet loop runs ahead of the frame loop, so a
+        three-second buffer would flush packets past the deadline in at open time and
+        mask the difference.
+        """
+        patch_postroll(monkeypatch, seconds=3.0)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        source = alternating_source("cam-1", count=60, fps=10.0, origin=10_000.0)
+        runner = make_runner(
+            source=source,
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            preroll=PreRollBuffer(preroll_seconds=0.05),
+            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+        )
+
+        async def until_five_frames_are_processed() -> None:
+            while runner.telemetry().detections_run < 5:
+                await asyncio.sleep(0)  # cooperative yield; zero wall-clock time
+
+        async with Worker(scheduler):
+            run_task = asyncio.create_task(runner.run())
+            await asyncio.wait_for(until_five_frames_are_processed(), timeout=5.0)
+            await runner.describe_now()
+            await run_task
+            await scheduler.drain()
+
+        handle = writer.handles[0]
+        assert handle.finished is True, "the post-roll deadline must be reachable"
+        owning = next(event for event in publisher.events if event.clip_uri is not None)
+        last_pts = handle.packets[-1].pts
+        assert last_pts - owning.occurred_at == pytest.approx(3.0, abs=0.11), (
+            "the clip must keep recording for its whole post-roll after the escalation; "
+            f"escalated at {owning.occurred_at}, last packet at {last_pts}"
+        )
