@@ -1,6 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 import { useCameraEvents, useCameraTelemetry, useDescribeCameraNow } from '@/api/queries'
 import type { RecentEventEntry } from '@/api/engineClient'
+import { HlsPlayer } from '@/live/HlsPlayer'
 import { Panel } from '@/components/ui/Panel'
 import { Reading } from '@/components/ui/Reading'
 import { Pill } from '@/components/ui/Pill'
@@ -156,40 +157,54 @@ export function CameraPage() {
         </Notice>
       ) : null}
 
-      <Panel className="mb-4" data-testid="scene-description-panel">
-        <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
-          <h2>Live scene description</h2>
-          <Button
-            variant="act"
-            size="small"
-            onClick={() => describeMutation.mutate()}
-            disabled={describeMutation.isPending}
-          >
-            {describeMutation.isPending ? 'Describing…' : 'Describe now'}
-          </Button>
-        </div>
-        <p className="muted mb-3">{VLM_CAVEAT}</p>
-        {describeMutation.isError ? (
-          <p className="err mt-1 mb-2" data-testid="describe-feedback" role="alert">
-            {describeMutation.error.message}
-          </p>
-        ) : null}
-        {describeMutation.isSuccess ? (
-          <p className="ok-text mt-1 mb-2" data-testid="describe-feedback">
-            Requested — event <code>{describeMutation.data.event_id}</code> queued.
-          </p>
-        ) : null}
+      {/*
+        The centre-with-rails composition: the video canvas is the thing an
+        operator actually clicked through for, so it gets the wide column;
+        the live description sits beside it, close enough to read while
+        watching. Everything below (chart, readings, notifications) is
+        secondary telemetry and spans the full width underneath.
+      */}
+      <div className="mb-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.6fr)_minmax(280px,1fr)]">
+        <Panel data-testid="video-panel">
+          <h2 className="mb-2">Live video</h2>
+          <HlsPlayer cameraId={cameraId} />
+        </Panel>
 
-        {eventsQuery.isPending ? (
-          <p className="muted">Loading…</p>
-        ) : eventsQuery.isError ? (
-          <Notice tone="breach" className="mt-1">
-            Live scene description unreachable: {eventsQuery.error.message}
-          </Notice>
-        ) : (
-          renderPanelState(panelStateFor(eventsQuery.data), cameraId)
-        )}
-      </Panel>
+        <Panel data-testid="scene-description-panel">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
+            <h2>Live scene description</h2>
+            <Button
+              variant="act"
+              size="small"
+              onClick={() => describeMutation.mutate()}
+              disabled={describeMutation.isPending}
+            >
+              {describeMutation.isPending ? 'Describing…' : 'Describe now'}
+            </Button>
+          </div>
+          <p className="muted mb-3">{VLM_CAVEAT}</p>
+          {describeMutation.isError ? (
+            <p className="err mt-1 mb-2" data-testid="describe-feedback" role="alert">
+              {describeMutation.error.message}
+            </p>
+          ) : null}
+          {describeMutation.isSuccess ? (
+            <p className="ok-text mt-1 mb-2" data-testid="describe-feedback">
+              Requested — event <code>{describeMutation.data.event_id}</code> queued.
+            </p>
+          ) : null}
+
+          {eventsQuery.isPending ? (
+            <p className="muted">Loading…</p>
+          ) : eventsQuery.isError ? (
+            <Notice tone="breach" className="mt-1">
+              Live scene description unreachable: {eventsQuery.error.message}
+            </Notice>
+          ) : (
+            renderPanelState(panelStateFor(eventsQuery.data), cameraId)
+          )}
+        </Panel>
+      </div>
 
       <Panel className="mb-4" data-testid="chart-panel">
         <h2>Threat over time</h2>
