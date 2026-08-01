@@ -549,12 +549,16 @@ class VlmScheduler:
         escalation before it was ever described — comes through here, precisely so no
         error path can produce a differently-shaped event, or none at all.
 
-        Which is also why the console's recent-event ring is written here and nowhere
-        else: hanging it off the publish path instead would omit exactly the events an
+        Which is also why the console's recent-event ring is *first* written here:
+        hanging it off the publish path instead would omit exactly the events an
         operator most needs to see in the console — the §9 degraded one, and the one a
         cancelled shutdown dead-lettered rather than published. The ring is bounded,
-        per camera, and volatile; see `orchestrator/event_history.py` for the bound and
-        for why `clip_uri` (attached later, in `_attach_clip`) is not carried in it.
+        per camera, and volatile; see `orchestrator/event_history.py` for the bound.
+
+        The one later write is `_attach_clip`'s back-fill of `clip_uri`, which rewrites
+        this entry rather than appending another. It has to come after: the clip is not
+        finished at assembly, and delaying the record until it is would lose the event
+        whenever the clip does not finish at all — the one thing §9 forbids.
         """
         labels, track_ids = _labels_and_tracks(request.scene)
         event = Event(
