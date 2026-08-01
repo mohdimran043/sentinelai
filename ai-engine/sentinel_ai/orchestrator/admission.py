@@ -39,11 +39,19 @@ class AdmissionGate:
         """
         await self._semaphore.acquire()
         self._in_flight += 1
+        admitted_at = now
         if self._last_acquired_at is not None:
             deficit = self._min_interval_seconds - (now - self._last_acquired_at)
             if deficit > 0:
                 await _sleep(deficit)
-        self._last_acquired_at = now
+                # The origin the *next* caller measures its deficit from must be the
+                # instant this call was actually admitted, not the clock read it took
+                # before paying the deficit off. Recording the stale `now` here makes
+                # the following caller's interval look already-elapsed, so every second
+                # admission slips through unspaced and the gate admits at ~2x its
+                # configured rate.
+                admitted_at = now + deficit
+        self._last_acquired_at = admitted_at
 
     def release(self, now: float) -> None:
         del now  # no release-side interval policy today; kept for symmetry with acquire

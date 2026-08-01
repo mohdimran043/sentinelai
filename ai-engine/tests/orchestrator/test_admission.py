@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from itertools import pairwise
 
 import pytest
 
@@ -89,6 +90,52 @@ async def test_ample_spacing_never_sleeps(monkeypatch: pytest.MonkeyPatch) -> No
     gate.release(now=0.0)
     await gate.acquire(now=5.0)
     assert slept == []
+
+
+class VirtualClock:
+    """A clock that only advances when the gate sleeps.
+
+    The existing interval tests replace `asyncio.sleep` with a recorder and then keep
+    handing the gate a `now` of their own choosing — so the time the gate *believes* it
+    spent waiting never feeds back into the next `now`. That is exactly the blind spot
+    the under-spacing bug hides in, so this clock closes it: every second the gate sleeps
+    off is a second the caller's next clock read observes.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def test_successive_admissions_are_spaced_by_the_full_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate is the only thing bounding *total* GPU load across cameras — Phase 1A's
+    token bucket and cooldown are both per camera — so a gate that admits at twice its
+    configured rate has no backstop behind it.
+
+    Fails against a gate that records the pre-sleep clock read as the admission instant:
+    that origin is stale by exactly the deficit it just slept off, so the next caller
+    measures its own deficit as already elapsed and is admitted immediately. Four
+    sequential acquires at a 2.0s floor then land at [0.0, 2.0, 2.0, 4.0] — gaps of
+    [2.0, 0.0, 2.0], every second admission unspaced.
+    """
+    clock = VirtualClock()
+    monkeypatch.setattr(admission_module, "_sleep", clock.sleep)
+    gate = AdmissionGate(concurrency=1, min_interval_seconds=2.0)
+
+    admitted: list[float] = []
+    for _ in range(4):
+        await gate.acquire(now=clock.now)
+        admitted.append(clock.now)
+        gate.release(now=clock.now)
+
+    gaps = [later - earlier for earlier, later in pairwise(admitted)]
+    assert gaps == pytest.approx([2.0, 2.0, 2.0]), (
+        f"every admission must be spaced by the full interval; got {admitted}"
+    )
 
 
 async def test_the_first_acquire_of_a_gates_life_never_waits(
