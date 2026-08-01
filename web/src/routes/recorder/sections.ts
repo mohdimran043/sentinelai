@@ -35,7 +35,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'alerts',
     label: 'Alerts',
-    built: false,
+    built: true,
     endpoints: ['GET /api/alerts'],
     summary: 'Every alert raised about a camera, and what happened when delivery was attempted.',
   },
