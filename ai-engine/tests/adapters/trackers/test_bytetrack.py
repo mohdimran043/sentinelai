@@ -106,3 +106,24 @@ def test_reset_clears_state_and_a_re_sighted_object_gets_a_fresh_id() -> None:
     assert after[0].track_id != far_before.track_id, "the association must be forgotten"
     assert after[0].track_id == 1, "the id counter must be rewound"
     assert after[0].age_frames == 1, "a re-sighted object is new, not aged"
+
+
+def test_a_non_advancing_timestamp_yields_zero_speed_rather_than_dividing_by_zero() -> None:
+    """A repeated or regressing timestamp must not raise.
+
+    Duplicate timestamps are reachable in practice: a source can emit two packets
+    with the same pts, and an RTSP reconnect can hand the pipeline a timestamp
+    behind the previous one. Without the `elapsed > 0` guard this is a
+    ZeroDivisionError (equal) or a negative speed (regressing) — and a negative
+    speed silently disarms the SpeedAnomaly trigger, which only ever compares
+    upward against a threshold.
+    """
+    tracker = ByteTrackTracker(frame_rate=10)
+    tracker.update((_det("person", 0.0, 0.0, 10.0, 10.0),), timestamp=1.0)
+
+    same_ts = tracker.update((_det("person", 2.0, 0.0, 12.0, 10.0),), timestamp=1.0)
+    assert same_ts[0].speed_px_s == 0.0
+
+    earlier_ts = tracker.update((_det("person", 4.0, 0.0, 14.0, 10.0),), timestamp=0.5)
+    assert earlier_ts[0].speed_px_s == 0.0
+    assert earlier_ts[0].speed_px_s >= 0.0, "a negative speed would disarm SpeedAnomaly"
