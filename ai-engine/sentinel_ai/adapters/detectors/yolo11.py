@@ -129,15 +129,19 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
         self._lock = asyncio.Lock()
         """Serialises `predict()` across every camera sharing this detector.
 
-        An `asyncio.Lock` rather than one detector per camera: `plan_residency()`
-        admits models against `total_mib - reserved_mib`, and a second detector is a
-        second `ModelSpec` in that arithmetic. On the reference RTX 4060 with the
-        shipped budget (8192 total, 2048 reserved -> 6144 usable) the VLM's 4400 MiB
-        plus one 900 MiB detector already sits at 5300; a second camera's detector
-        takes it to 6200 and `plan_residency` raises `InsufficientVram` at startup.
-        That would turn a silent correctness bug into a hard boot failure on exactly
-        the two-camera config `cameras.example.json` ships, and it scales the wrong
-        way — VRAM per camera, on a box that has one GPU. A dedicated single-thread
+        An `asyncio.Lock` rather than one detector per camera. Note what does *not*
+        justify that: a second detector would comfortably fit. `plan_residency()`
+        admits against `total_mib - reserved_mib` = 6144 usable, and the shipped
+        figures are 432 MiB for the detector and 2766 MiB for the VLM (`config.py`) —
+        the values Tasks 11 and 13 actually measured on the RTX 4060, not the 900 and
+        4400 of spec §4.3's design table, which both models came in well under. So
+        2766 + 2*432 = 3630 leaves 2514 MiB free, and `InsufficientVram` would not
+        appear until eight cameras.
+
+        The argument that does carry: there is one GPU, so the kernels serialise
+        whatever we do here. A lock makes that explicit at zero VRAM cost, while
+        per-camera weights buy no parallelism and scale VRAM linearly in cameras on a
+        box with a single card. A dedicated single-thread
         executor was the other candidate; it buys the same mutual exclusion but adds
         an executor to create and tear down across every initialize/shutdown cycle,
         and with this lock held the model is already only ever touched by one thread
