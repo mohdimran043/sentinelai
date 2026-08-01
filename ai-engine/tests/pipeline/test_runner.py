@@ -426,6 +426,121 @@ class TestDiscontinuity:
         assert runner.telemetry().escalations == 2
         assert len(publisher.events) == 2
 
+    async def test_the_scene_on_the_reconnect_frame_itself_is_built_from_reset_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate is reset on a discontinuity and then immediately asked to judge a
+        scene — so that scene must not be the one built from the state just declared
+        invalid.
+
+        Fails against a runner that calls `tracker.update()` and `motion.analyze()`
+        before testing for a discontinuity: the post-reconnect `SceneState` then carries
+        a track matched against a pre-reconnect one (`age_frames == 3`, an id that should
+        have ended) and a motion energy measured as a delta against the pre-reconnect
+        frame (~0.78 here). `min_track_frames` and the speed trigger both read those
+        fields, so a stale scene can fire a spurious escalation.
+        """
+        patch_postroll(monkeypatch, seconds=5.0)
+        frames = [
+            FakeSource.make_frame("cam-1", 0, 0.0, value=0),
+            FakeSource.make_frame("cam-1", 1, 0.1, value=200),
+            FakeSource.make_frame("cam-1", 2, 0.2, value=0),
+            FakeSource.make_frame("cam-1", 0, 0.0, value=200),  # reconnect
+        ]
+        publisher = FakePublisher()
+        vlm = FakeVisionLLM()
+        scheduler = new_scheduler(publisher, vlm)
+        runner = make_runner(
+            source=FakeSource(frames),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=1, cooldown_seconds=0.05),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().discontinuities == 1
+        scene = vlm.requests[-1].scene
+        assert scene.frame_index == 0 and scene.timestamp == pytest.approx(0.0), (
+            "the last escalation must be the reconnect frame's own"
+        )
+        assert scene.motion_energy == pytest.approx(0.0), (
+            "energy against a frame from the old timeline is not motion"
+        )
+        assert [track.age_frames for track in scene.tracks] == [1], (
+            "tracks must not carry ages accumulated before the reconnect"
+        )
+
+    async def test_a_reconnect_aborts_the_open_clip_rather_than_splicing_two_timelines(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clip recording when the stream restarts cannot be salvaged.
+
+        The pre-roll is already cleared on a discontinuity, and the reason given is that
+        old-timeline packets "cannot even be remuxed into the same clip". An open clip is
+        the same problem one step later: keeping it merely re-anchored appends
+        new-timeline packets straight onto old-timeline ones, so the file's pts sequence
+        runs 0.0 .. 0.4 and then restarts at 0.0. It is worse than no clip, because it
+        looks like evidence until someone tries to play it.
+
+        Fails against a runner that re-anchors the open clip's deadline instead of
+        aborting it: handle 0 then reaches its new deadline in the new timeline and is
+        `finish()`ed, so it carries a `clip_uri` and its packets are not pts-ordered.
+        """
+        patch_postroll(monkeypatch, seconds=0.5)
+        frames = [
+            FakeSource.make_frame("cam-1", index, index / 10.0, value=0 if index % 2 == 0 else 200)
+            for index in range(5)
+        ] + [
+            FakeSource.make_frame("cam-1", index, index / 10.0, value=0 if index % 2 == 0 else 200)
+            for index in range(10)  # reconnect: indices and timestamps restart at zero
+        ]
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=FakeSource(frames),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=1, cooldown_seconds=0.2),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().discontinuities == 1
+        assert writer.handles, "the first escalation must have opened a clip"
+        first = writer.handles[0]
+        assert first.aborted is True, "the clip open across the reconnect must be discarded"
+        assert first.finished is False, "a spliced clip must never be finalised"
+        # The packet loop runs concurrently with the frame loop, so by the time the
+        # discontinuity is *detected* this handle has already been fed a new-timeline
+        # packet. That is why aborting is the only option: there is no clean cut point
+        # left to finish at.
+        assert [packet.pts for packet in first.packets] != sorted(
+            packet.pts for packet in first.packets
+        ), "the open clip really was already spliced — the defect is not hypothetical"
+
+        # No *surviving* clip may splice two timelines. Aborted files are discarded, so
+        # only the ones that were finalised are evidence anyone will ever open.
+        for index, handle in enumerate(writer.handles):
+            if not handle.finished:
+                continue
+            pts = [packet.pts for packet in handle.packets]
+            assert pts == sorted(pts), f"finalised clip {index} splices two timelines: {pts}"
+
+        # Spec §9: discarding the file must not discard the event.
+        assert len(publisher.events) == runner.telemetry().escalations
+        assert runner.telemetry().escalations_dropped == 0
+        aborted_uri = f"s3://sentinel-clips/cam-1/{first.event_id}.mp4"
+        assert all(event.clip_uri != aborted_uri for event in publisher.events), (
+            "no event may point at the aborted clip"
+        )
+
     async def test_a_continuous_stream_never_reports_a_discontinuity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

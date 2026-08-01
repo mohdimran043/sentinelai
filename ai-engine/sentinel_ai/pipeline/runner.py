@@ -39,6 +39,10 @@ undefined. The clip-owning request is queued lazily, from the packet loop, the m
 `packet.pts` first reaches the (possibly-extended) deadline; never from the frame loop,
 so escalation submission stays non-blocking and immediate for every *other* request.
 
+A clip only ever ends one of two ways: `finish()` at its deadline, or `abort()` — on
+shutdown, or on a discontinuity, both of which leave it unable to be completed. It is
+never carried across a discontinuity, for the same reason the pre-roll is not.
+
 Deadlock analysis
 -----------------
 Three concurrent flows share one lock (`_clip_lock`) and one mailbox:
@@ -46,9 +50,10 @@ Three concurrent flows share one lock (`_clip_lock`) and one mailbox:
   * `_produce` never blocks on the consumer (`_LatestSlot.put` is synchronous and
     overwrites), so the producer cannot be starved by a slow pipeline, and `close()`
     guarantees the consumer always terminates rather than waiting forever.
-  * `_escalate` (consumer side) and `_packet_loop` both take `_clip_lock` and neither
-    acquires a second lock while holding it, so there is no lock-order cycle. Each
-    holds it only across clip-writer I/O, which depends on neither of the other flows.
+  * `_escalate` and `_on_discontinuity` (both consumer side, never nested) and
+    `_packet_loop` take `_clip_lock`, and none acquires a second lock while holding it,
+    so there is no lock-order cycle. Each holds it only across clip-writer I/O, which
+    depends on neither of the other flows.
   * `VlmScheduler.submit` is synchronous and drops when full, so a stalled VLM can
     never apply back-pressure to the camera.
 
@@ -282,10 +287,28 @@ class CameraRunner:
     async def _process_frame(self, frame: FrameData) -> None:
         detections = await self._detector.detect(frame)
         self._detections_run += 1
+
+        # Before `update()`/`analyze()`, not after. Both of the regression signals are
+        # readable off the frame alone, and everything those two stages derive is
+        # meaningless across the break: track ids matched against pre-reconnect tracks
+        # (with inflated `age_frames`), a motion energy computed as a delta against a
+        # frame from the old timeline. Resetting afterwards reset the gate correctly and
+        # then immediately fed it a `SceneState` built from the state just declared
+        # invalid — and `min_track_frames` and the speed trigger both read those fields,
+        # so the first frame after a reconnect could fire a spurious escalation.
+        discontinuous = self._is_timeline_regression(frame)
+        if discontinuous:
+            await self._on_discontinuity(frame)
+
         tracks = self._tracker.update(detections, frame.timestamp)
         signals = self._motion.analyze(frame)
 
-        if self._is_discontinuous(frame, signals):
+        # The third signal is the only one that needs the analyzer's output, so it can
+        # only be handled here, after the fact: this frame's `signals` are already
+        # computed by the time we learn they are incomparable, and the reset protects
+        # the frames after it. A timeline regression has already reset everything, so
+        # a signature length that also moved is the same discontinuity, not a second one.
+        if not discontinuous and self._is_signature_change(signals):
             await self._on_discontinuity(frame)
 
         self._last_signature_len = len(signals.scene_signature)
@@ -318,28 +341,29 @@ class CameraRunner:
                 now=frame.timestamp,
             )
 
-    def _is_discontinuous(self, frame: FrameData, signals: MotionSignals) -> bool:
-        """Spec §5.2/§6: a stream discontinuity, not a comparable `SceneState`.
+    def _is_timeline_regression(self, frame: FrameData) -> bool:
+        """Spec §5.2/§6: the stream restarted — an RTSP reconnect (Task 14) restarts
+        `frame_index` and timestamps at zero.
 
-        Two observable signals, both of which invalidate everything derived from
-        frame-to-frame history:
-
-          * a `frame_index` or timestamp regression — an RTSP reconnect (Task 14)
-            restarts both at zero;
-          * a scene-signature length change — a mid-stream resolution renegotiation
-            leaves two histograms with different bin counts.
-
-        The domain already returns 0.0/None rather than raising on the second case
-        (Phase 1A review finding B1); resetting the derived state so the next frame
-        starts clean is the caller's job, and this is the caller.
+        Readable off the frame alone, which is what lets it be checked before anything
+        is derived from frame-to-frame history.
         """
         if self._last_frame_index is not None and frame.frame_index < self._last_frame_index:
             return True
-        if (
+        return (
             self._last_processed_timestamp is not None
             and frame.timestamp < self._last_processed_timestamp
-        ):
-            return True
+        )
+
+    def _is_signature_change(self, signals: MotionSignals) -> bool:
+        """Spec §5.2/§6: a mid-stream resolution renegotiation leaves two histograms
+        with different bin counts, so the two `SceneState`s are not comparable.
+
+        Unlike a timeline regression this is only visible in the analyzer's output. The
+        domain already returns 0.0/None rather than raising on it (Phase 1A review
+        finding B1); resetting the derived state so the *next* frame starts clean is the
+        caller's job, and this is the caller.
+        """
         return (
             self._last_signature_len is not None
             and len(signals.scene_signature) != self._last_signature_len
@@ -361,7 +385,19 @@ class CameraRunner:
         self._preroll.clear()
         self._gate_state = GateState.initial(self._profile, frame.timestamp)
         self._last_two_timestamps = None
-        await self._reanchor_open_clip(frame.timestamp)
+        # An already-recording clip is the same problem as the pre-roll, one step later:
+        # left open it goes on appending new-timeline packets directly onto old-timeline
+        # ones, producing a file with a non-monotonic pts sequence after a reconnect and
+        # an unmuxable one after a resolution change. That is worse than no clip at all,
+        # because it looks like evidence until someone tries to play it. Finishing early
+        # is not an option: the packet loop runs concurrently with this one and may
+        # already have appended post-discontinuity packets, so there is no clean cut
+        # point left to finish at. Abort it and let the escalation it belonged to
+        # publish with no clip — spec §9 keeps the event either way.
+        async with self._clip_lock:
+            # `_abandon_open_clip` does not take the lock itself: its other caller is
+            # `run()`'s `finally`, by which point the packet loop is already cancelled.
+            await self._abandon_open_clip()
 
     # -- escalation, clip lifecycle, scheduler submission ----------------------------
 
@@ -438,27 +474,19 @@ class CameraRunner:
                         self._submit(active.request)
             await asyncio.sleep(0)  # cooperative yield; see the module docstring
 
-    async def _reanchor_open_clip(self, now: float) -> None:
-        """Move a recording clip's deadline onto the post-discontinuity timeline.
-
-        After a reconnect restarts pts at zero, a deadline expressed in the old
-        timeline would never be reached and the clip would record until the camera
-        stops.
-        """
-        async with self._clip_lock:
-            if self._active_clip is not None:
-                self._active_clip = replace(
-                    self._active_clip, deadline=now + self._clip_postroll_seconds
-                )
-
     async def _abandon_open_clip(self) -> None:
-        """Shutdown with a clip still recording: discard the partial file, keep the event.
+        """Discard a still-recording clip's partial file, keep its event.
 
-        The post-roll never closed, so the clip is incomplete — `abort()` is
-        contractually infallible, which is why it is safe to await here, possibly while
-        already being cancelled. The escalation is still submitted, with `clip=None`:
-        spec §9 forbids losing an anomaly event to an infrastructure or lifecycle
-        failure, and a camera stopping mid-post-roll is one.
+        Two callers, one rule: the clip cannot be completed, so the file goes and the
+        escalation is submitted anyway with `clip=None`. Shutdown reaches here because
+        the post-roll never closed; a discontinuity reaches here because the recording
+        would otherwise splice two timelines. Spec §9 forbids losing an anomaly event to
+        an infrastructure or lifecycle failure, and both of those are one.
+
+        `abort()` is contractually infallible, which is why it is safe to await here,
+        possibly while already being cancelled. Caller-owned locking: `run()`'s `finally`
+        has already cancelled the packet loop, while `_on_discontinuity` races it and
+        holds `_clip_lock` across the call.
         """
         pending, self._active_clip = self._active_clip, None
         if pending is None:
