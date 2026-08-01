@@ -3,6 +3,9 @@ import type {
   RecorderAlertsResponse,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderMaskRegion,
+  RecorderMaskResponse,
+  RecorderMaskValidation,
   RecorderModelsResponse,
   RecorderNotificationsResponse,
   RecorderSettingsResponse,
@@ -164,4 +167,77 @@ export function startRecorderCamera(cameraId: string): Promise<void> {
 
 export function stopRecorderCamera(cameraId: string): Promise<void> {
   return postCameraAction(cameraId, 'stop')
+}
+
+/** `GET /api/masks/{camera_id}` — the mask editor's whole state for one camera. */
+export function getRecorderMask(cameraId: string): Promise<RecorderMaskResponse> {
+  return request<RecorderMaskResponse>(`/masks/${encodeURIComponent(cameraId)}`)
+}
+
+/**
+ * `GET /api/masks/{camera_id}/calibration-frame` — a real, unmasked frame to
+ * draw against. Not fetched through `request`: like `recorderSnapshotUrl`,
+ * this is consumed directly as an `<img src>`.
+ *
+ * VERIFIED 2026-08-01: this 404s with `{"error": "no such endpoint: GET
+ * ..."}` whenever the owning camera's `GET /api/masks/{camera_id}` reports
+ * `calibration_available: false` — which is every camera on the reference
+ * instance, all of them recording. That 404 IS the refusal already carried in
+ * `calibration_refusal`, not a second failure to explain; callers must gate on
+ * `calibration_available` and never request this URL (nor fall back to
+ * `recorderSnapshotUrl`) when it is false. See `MasksPage.tsx`.
+ */
+export function recorderCalibrationFrameUrl(cameraId: string): string {
+  return `${RECORDER_BASE_URL}/masks/${encodeURIComponent(cameraId)}/calibration-frame`
+}
+
+/**
+ * Shared by `validateRecorderMask` (always a dry run) and `saveRecorderMask`
+ * (persists when valid). Both answer with the identical `RecorderMaskValidation`
+ * shape, but VERIFIED 2026-08-01 they disagree on how a rejection is reported:
+ * `POST .../validate` always answers HTTP 200, valid or not — the body's
+ * `valid` flag is the only signal. `PUT /api/masks/{camera_id}` answers HTTP
+ * 200 when it saves and HTTP 422 when it refuses to (confirmed live: a
+ * rejected `PUT` left the camera's on-disk regions byte-for-byte unchanged).
+ * Both status codes therefore carry the same well-formed body and are handled
+ * identically here; anything else (404 unknown camera, 400 unparsable JSON,
+ * 5xx) is a genuine transport failure and throws exactly as `request` does.
+ */
+async function submitMaskRegions(
+  path: string,
+  method: 'POST' | 'PUT',
+  regions: RecorderMaskRegion[],
+): Promise<RecorderMaskValidation> {
+  let response: Response
+  try {
+    response = await fetch(`${RECORDER_BASE_URL}${path}`, {
+      method,
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ regions }),
+    })
+  } catch (cause) {
+    throw new RecorderUnreachableError(cause)
+  }
+
+  if (response.status === 200 || response.status === 422) {
+    return (await response.json()) as RecorderMaskValidation
+  }
+
+  throw await toHttpError(response)
+}
+
+/** `POST /api/masks/{camera_id}/validate` — checks a candidate region set against the recorder's own polygon rules. Never persists. */
+export function validateRecorderMask(
+  cameraId: string,
+  regions: RecorderMaskRegion[],
+): Promise<RecorderMaskValidation> {
+  return submitMaskRegions(`/masks/${encodeURIComponent(cameraId)}/validate`, 'POST', regions)
+}
+
+/** `PUT /api/masks/{camera_id}` — validates, and persists only if the result is valid. */
+export function saveRecorderMask(
+  cameraId: string,
+  regions: RecorderMaskRegion[],
+): Promise<RecorderMaskValidation> {
+  return submitMaskRegions(`/masks/${encodeURIComponent(cameraId)}`, 'PUT', regions)
 }

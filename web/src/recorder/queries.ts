@@ -8,6 +8,7 @@ import {
 import {
   getRecorderAlerts,
   getRecorderCapabilities,
+  getRecorderMask,
   getRecorderModels,
   getRecorderNotifications,
   getRecorderSettings,
@@ -21,6 +22,7 @@ import type {
   RecorderAlertsResponse,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderMaskResponse,
   RecorderModelsResponse,
   RecorderNotificationsResponse,
   RecorderSettingsResponse,
@@ -117,6 +119,18 @@ export function useRecorderUntrackedStorage(): UseQueryResult<RecorderUntrackedR
   return useQuery({
     queryKey: ['recorder', 'storage', 'untracked'],
     queryFn: getRecorderUntrackedStorage,
+    retry: 1,
+  })
+}
+
+/** The mask editor's state for one camera. Undefined `cameraId` means "no camera picked yet". */
+export function useRecorderMask(
+  cameraId: string | undefined,
+): UseQueryResult<RecorderMaskResponse, Error> {
+  return useQuery({
+    queryKey: ['recorder', 'masks', cameraId],
+    queryFn: () => getRecorderMask(cameraId as string),
+    enabled: cameraId !== undefined,
     retry: 1,
   })
 }

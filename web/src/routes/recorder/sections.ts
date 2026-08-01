@@ -86,6 +86,19 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
     summary:
       'The thirteen capabilities the recorder declares, six available and seven not, each with the recorder’s own statement of what it can and cannot do.',
   },
+  {
+    path: 'masks',
+    label: 'Masks',
+    built: true,
+    endpoints: [
+      'GET /api/masks/{camera_id}',
+      'GET /api/masks/{camera_id}/calibration-frame',
+      'POST /api/masks/{camera_id}/validate',
+      'PUT /api/masks/{camera_id}',
+    ],
+    summary:
+      'Privacy regions that are never observed and never recorded, drawn over the camera’s own calibration frame and checked against the recorder’s own polygon rules before anything is saved. The recorder refuses to serve an unmasked frame for a camera under observation, and this screen honours that refusal rather than drawing over the (already masked) live snapshot instead.',
+  },
 ]
 
 export function findRecorderSection(path: string): RecorderSection | undefined {

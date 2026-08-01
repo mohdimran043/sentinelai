@@ -1,5 +1,6 @@
 import { http, HttpResponse } from 'msw'
 import { RECORDER_BASE_URL } from '@/recorder/config'
+import { maskHandlers } from '@/recorder/mocks/maskHandlers'
 import {
   REAL_ALERTS,
   REAL_CAMERAS,
@@ -123,4 +124,5 @@ export const recorderHandlers = [
   recorderStatusHandler(REAL_STATUS),
   recorderNotificationsHandler(REAL_NOTIFICATIONS),
   recorderSnapshotHandler(),
+  ...maskHandlers,
 ]

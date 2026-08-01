@@ -255,6 +255,99 @@ export interface RecorderModelsResponse {
 }
 
 /* ------------------------------------------------------------------ *
+ * GET /api/masks/{camera_id}
+ * PUT /api/masks/{camera_id}                (save — validates, then persists)
+ * POST /api/masks/{camera_id}/validate       (dry run — never persists)
+ * GET /api/masks/{camera_id}/calibration-frame
+ *
+ * All four verified live 2026-08-01 against `room_4b`, `corridor_1`, `room_2a`
+ * and `dayroom_1`. Every camera on the reference instance is `recording`, so
+ * `calibration_available: true` and a real calibration-frame image were never
+ * observed live; that branch is built from the same documented shape, not a
+ * second live capture — see `MasksPage.tsx` for how it is handled.
+ * ------------------------------------------------------------------ */
+
+/** `[x, y]` in the camera's CONFIGURED frame pixels — see `RecorderMaskResponse.note`. */
+export type MaskPolygonPoint = [number, number]
+
+export interface RecorderMaskRegion {
+  region_id: string
+  polygon: MaskPolygonPoint[]
+}
+
+export interface RecorderMaskInventoryRegion {
+  region_id: string
+  area_px: number
+  area_pct: number
+  /** `[x_min, y_min, x_max, y_max]`. */
+  bbox: [number, number, number, number]
+}
+
+export interface RecorderMaskInventory {
+  path: string
+  regions: RecorderMaskInventoryRegion[]
+  total_px: number
+  total_pct: number
+  frame_px: number
+  /** Whether any two regions cover overlapping pixels. Not itself a fault — a
+   * pixel counted by two regions is still masked exactly once. */
+  may_overlap: boolean
+  note: string
+}
+
+export interface RecorderMaskResponse {
+  camera_id: string
+  /** Observed: "room", "common_area" — same vocabulary as `RecorderCamera.mode`. */
+  mode: string
+  frame_width: number
+  frame_height: number
+  /** Empty string when no mask file is configured — not null. */
+  mask_path: string
+  regions: RecorderMaskRegion[]
+  editable: boolean
+  recording: boolean
+  /**
+   * False on every camera observed live, because every camera on the
+   * reference instance is recording. When false, the recorder will not serve
+   * `GET .../calibration-frame` (404) — this console must never substitute the
+   * live snapshot for it; the snapshot is already masked, so drawing against
+   * it would either mislead the operator about what they are covering or
+   * expose exactly what the mask exists to hide.
+   */
+  calibration_available: boolean
+  /** Present (and only meaningful) when `calibration_available` is false: the
+   * recorder's own words for why, and what to do about it. Render verbatim. */
+  calibration_refusal?: string
+  /** Present only when `regions.length > 0` — verified absent on an empty set. */
+  inventory?: RecorderMaskInventory
+  /** Explains the frame-pixel coordinate space; see `MaskPolygonPoint`. */
+  note: string
+}
+
+/** Per-region outcome from a validate or save call. */
+export interface RecorderMaskRegionResult {
+  region_id: string
+  valid: boolean
+  /** Present when this region failed — the recorder's own polygon rule that
+   * rejected it. Never re-derived or second-guessed client-side. */
+  error?: string
+}
+
+/**
+ * Body of both `POST .../validate` (always dry-run, HTTP 200 either way) and
+ * `PUT /api/masks/{camera_id}` (HTTP 200 and persisted when `valid`, HTTP 422
+ * and left untouched on disk when not — verified live: an invalid `PUT` did
+ * not change the camera's saved regions).
+ */
+export interface RecorderMaskValidation {
+  valid: boolean
+  /** Present when invalid — a top-level summary, usually the first failing region's own error. */
+  error?: string
+  regions: RecorderMaskRegionResult[]
+  /** Present only when `valid` is true. */
+  inventory?: RecorderMaskInventory
+}
+
  * GET /api/capabilities
  * ------------------------------------------------------------------ */
 
