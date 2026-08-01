@@ -1,11 +1,42 @@
 # deploy/compose/mediamtx.yml
 #
-# avenue_01 is a `source: publisher` path (spec §5): mediamtx does not pull this stream on
-# its own — an external client pushes it in over RTSP. The exact ffmpeg command that loops
-# a file into this path is documented in this task's own report; every camera in this slice,
-# real or looped file, arrives at RtspSource (Task 14) through the same rtsp:// URL, which is
-# the entire point of normalising every source through mediamtx.
+# Every camera the engine sees arrives as `rtsp://mediamtx:8554/<path>`, whatever the
+# upstream actually is. That is spec §5's whole point: mediamtx normalises HLS, RTSP and
+# pushed files to one protocol, so `RtspSource` is the engine's single network code path
+# and there is no per-source special-casing to get wrong.
+#
+# `source: publisher` means mediamtx waits to be pushed to. Anything else is pulled by
+# mediamtx itself on demand.
 
 paths:
+
+  # --- looped local footage -------------------------------------------------------
+  # Pushed in by ffmpeg, not pulled. This is the one with real pedestrians in it, so it
+  # is what actually exercises detection, tracking and the escalation gate. The public
+  # streams below prove the ingest path; this proves the pipeline.
+  #
+  #   ffmpeg -re -stream_loop -1 -i datasets/avenue/avenue_01.mp4 \
+  #     -c copy -f rtsp rtsp://localhost:8554/avenue_01
   avenue_01:
     source: publisher
+
+  # --- public streams -------------------------------------------------------------
+  # Spec §5 permits deliberately-public feeds and forbids anything that indexes
+  # unsecured private cameras. These are vendor-published test streams: nobody is being
+  # observed, so there is no consent question at all. They verify HLS ingest, reconnect
+  # and the demux fan-out — they will not produce interesting descriptions, because
+  # there are no people in them. Do not read an empty event list here as a broken gate.
+  #
+  # Verified 2026-08-01 with ffprobe.
+
+  # Unified Streaming's public demo. h264 1280x720 @ 25fps, genuinely live.
+  demo_live:
+    source: https://demo.unified-streaming.com/k8s/live/stable/live.isml/.m3u8
+    sourceOnDemand: yes
+
+  # Apple's long-standing bipbop test stream, served from CloudFront.
+  # h264 416x234 @ 29.97fps — low resolution on purpose, useful for checking the
+  # pipeline does not assume 720p.
+  bipbop:
+    source: https://d2zihajmogu5jn.cloudfront.net/bipbop-advanced/bipbop_16x9_variant.m3u8
+    sourceOnDemand: yes
