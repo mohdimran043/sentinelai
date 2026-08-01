@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
@@ -12,6 +13,8 @@ from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
 from sentinel_ai.pipeline.runner import CameraRunner, CameraTelemetry
 from sentinel_ai.ports.model_runtime import HealthReport
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["EngineService", "UnknownCameraError"]
 
@@ -176,6 +179,17 @@ class EngineService:
         `Task.cancelling()` counts cancellations requested *of this task*, so a rise
         across the await means the cancellation was aimed at us, not delivered by the
         task we were waiting on. Re-raise so the caller learns shutdown was cut short.
+
+        An ordinary exception out of an awaited task is a different thing entirely and
+        must **not** propagate. `CameraRunner.run()` deliberately re-raises a producer
+        failure so a mid-stream decode error is not mistaken for a clean end of stream
+        (`runner.py`; `FileSource` surfaces `_pump_error` the same way, and a
+        `detector.detect()` CUDA fault does it on RTSP). Letting that out of here
+        aborted phases 2-4 of `stop()`: the scheduler worker was never cancelled and
+        leaked, and every *other* camera's `finally` never ran — so its recording clip
+        was never aborted and the in-flight escalation that `finally` exists to submit
+        was never submitted. One camera's decode error losing another camera's evidence
+        is exactly what spec §9 forbids, so it is logged and shutdown carries on.
         """
         live = [task for task in tasks if task is not None]
         for task in live:
@@ -189,6 +203,8 @@ class EngineService:
             except asyncio.CancelledError:
                 if current is not None and current.cancelling() > requested_before:
                     raise
+            except Exception:
+                logger.exception("a task failed during shutdown; continuing to unwind")
 
     def cameras(self) -> tuple[CameraTelemetry, ...]:
         return tuple(runner.telemetry() for runner in self._cameras.values())

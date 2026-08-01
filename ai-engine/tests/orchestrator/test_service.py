@@ -512,6 +512,134 @@ async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description
     )
 
 
+class DecodeErrorSource(EndlessSource):
+    """Endless until a decode error kills the frame stream mid-flight.
+
+    Not hypothetical and not a test-only shape: `FileSource` surfaces `_pump_error`
+    from its demux thread, `CameraRunner.run()` deliberately re-raises it so a decode
+    error is never mistaken for a clean end of stream, and a `detector.detect()` CUDA
+    fault reaches the same place on a live RTSP camera. Nothing in the suite exercised
+    a mid-stream source error before this.
+    """
+
+    def __init__(self, camera_id: str, fail_after: int, fps: float = 10.0) -> None:
+        super().__init__(camera_id, fps)
+        self._fail_after = fail_after
+
+    def __aiter__(self) -> AsyncIterator[FrameData]:
+        async def frames() -> AsyncIterator[FrameData]:
+            index = 0
+            while index < self._fail_after:
+                yield self._frame(index)
+                index += 1
+                await asyncio.sleep(0)
+            raise RuntimeError("decode error: corrupt frame")
+
+        return frames()
+
+
+async def test_one_cameras_decode_error_does_not_abort_the_rest_of_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2 — C3 reopened through a path the progress ledger recorded as unreachable.
+
+    `_cancel` re-raised anything that was not a `CancelledError`, so the first camera
+    task that ended in an exception aborted phases 2-4 of `stop()`. The reviewer's
+    probe, two cameras with one mid-stream decode error:
+
+        PROBE stop() raised: RuntimeError decode error: corrupt frame
+        PROBE scheduler task done?  False    <- worker never cancelled, leaks
+        PROBE cam-b clip aborted:   False    <- its finally never ran
+        PROBE escalations cam-b: 0           <- its in-flight event never submitted
+
+    One camera's decode error costing another camera's evidence is precisely what the
+    C3 ordering exists to prevent, so this asserts all three: shutdown completes, the
+    healthy camera's clip is aborted rather than leaked, and the escalation its
+    `finally` preserved reaches the publisher.
+
+    Fails against the propagating `_cancel` at the very first line — `stop()` raises
+    `RuntimeError: decode error: corrupt frame` out of the test.
+    """
+    from sentinel_ai.config import Settings
+    from sentinel_ai.pipeline import runner as runner_module
+
+    # Long enough that cam-b's clip is still recording when stop() arrives.
+    monkeypatch.setattr(
+        runner_module, "get_settings", lambda: Settings(clip_postroll_seconds=600.0)
+    )
+
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    publisher = FakePublisher()
+    scheduler = VlmScheduler(
+        vlm=FakeVisionLLM(),
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
+        dead_letter=FakeFailedEventSink(),
+        maxsize=8,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+
+    def build_runner(
+        camera_id: str, source: FrameSource, writer: FakeClipWriter | None
+    ) -> CameraRunner:
+        return CameraRunner(
+            camera_id=camera_id,
+            camera_label=camera_id,
+            source=source,
+            detector=FakeDetector(script=[()]),
+            tracker=FakeTracker(),
+            motion=MotionAnalyzer(),
+            profile=CameraProfile(camera_id=camera_id),
+            scheduler=scheduler,
+            clip_writer=writer,
+            preroll=PreRollBuffer(preroll_seconds=3.0),
+        )
+
+    writer_b = ClipOpenSignallingWriter()
+    service = EngineService(
+        # cam-a first: `_cancel` awaits in this order, so the failing camera is the
+        # one that used to abort the loop before cam-b was ever awaited.
+        cameras={
+            "cam-a": build_runner("cam-a", DecodeErrorSource("cam-a", fail_after=4), None),
+            "cam-b": build_runner("cam-b", EndlessSource("cam-b"), writer_b),
+        },
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=clock,
+    )
+
+    await service.start()
+    scheduler_task = service._scheduler_task
+    cam_a_task = service._camera_tasks[0]
+    await asyncio.wait_for(writer_b.clip_open.wait(), timeout=5.0)
+    await asyncio.wait({cam_a_task})
+    assert isinstance(cam_a_task.exception(), RuntimeError), (
+        "test setup: cam-a must have died of its decode error"
+    )
+
+    await service.stop()
+
+    assert scheduler_task is not None and scheduler_task.done(), (
+        "phase 4 must still run: an uncancelled scheduler worker is a leaked task"
+    )
+    handle_b = writer_b.handles[0]
+    assert handle_b.aborted is True, "cam-b's finally must still run and abort its clip"
+    assert handle_b.finished is False
+    assert service.telemetry("cam-b").escalations_dropped == 0
+    assert handle_b.event_id in {event.event_id for event in publisher.events}, (
+        "cam-b's preserved escalation must still be published (spec §9)"
+    )
+
+
 class TestStopUnderExternalCancellation:
     """`stop()` must not silently skip its remaining phases when *it* is cancelled.
 
