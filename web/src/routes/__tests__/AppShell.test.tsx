@@ -42,7 +42,15 @@ describe('AppShell navigation', () => {
 
     const rail = screen.getByRole('navigation', { name: 'Sections' })
     const expectedPending = RECORDER_SECTIONS.filter((section) => !section.built).length
-    expect(within(rail).getAllByText('soon')).toHaveLength(expectedPending)
+    // `getAllByText` throws on zero matches rather than returning `[]`, and the
+    // parity checklist can legitimately reach "every section built" — so the
+    // zero case has to be asserted as an absence, not as a call that can never
+    // return an empty array.
+    if (expectedPending === 0) {
+      expect(within(rail).queryByText('soon')).not.toBeInTheDocument()
+    } else {
+      expect(within(rail).getAllByText('soon')).toHaveLength(expectedPending)
+    }
 
     for (const section of RECORDER_SECTIONS) {
       const link = within(rail).getByRole('link', { name: new RegExp(`^${section.label}`) })

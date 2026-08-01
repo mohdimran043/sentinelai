@@ -288,15 +288,36 @@ export interface RecorderNotificationEventType {
   default_enabled: boolean
 }
 
+/**
+ * The currently-applied routing for one event type. Distinct from
+ * `RecorderNotificationEventType.default_enabled` — that is what ships by
+ * default, this is what is in force now. VERIFIED 2026-08-01: one rule per
+ * event type, 16 total, `channels` always `["dashboard"]` on the live
+ * instance (the only configured channel).
+ */
+export interface RecorderNotificationRule {
+  event_type: string
+  channels: string[]
+  enabled: boolean
+}
+
 export interface RecorderNotificationsResponse {
   channel_config: Record<string, unknown>
   channels: RecorderNotificationChannel[]
   delivery_note: string
   delivery_wired: boolean
   event_types: RecorderNotificationEventType[]
-  /** Shape not yet pinned down — F5 will probe it before rendering. */
-  rules?: unknown[]
-  locked?: string[]
+  /** VERIFIED 2026-08-01: 16 entries, one per event type. */
+  rules: RecorderNotificationRule[]
+  /** The event `type` values that are locked — the same set as `event_types[].locked`, restated. */
+  locked: string[]
+  /**
+   * "Locked event types report loss of observation or loss of protection ...
+   * and cannot be disabled, left without channels, or routed only to a
+   * channel that cannot deliver." The invariant this whole page exists to
+   * make legible.
+   */
+  note: string
 }
 
 /* ------------------------------------------------------------------ *

@@ -5,6 +5,7 @@ import {
   REAL_CAMERAS,
   REAL_CAPABILITIES,
   REAL_MODELS,
+  REAL_NOTIFICATIONS,
   REAL_SETTINGS,
   REAL_STATUS,
   REAL_STORAGE,
@@ -14,6 +15,7 @@ import type {
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
   RecorderModelsResponse,
+  RecorderNotificationsResponse,
   RecorderSettingsResponse,
   RecorderStatusResponse,
   RecorderUntrackedResponse,
@@ -48,6 +50,9 @@ export const recorderCamerasHandler = (body: RecorderCamerasResponse) =>
 
 export const recorderStatusHandler = (body: RecorderStatusResponse) =>
   http.get(`${RECORDER_BASE_URL}/status`, () => HttpResponse.json(body))
+
+export const recorderNotificationsHandler = (body: RecorderNotificationsResponse) =>
+  http.get(`${RECORDER_BASE_URL}/notifications`, () => HttpResponse.json(body))
 
 /**
  * A tiny valid JPEG (a 1x1 black pixel), so `CamerasPage` tests never touch
@@ -116,5 +121,6 @@ export const recorderHandlers = [
   recorderCapabilitiesHandler(REAL_CAPABILITIES),
   recorderCamerasHandler(REAL_CAMERAS),
   recorderStatusHandler(REAL_STATUS),
+  recorderNotificationsHandler(REAL_NOTIFICATIONS),
   recorderSnapshotHandler(),
 ]
