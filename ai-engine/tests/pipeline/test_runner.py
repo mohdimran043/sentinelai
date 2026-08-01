@@ -738,3 +738,116 @@ class TestClipLifecycle:
         )
         with pytest.raises(RuntimeError, match="has not processed a frame"):
             await runner.describe_now()
+
+
+class TestEstimatedClipFps:
+    """The fps a clip is opened with, measured off the source's own frame interval.
+
+    Regression net, added before the fixes to C1-C3 touched this region. Nothing in
+    the suite previously constrained `_estimated_fps` at all: `FakeClipWriter.opened`
+    records `(camera_id, event_id, fps)` and the only assertion on it anywhere was
+    `tests/ports/test_port_contracts.py`'s check that the fake echoes the literal the
+    test itself handed to `open()`. A whole-suite mutation sweep confirmed the gap —
+    eight separate mutations of `_estimated_fps` and its backing state, including
+    replacing the entire body with `return 0.0`, all survived. An fps of 0 is not a
+    harmless wrong number: it is the `rate` the MP4 muxer builds its time base from.
+    """
+
+    async def test_the_clip_opens_at_the_measured_source_frame_rate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """25 fps in, 25.0 out — not the 10.0 default, and not a value derived from
+        the runner's own clock.
+
+        `vlm_enabled=False` keeps the gate silent so the clip under test is the one
+        `describe_now()` opens, by which point two real frame timestamps have been
+        seen and a genuine interval is measurable.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=6, fps=25.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await runner.describe_now()
+            await scheduler.drain()
+
+        assert [fps for _camera, _event, fps in writer.opened] == [pytest.approx(25.0)]
+
+    async def test_two_frames_sharing_a_timestamp_fall_back_to_the_default_fps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A zero interval must yield the default, never a division by zero.
+
+        Two frames stamped identically is not hypothetical: a source whose timestamps
+        are quantised to a coarse clock produces them, and `_is_timeline_regression`
+        deliberately treats equal timestamps as continuous, so nothing upstream
+        filters this out.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=FakeSource(
+                [
+                    FakeSource.make_frame("cam-1", 0, 0.0, value=0),
+                    FakeSource.make_frame("cam-1", 1, 0.0, value=200),
+                ]
+            ),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await runner.describe_now()
+            await scheduler.drain()
+
+        assert [fps for _camera, _event, fps in writer.opened] == [
+            pytest.approx(runner_module._DEFAULT_FPS)
+        ]
+
+    async def test_fps_is_never_measured_across_a_timeline_break(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The last frame before a reconnect and the first frame after it are not an
+        interval — they are two points on two different clocks. Pairing them yields a
+        negative delta, and a clip opened from it must fall back to the default rather
+        than carry a negative frame rate into the muxer.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        frames = [
+            FakeSource.make_frame("cam-1", index, index / 25.0, value=0 if index % 2 == 0 else 200)
+            for index in range(6)
+        ] + [FakeSource.make_frame("cam-1", 0, 0.0, value=200)]  # reconnect
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=FakeSource(frames),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await runner.describe_now()
+            await scheduler.drain()
+
+        assert runner.telemetry().discontinuities == 1
+        assert [fps for _camera, _event, fps in writer.opened] == [
+            pytest.approx(runner_module._DEFAULT_FPS)
+        ]

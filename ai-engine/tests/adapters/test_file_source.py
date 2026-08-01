@@ -4,6 +4,7 @@ import asyncio
 import time
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
@@ -39,6 +40,70 @@ async def test_timestamps_start_at_zero_and_are_spaced_by_the_frame_interval() -
     stamps = [f.timestamp async for f in source]
     assert stamps[0] == 0.0
     assert stamps == pytest.approx([i * 0.1 for i in range(50)], abs=1e-6)
+    await source.close()
+
+
+def _asset_shifted_by(tmp_path: Path, seconds: float) -> str:
+    """Remux the committed fixture onto a non-zero pts origin, packet-for-packet.
+
+    A stream copy, so the bytes are identical and only the timestamps move — which is
+    exactly the difference between the committed fixture and a recording whose
+    container start time is not zero. Written here rather than committed as a second
+    asset because the shift has to be visible in the test that depends on it.
+    """
+    out_path = tmp_path / "shifted.mp4"
+    source = av.open(ASSET)
+    try:
+        in_stream = source.streams.video[0]
+        assert in_stream.time_base is not None
+        offset = round(seconds / float(in_stream.time_base))
+        destination = av.open(str(out_path), mode="w")
+        try:
+            out_stream = destination.add_stream_from_template(in_stream)
+            for packet in source.demux(in_stream):
+                if packet.pts is None:
+                    continue
+                packet.pts += offset
+                if packet.dts is not None:
+                    packet.dts += offset
+                packet.stream = out_stream
+                destination.mux(packet)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    return str(out_path)
+
+
+async def test_timestamps_are_rebased_when_the_file_does_not_start_at_pts_zero(
+    tmp_path: Path,
+) -> None:
+    """`test_timestamps_start_at_zero_...` above cannot prove its own name.
+
+    `synthetic_clip.mp4`'s first packet has `pts == 0`, so `packet.pts - first_pts` is
+    the identity function in every test in this suite: a mutation sweep confirmed that
+    both dropping the `- first_pts` term and flipping it to `+` survive the full
+    353-test run. Rebasing matters because everything downstream — the pre-roll
+    buffer's horizon, `_ActiveClip.deadline`, and the clip writer's own pts origin —
+    treats `FrameData.timestamp` and `EncodedPacket.pts` as one shared timeline that
+    starts where the stream starts.
+
+    Frames and packets are drained together because they share one pump, and both
+    must land on the same rebased timeline, not just one of them.
+    """
+    source = FileSource(_asset_shifted_by(tmp_path, 30.0), camera_id="cam-1", realtime=False)
+
+    async def collect_frames() -> list[float]:
+        return [f.timestamp async for f in source]
+
+    stamps, packets = await asyncio.wait_for(
+        asyncio.gather(collect_frames(), _collect_packets(source)), timeout=5.0
+    )
+
+    assert stamps[0] == 0.0, "a 30s container origin must not become a 30s frame timestamp"
+    assert stamps == pytest.approx([i * 0.1 for i in range(50)], abs=1e-6)
+    assert packets[0].pts == 0.0, "packets share the timeline frames are on"
+    assert [p.pts for p in packets] == pytest.approx([i * 0.1 for i in range(50)], abs=1e-6)
     await source.close()
 
 

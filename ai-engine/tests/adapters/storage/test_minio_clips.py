@@ -8,6 +8,7 @@ excluded from CI.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -167,6 +168,52 @@ class TestRemuxSession:
         out.close()
 
         assert first.pts == 0
+
+    def test_the_clip_is_rebased_when_the_camera_clock_is_far_from_zero(
+        self, tmp_path: Path
+    ) -> None:
+        """The test above cannot actually prove what it claims, and this one can.
+
+        `synthetic_clip.mp4`'s first packet has `pts == 0`, so `au_pts - self._start_pts`
+        is the identity function everywhere in the suite: a mutation sweep confirmed that
+        dropping the `- self._start_pts` term entirely survives the full 353-test run.
+        In production the packets come from `RtspSource`, which stamps `pts` from
+        `time.monotonic()` — of the order of 10**5 seconds on any machine that has been
+        up a day — so that subtraction is the only thing standing between the operator and
+        an MP4 whose first frame is presented ~28 hours in.
+
+        Shifting the whole fixture onto such an origin is what makes the rebasing
+        observable: the first muxed pts must still be 0, and the clip's span must be
+        unchanged, because rebasing moves the origin and nothing else.
+        """
+        origin = 98_765.4  # what time.monotonic() looks like after a day of uptime
+        packets = [
+            replace(packet, pts=packet.pts + origin)
+            for packet in _annexb_packets_from_fixture("cam-1")
+        ]
+        temp_path = tmp_path / "clip.mp4"
+
+        session = _RemuxSession(temp_path, fps=25.0)
+        for packet in packets:
+            session.append(packet)
+        session.finish()
+
+        out = av.open(str(temp_path))
+        out_stream = out.streams.video[0]
+        out_packets = [p for p in out.demux(out_stream) if p.dts is not None]
+        assert out_stream.time_base is not None
+        time_base = out_stream.time_base
+        out.close()
+
+        first_pts, last_pts = out_packets[0].pts, out_packets[-1].pts
+        assert first_pts is not None and last_pts is not None
+        assert first_pts == 0, "the clip must start at its own zero, not the camera's"
+        assert out_packets[0].dts == 0, "dts is rebased alongside pts, or the muxer rejects it"
+        assert len(out_packets) == len(packets)
+        muxed_span = float((last_pts - first_pts) * time_base)
+        assert muxed_span == pytest.approx(packets[-1].pts - packets[0].pts, abs=1e-4), (
+            "rebasing moves the origin; it must not stretch or compress the timeline"
+        )
 
     def test_unsupported_codec_raises_on_the_first_packet(self, tmp_path: Path) -> None:
         """A codec outside `SUPPORTED_CODECS` must raise immediately rather than

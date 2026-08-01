@@ -20,7 +20,7 @@ from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher
-from sentinel_ai.ports.vision_llm import SceneDescription
+from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
 from tests.fakes.models import FakeVisionLLM
 
@@ -76,6 +76,31 @@ class Worker:
             await self._task
 
 
+class HangingVisionLLM(VisionLanguageModel):
+    """A `describe` that never returns — the only shape that reaches the timeout.
+
+    `FakeVisionLLM(error=TimeoutError(...))` looks like a timeout and is not one: it
+    raises synchronously on the first `await`, so it exercises `_describe`'s
+    `except Exception` clause and never `asyncio.timeout` at all. A hung GPU call is
+    the failure `vlm_timeout_seconds` actually exists for, and it does not raise —
+    it simply never completes.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self._never_set = asyncio.Event()
+
+    async def describe(self, request: VisionRequest) -> SceneDescription:
+        self.started.set()
+        try:
+            await self._never_set.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable: the event is never set")  # pragma: no cover
+
+
 def a_request(
     clip: ClipHandle | None = None,
     reason: EscalationReason = EscalationReason.PERIODIC_SUMMARY,
@@ -105,10 +130,11 @@ def a_request(
 
 
 def new_scheduler(
-    vlm: FakeVisionLLM | None = None,
+    vlm: VisionLanguageModel | None = None,
     publisher: EventPublisher | None = None,
     maxsize: int = 4,
     admission: AdmissionGate | None = None,
+    timeout_seconds: float = 5.0,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -122,7 +148,7 @@ def new_scheduler(
         publisher=publisher or FakePublisher(),
         admission=admission or AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         maxsize=maxsize,
-        timeout_seconds=5.0,
+        timeout_seconds=timeout_seconds,
         clock=clock,
     )
 
@@ -224,6 +250,41 @@ class TestNeverLoseAnEvent:
         assert "person" in event.description, "the fallback is built from the scene's labels"
         assert event.reason is EscalationReason.NEW_SALIENT_TRACK
         assert event.threat.value == pytest.approx(0.5)
+
+    async def test_a_hanging_vlm_is_timed_out_and_still_publishes_a_fallback_event(self) -> None:
+        """`vlm_timeout_seconds` is shipped at 30.0 and, before this test, nothing
+        exercised it: a mutation sweep showed that deleting the `asyncio.timeout`
+        wrapper — and independently hardcoding it to 1e9 — both survived the full
+        353-test suite. A hung `describe` at concurrency 1 holds the only admission
+        slot, so without the timeout the camera never escalates again for the lifetime
+        of the process; §9's guarantee that the event survives depends on the wrapper.
+
+        `timeout_seconds=0.0` costs no wall-clock time at all: `asyncio.timeout`
+        schedules the deadline at `loop.time()`, which the loop reaches on its very
+        next pass. The `wait_for` around `drain()` is the failure path only — against
+        a scheduler with no timeout the worker never finishes this request, and this
+        test must fail rather than hang the suite.
+        """
+        vlm = HangingVisionLLM()
+        publisher = FakePublisher()
+        admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+        scheduler = new_scheduler(
+            vlm=vlm, publisher=publisher, admission=admission, timeout_seconds=0.0
+        )
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            try:
+                await asyncio.wait_for(scheduler.drain(), timeout=5.0)
+            except TimeoutError:
+                pytest.fail("the hung describe() was never timed out: vlm_timeout_seconds is dead")
+
+        assert vlm.started.is_set(), "test setup: describe() must actually have been entered"
+        assert vlm.cancelled is True, "the timeout must cancel the call, not merely abandon it"
+        assert len(publisher.events) == 1, "§9: a hung VLM must not cost the event"
+        assert publisher.events[0].description_unavailable is True
+        assert publisher.events[0].threat.value == pytest.approx(0.5)
+        assert admission.in_flight == 0, "a timed-out call must not leak the GPU slot"
 
     async def test_a_clip_that_fails_to_finish_still_publishes_with_no_uri(self) -> None:
         writer = FakeClipWriter(finish_error=OSError("minio unreachable"))
