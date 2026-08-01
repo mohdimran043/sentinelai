@@ -35,6 +35,12 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.7",
     "mypy>=1.13",
+    "httpx>=0.27",
+    # starlette>=1.0's TestClient prefers httpx2 over httpx and emits a
+    # StarletteDeprecationWarning when only httpx is present; under this
+    # suite's `-W error` that warning becomes a collection-time exception, so
+    # httpx2 is a real dependency here, not a nicety.
+    "httpx2>=2.0",
 ]
 
 [build-system]
