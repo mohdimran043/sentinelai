@@ -169,3 +169,34 @@ async def test_a_broker_failure_mid_replay_leaves_remaining_files_for_next_time(
     await publisher.replay_spool()  # must not raise
 
     assert len(list(tmp_path.glob("*.json"))) == 2, "nothing was deleted on a failed replay"
+
+
+async def test_a_wrong_shape_spool_file_is_set_aside_not_left_to_wedge_the_spool(
+    tmp_path: Path,
+) -> None:
+    """Valid JSON of the wrong shape must not strand every event behind it.
+
+    `["abc"]` parses cleanly, then raises ValueError inside validate_payload's
+    dict() conversion. Before the guard widened, that escaped replay_spool AND
+    left the file in place — so it sorted first every time and re-crashed on
+    every subsequent attempt, permanently blocking the healthy events queued
+    behind it. Spec §9 says an event is never lost to an infrastructure
+    failure; a spool that can never drain loses all of them.
+    """
+    publisher = RabbitMQPublisher(
+        url="amqp://unused", exchange="sentinel.events", spool_dir=tmp_path
+    )
+    # Sorts first: an all-zero timestamp prefix puts it ahead of the real event.
+    (tmp_path / "00000000000000000000-00000000-deadbeef.json").write_text(
+        '["abc"]', encoding="utf-8"
+    )
+    await publisher.publish(_event())
+    assert len(list(tmp_path.glob("*.json"))) == 2
+
+    exchange = _FakeExchange()
+    publisher._exchange = exchange  # type: ignore[assignment]
+    await publisher.replay_spool()
+
+    assert len(exchange.published) == 1, "the healthy event was stranded behind the bad file"
+    assert list(tmp_path.glob("*.json")) == [], "spool did not drain"
+    assert len(list(tmp_path.glob("*.json.corrupt"))) == 1, "bad file was not set aside"

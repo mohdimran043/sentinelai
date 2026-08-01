@@ -106,8 +106,26 @@ class RabbitMQPublisher(EventPublisher):
         for path in sorted(self._spool_dir.glob("*.json")):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    # Valid JSON of the wrong shape: `["abc"]` parses fine, then blows up
+                    # inside validate_payload's dict() conversion. Rejecting it here keeps
+                    # the guard about the shape rather than about which exception type a
+                    # downstream call happens to raise.
+                    raise TypeError(f"spool payload must be a JSON object, got {type(payload)}")
                 validate_payload(payload)
-            except (json.JSONDecodeError, ValidationError, KeyError, TypeError, OSError):
+            except (
+                json.JSONDecodeError,
+                ValidationError,
+                KeyError,
+                TypeError,
+                ValueError,
+                OSError,
+            ):
+                # ValueError matters as much as the rest: without it a wrong-shape file
+                # crashed replay AND was left in place, so it stayed first in sort order
+                # and re-crashed on every later attempt — permanently stranding every
+                # healthy event queued behind it. Spec §9 says events are never lost to an
+                # infrastructure failure, and an un-drainable spool loses all of them.
                 logger.warning("skipping corrupt spool file %s", path.name, exc_info=True)
                 path.rename(path.with_suffix(".json.corrupt"))
                 continue
@@ -134,6 +152,18 @@ class RabbitMQPublisher(EventPublisher):
         await self._exchange.publish(message, routing_key=routing_key)
 
     def _spool(self, event_id: UUID, payload: Mapping[str, object]) -> None:
+        """Persist a payload for later replay.
+
+        Ordering caveat: the filename's primary sort key is wall-clock
+        `time.time_ns()`, because it is the only clock that keeps advancing across a
+        process restart — the injected monotonic clock the rest of the system uses
+        restarts at zero. The cost is that an NTP step correction can move the wall
+        clock backwards mid-run, so events spooled after the jump may sort before
+        events spooled before it. No event is lost — every file is still replayed —
+        but replay order can differ from occurrence order across such a jump.
+        `_spool_seq` only breaks ties within an identical nanosecond, so it does not
+        rescue this case.
+        """
         self._spool_seq += 1
         base = f"{time.time_ns():020d}-{self._spool_seq:08d}-{event_id.hex}"
         final_path = self._spool_dir / f"{base}.json"
