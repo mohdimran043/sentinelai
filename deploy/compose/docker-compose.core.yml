@@ -106,6 +106,10 @@ services:
       - "8889:8889" # webrtc
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
+      # The mediamtx image is built FROM scratch and carries no CA bundle, so every
+      # https:// source fails with "x509: certificate signed by unknown authority".
+      # Mounting the host's bundle is what lets mediamtx pull public HLS feeds at all.
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     # No Docker healthcheck: the official image is built FROM scratch (no shell, no
     # curl/wget), so a CMD-SHELL or CMD probe cannot run inside the container. Reachability
     # is instead asserted from outside, over the RTSP port, by this task's own smoke test.

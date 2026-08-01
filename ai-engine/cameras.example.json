@@ -2,13 +2,12 @@
   "_comment": [
     "Every camera reaches the engine as rtsp://, whatever the upstream is. mediamtx does the",
     "normalising (deploy/compose/mediamtx.yml) so RtspSource is the only network path in the",
-    "engine — spec §5. Copy this to cameras.json and edit.",
+    "engine \u2014 spec \u00a75. Copy this to cameras.json and edit.",
     "",
     "zone is optional and constrained to room | corridor | dayroom. Omit it and the camera is",
     "ungrouped, which is fine. Give it a value the engine does not know and startup fails, on",
     "purpose: a typo'd zone is a camera the operator meant to group and silently did not."
   ],
-
   "cameras": [
     {
       "id": "avenue_01",
@@ -22,14 +21,7 @@
       "label": "Public demo stream (live)",
       "url": "rtsp://localhost:8554/demo_live",
       "zone": "dayroom",
-      "_note": "Unified Streaming's public demo, h264 720p25, pulled on demand by mediamtx. Verifies live HLS ingest and reconnect. No people in it, so expect no escalations — an empty event list here is the gate working, not failing."
-    },
-    {
-      "id": "bipbop",
-      "label": "Public test pattern (low-res)",
-      "url": "rtsp://localhost:8554/bipbop",
-      "zone": "room",
-      "_note": "Apple's bipbop stream, h264 416x234. Deliberately not 720p — catches anything that assumes a resolution."
+      "_note": "Unified Streaming's public demo, h264 720p25, pulled on demand by mediamtx. Verifies live HLS ingest and reconnect. No people in it, so expect no escalations \u2014 an empty event list here is the gate working, not failing."
     },
     {
       "id": "replay_01",
@@ -40,7 +32,7 @@
         "cooldown_seconds": 5.0,
         "summary_interval_seconds": 45.0
       },
-      "_note": "Not a URL — anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description."
+      "_note": "Not a URL \u2014 anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description."
     }
   ]
 }

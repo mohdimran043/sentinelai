@@ -34,9 +34,7 @@ paths:
     source: https://demo.unified-streaming.com/k8s/live/stable/live.isml/.m3u8
     sourceOnDemand: yes
 
-  # Apple's long-standing bipbop test stream, served from CloudFront.
-  # h264 416x234 @ 29.97fps — low resolution on purpose, useful for checking the
-  # pipeline does not assume 720p.
-  bipbop:
-    source: https://d2zihajmogu5jn.cloudfront.net/bipbop-advanced/bipbop_16x9_variant.m3u8
-    sourceOnDemand: yes
+  # A second public feed was attempted twice and dropped both times: Apple's bipbop and
+  # Mux's x36xhzz both fail mediamtx's HLS client with
+  # "astits: packet must start with a sync byte". Not worth more time — demo_live proves
+  # the HLS-to-RTSP path, and avenue_01 is what actually exercises the pipeline.
