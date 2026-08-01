@@ -189,6 +189,44 @@ async def test_never_touching_packets_overflows_a_small_packet_queue_without_sta
     await source.close()
 
 
+async def test_close_mid_stream_unblocks_a_consumer_parked_on_the_queue() -> None:
+    """Closing part-way through must end both streams, not strand their consumers.
+
+    Every other test here drains the file to end of stream, where the pump enqueues
+    its own `_QUEUE_END`. A mid-stream `close()` is different: `_put_frame_blocking`
+    refuses to put anything once `_stop` is set, so the pump exits *without* the
+    sentinel and any consumer sitting in `queue.get` waits forever. Those `get()`
+    calls run on the event loop's default executor, so the cost is not a leaked task
+    but a thread the loop joins at close — i.e. an engine shutdown that never
+    completes. Found by running the composition root (`sentinel_ai/main.py`), whose
+    `EngineService.stop()` is the first thing in the codebase to close a `FileSource`
+    part-way through.
+
+    Fails before the fix by timing out on `asyncio.wait_for`.
+    """
+    source = FileSource(ASSET, camera_id="cam-1", realtime=False, packet_queue_maxsize=4)
+    frames = source.__aiter__()
+    packets = source.packets()
+    await anext(frames)
+    await anext(packets)
+
+    async def drain_frames() -> int:
+        return 1 + len([f async for f in frames])
+
+    async def drain_packets() -> int:
+        return 1 + len([p async for p in packets])
+
+    frame_task = asyncio.create_task(drain_frames())
+    packet_task = asyncio.create_task(drain_packets())
+    await source.close()
+
+    seen_frames, seen_packets = await asyncio.wait_for(
+        asyncio.gather(frame_task, packet_task), timeout=5.0
+    )
+    assert 1 <= seen_frames <= 50
+    assert 1 <= seen_packets <= 50
+
+
 async def test_realtime_false_yields_as_fast_as_possible() -> None:
     source = FileSource(ASSET, camera_id="cam-1", realtime=False)
     start = time.monotonic()

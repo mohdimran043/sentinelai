@@ -214,5 +214,17 @@ class FileSource(FrameSource):
 
     async def close(self) -> None:
         self._stop.set()
+        # Wake any consumer parked in `queue.get`. The pump's own end-of-stream
+        # sentinel is not enough on a mid-stream close: `_put_frame_blocking` refuses
+        # to put anything once `_stop` is set, so the pump exits without ever
+        # enqueuing `_QUEUE_END` and `__aiter__`/`packets()` stay blocked on a `get()`
+        # that can never return. Those `get()` calls run on the event loop's *default
+        # executor*, so a blocked one is a thread the loop joins forever when it
+        # closes — an engine shutdown that hangs, not merely a leaked task. Found by
+        # the composition root (`sentinel_ai/main.py`): every camera-run-to-EOS test
+        # drains the stream, and only a real `EngineService.stop()` closes one mid-way.
+        # Non-blocking, drop-oldest, mirroring `RtspSource.close()`.
+        _drop_oldest_put(self._frame_queue, _QUEUE_END)
+        _drop_oldest_put(self._packet_queue, _QUEUE_END)
         if self._thread is not None:
             await asyncio.get_running_loop().run_in_executor(None, self._thread.join)
