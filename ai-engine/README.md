@@ -17,27 +17,65 @@ pip install -e ".[runtime,dev]"      # CPU-only pipeline with fakes
 
 docker compose -f ../deploy/compose/docker-compose.core.yml --profile core up -d   # Postgres, Redis, RabbitMQ, MinIO, mediamtx
 
-uvicorn sentinel_ai.api.app:app --host 0.0.0.0 --port 8000
+cp cameras.example.json cameras.json    # then edit it: see "Camera configuration"
+
+uvicorn sentinel_ai.main:app --host 0.0.0.0 --port 8000
 ```
 
-**The last line above is aspirational, not runnable today.**
-`sentinel_ai/api/app.py` exposes `create_app(service: EngineServiceProtocol)`,
-a factory that takes an already-built `EngineService` — deliberately, "so
-tests never build a real `EngineService`" (its own docstring). No task
-through Phase 1B has added the composition root that would actually build
-one: something that reads a camera list (id, RTSP URL, `CameraProfile`),
-constructs a real `RtspSource` per camera, wires the real `Yolo11Detector` /
-`ByteTrackTracker` / `Qwen25VLDescriber` / `MinioClipWriter` /
-`RabbitMQPublisher` into a `ModelRegistry` + `ResidentSet` +
-`VlmScheduler` + one `CameraRunner` per camera, and hands the result to
-`create_app`. There is no `cameras.yaml`/`.toml` loader anywhere in the
-codebase either. Until that composition root exists, `uvicorn
-sentinel_ai.api.app:app` has no module-level `app` to serve, and starting
-the engine against a live RTSP source is not a one-line command — see
-"What was actually run" below for what this task verified instead.
+That last line is the real entry point. `sentinel_ai/main.py` is the
+composition root: it reads the camera list, builds `Yolo11Detector`,
+`Qwen25VLDescriber`, `ByteTrackTracker`, `MotionAnalyzer`, `MinioClipWriter`,
+`RabbitMQPublisher` and one `RtspSource`/`FileSource` per camera, registers
+both models with a `ModelSpec`, wires `ModelRegistry` + `ResidentSet` +
+`VlmScheduler` + one `CameraRunner` per camera into an `EngineService`, owns
+the reconnect loop that calls `connect()`/`replay_spool()` on the publisher,
+and hands the result to `create_app`. `sentinel_ai/api/app.py` still exposes
+only `create_app(service)`, so tests still never build a real
+`EngineService`.
 
-Configuration is environment variables prefixed `SENTINEL_` (see
-`sentinel_ai/config.py`), or a `.env` file in `ai-engine/`.
+Process-wide configuration is environment variables prefixed `SENTINEL_`
+(see `sentinel_ai/config.py`), or a `.env` file in `ai-engine/`.
+
+## Camera configuration
+
+Cameras live in a JSON file — `SENTINEL_CAMERAS_FILE`, default
+`./cameras.json`, template committed as `cameras.example.json` (the real one
+is gitignored, since it carries site names and URLs with credentials in
+them):
+
+```json
+{
+  "cameras": [
+    {
+      "id": "avenue_01",
+      "label": "Avenue (demo)",
+      "url": "rtsp://localhost:8554/avenue_01",
+      "profile": {"cooldown_seconds": 5.0}
+    }
+  ]
+}
+```
+
+`id` and `url` are required, `label` defaults to `id`, and `profile`
+overrides any `CameraProfile` field — validated against that dataclass's own
+field names, so a typo fails at startup instead of silently doing nothing. A
+`url` with an `rtsp://`/`rtsps://` scheme builds an `RtspSource`; anything
+else is taken as a path to a video file and builds a `FileSource`, so a
+replay over recorded footage is the same code path as a live camera.
+
+A file rather than more `SENTINEL_*` variables because a camera is a nested
+record with a nested profile, and flattening a list of those into environment
+names is a worse interface than one small document that can be diffed,
+reviewed and mounted into a container.
+
+### VRAM specs
+
+`ModelSpec.vram_mib` starts from `SENTINEL_DETECTOR_VRAM_MIB` /
+`SENTINEL_VLM_VRAM_MIB` (defaults: the figures measured on an RTX 4060) and is
+replaced with the measured `capabilities().vram_mib` immediately after
+startup. A configured seed is unavoidable — `plan_residency()` must decide
+whether a model fits *before* it is loaded, and `capabilities().vram_mib` is 0
+until `warmup()` has run.
 
 ## Development vs. Production Mode
 
@@ -120,11 +158,12 @@ GPU box with real core services — not just documented:
    one real `Event` with a non-empty description and a threat score in
    `[0, 1]`. This is what CI deselects (`-m "not gpu and not integration"`).
 2. **Manual, full-stack demo**: mediamtx → `RtspSource` → real models →
-   RabbitMQ → MinIO. This needs the composition root described above, which
-   does not exist yet, so the commands below wire the pieces by hand instead
-   of starting the (not-yet-buildable) FastAPI app. Full details, output,
-   and the two real bugs this run found (and fixed) are in
-   `.superpowers/sdd/task-14-report.md`; the short version:
+   RabbitMQ → MinIO, started with `uvicorn sentinel_ai.main:app`. It used to
+   need a bespoke script because there was no composition root; it no longer
+   does. Full details of the original run, and the two real bugs it found
+   (and fixed), are in `.superpowers/sdd/task-14-report.md`; the run through
+   the composition root is in `.superpowers/sdd/phase1b-important-fix-report.md`.
+   The short version:
 
 ### 1. Fetch the clip once
 
@@ -155,13 +194,19 @@ failure during this task's own run — see the report.
 
 ### 4. Run the pipeline against it
 
-Without a composition root, this is a short Python script rather than
-`uvicorn`, wiring the same adapters `EngineService` would: `RtspSource`
-pointed at `rtsp://localhost:8554/avenue_01`, `Yolo11Detector`,
-`ByteTrackTracker`, `Qwen25VLDescriber`, `MinioClipWriter`,
-`RabbitMQPublisher`, one `CameraRunner`, one `VlmScheduler`. This task's
-report (`.superpowers/sdd/task-14-report.md`) has the exact script used and
-its full output for the run this task actually performed.
+```bash
+cd ai-engine
+cat > cameras.json <<'EOF'
+{"cameras": [{"id": "avenue_01", "label": "Avenue (demo)",
+              "url": "rtsp://localhost:8554/avenue_01"}]}
+EOF
+uvicorn sentinel_ai.main:app --host 127.0.0.1 --port 8000
+```
+
+Then `GET /health`, `GET /cameras`, `GET /cameras/avenue_01/telemetry` and
+`POST /cameras/avenue_01/describe`. Note the `sentinel.events` exchange is a
+topic exchange with no queue bound by default, so to *see* the events you
+need a consumer bound to `anomaly.#` before the engine publishes.
 
 ### Verification checklist — all checked against a real run
 

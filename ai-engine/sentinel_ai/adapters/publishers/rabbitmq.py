@@ -83,6 +83,17 @@ class RabbitMQPublisher(EventPublisher):
         self._channel = channel
         self._exchange = exchange
 
+    @property
+    def connected(self) -> bool:
+        """Whether `connect()` has succeeded and not been closed since.
+
+        Read by the composition root's reconnect loop (`main.BrokerLink`), which is
+        the only production caller of `connect()`/`replay_spool()`: without it the
+        loop would have to call `connect()` on every pass and open a fresh robust
+        connection each time just to find out.
+        """
+        return self._exchange is not None
+
     async def publish(self, event: Event) -> None:
         payload = encode_event(event)  # validates against the committed schema
         routing_key = _routing_key(event.camera_id, event.reason.value)
@@ -141,6 +152,11 @@ class RabbitMQPublisher(EventPublisher):
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()
+        # Cleared so `connected` cannot report a link that has been torn down, and
+        # so a `publish()` after close spools rather than using a dead exchange.
+        self._connection = None
+        self._channel = None
+        self._exchange = None
 
     async def _publish_payload(self, routing_key: str, payload: Mapping[str, object]) -> None:
         assert self._exchange is not None

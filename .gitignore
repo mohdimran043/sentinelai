@@ -25,5 +25,8 @@ clips/
 .DS_Store
 ai-engine/.venv/
 ai-engine/var/
+# The operator's real camera list (URLs, credentials in the URL, site names).
+# `ai-engine/cameras.example.json` is the committed template.
+ai-engine/cameras.json
 __pycache__/
 .pytest_cache/

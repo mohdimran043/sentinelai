@@ -1,0 +1,18 @@
+{
+  "cameras": [
+    {
+      "id": "avenue_01",
+      "label": "Avenue (demo)",
+      "url": "rtsp://localhost:8554/avenue_01"
+    },
+    {
+      "id": "replay_01",
+      "label": "Recorded footage (replay)",
+      "url": "./datasets/avenue/avenue_01.mp4",
+      "profile": {
+        "cooldown_seconds": 5.0,
+        "summary_interval_seconds": 45.0
+      }
+    }
+  ]
+}
