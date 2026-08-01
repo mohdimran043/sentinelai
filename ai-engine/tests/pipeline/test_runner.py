@@ -720,16 +720,40 @@ class TestClipLifecycle:
 
         Fails against the unguarded `_escalate` with the writer's error propagating out
         of `runner.run()`.
+
+        B3 strengthened the tail of this test. `open()` succeeds here and the pre-roll
+        flush's first `append()` is what fails, and the handler used to submit with
+        `clip=None` and return **without** aborting — unlike its sibling in
+        `_packet_loop`, which always has. The reviewer's probe:
+
+            PROBE handles opened : 2
+            PROBE handle[0] finished=False aborted=False
+            PROBE handle[1] finished=False aborted=False
+
+        With `MinioClipHandle` each of those is a live PyAV container plus a temp .mp4,
+        and because `_active_clip` is never set every subsequent escalation opens
+        another one — an unbounded leak on a camera whose remux is failing, which is
+        exactly the state B4's sub-tick fault leaves it in. The `aborted` assertions
+        below fail against that version; everything above them already passed.
         """
         patch_postroll(monkeypatch, seconds=1.0)
         writer = FakeClipWriter(append_error=RuntimeError("mux: Invalid argument"))
         publisher = FakePublisher()
         scheduler = new_scheduler(publisher)
+        preroll = PreRollBuffer(preroll_seconds=3.0)
+        # Seeded so the flush inside `_escalate` genuinely has a packet to append: with
+        # an empty pre-roll `open()` would succeed and nothing would ever fail.
+        preroll.append(
+            EncodedPacket(
+                camera_id="cam-1", data=b"history", pts=-0.1, is_keyframe=True, codec="h264"
+            )
+        )
         runner = make_runner(
             source=alternating_source("cam-1", count=15, fps=10.0),
             detector=FakeDetector(script=[(NEAR,)]),
             scheduler=scheduler,
             clip_writer=writer,
+            preroll=preroll,
             profile=CameraProfile(camera_id="cam-1", min_track_frames=2, cooldown_seconds=0.2),
         )
 
@@ -740,6 +764,13 @@ class TestClipLifecycle:
         assert runner.telemetry().frames_seen == 15
         assert len(publisher.events) >= 1
         assert all(event.clip_uri is None for event in publisher.events)
+
+        assert writer.handles, "test setup: a clip must actually have been opened"
+        assert all(handle.finished is False for handle in writer.handles)
+        assert all(handle.aborted is True for handle in writer.handles), (
+            "a clip opened and then failed mid-seed must be aborted, not leaked: "
+            f"{[(h.finished, h.aborted) for h in writer.handles]}"
+        )
 
     async def test_the_clip_opens_with_the_preroll_already_in_it(
         self, monkeypatch: pytest.MonkeyPatch

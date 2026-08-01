@@ -470,6 +470,7 @@ class CameraRunner:
 
         async with self._clip_lock:
             if self._active_clip is None:
+                handle = None
                 try:
                     handle = await self._clip_writer.open(
                         self._camera_id, event_id, self._estimated_fps()
@@ -488,6 +489,17 @@ class CameraRunner:
                         event_id,
                         exc_info=True,
                     )
+                    # The half-built clip is nobody's to finish. `open()` succeeding and
+                    # a pre-roll `append()` then failing is the ordinary shape of this —
+                    # it is the path B4's sub-tick remux fault takes when it lands during
+                    # the flush — and without this the handle is simply dropped: with
+                    # `MinioClipHandle` that is a live PyAV container plus a temp .mp4,
+                    # and since `_active_clip` is never set, *every* subsequent
+                    # escalation opens another one. Same discipline as the sibling
+                    # failure path in `_packet_loop`, which has always aborted.
+                    if handle is not None:
+                        with contextlib.suppress(Exception):
+                            await handle.abort()
                     self._submit(request_with(None))
                     return event_id
                 self._active_clip = _ActiveClip(
