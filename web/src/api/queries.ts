@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
   describeCameraNow,
+  getCameraEvents,
   getCameraTelemetry,
   getHealth,
   listCameras,
+  type CameraEventsResponse,
   type CameraStatus,
   type CamerasResponse,
   type HealthResponse,
@@ -12,6 +14,13 @@ import {
 const HEALTH_POLL_MS = 5_000
 const CAMERAS_POLL_MS = 5_000
 const TELEMETRY_POLL_MS = 2_000
+/**
+ * `CameraProfile`'s token bucket (capacity 2, refill every 10s) plus its
+ * cooldown caps a camera at roughly one escalation per 10s sustained — polling
+ * this ring faster than that buys nothing but load. 10s keeps the live
+ * description and chart current within one escalation cycle.
+ */
+const EVENTS_POLL_MS = 10_000
 
 /**
  * `retry: 1` (not the default 3) and a short `staleTime: 0`: this dashboard needs
@@ -51,6 +60,24 @@ export function useCameraTelemetry(cameraId: string): UseQueryResult<CameraStatu
   })
 }
 
+/**
+ * The camera's volatile event ring (`GET /cameras/{id}/events`): the recent
+ * events, the `latest` one lifted out for the live scene panel, and
+ * `latest_description_state` (`none` | `available` | `unavailable`) — see
+ * `engineClient.ts`'s doc comment for what this is and, just as importantly,
+ * is not.
+ */
+export function useCameraEvents(cameraId: string): UseQueryResult<CameraEventsResponse, Error> {
+  return useQuery({
+    queryKey: ['engine', 'cameras', cameraId, 'events'],
+    queryFn: () => getCameraEvents(cameraId),
+    retry: 1,
+    refetchInterval: EVENTS_POLL_MS,
+    refetchIntervalInBackground: false,
+    enabled: cameraId.length > 0,
+  })
+}
+
 export function useDescribeCameraNow(cameraId: string) {
   const queryClient = useQueryClient()
   return useMutation({
@@ -58,6 +85,9 @@ export function useDescribeCameraNow(cameraId: string) {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: ['engine', 'cameras', cameraId, 'telemetry'],
+      })
+      void queryClient.invalidateQueries({
+        queryKey: ['engine', 'cameras', cameraId, 'events'],
       })
     },
   })

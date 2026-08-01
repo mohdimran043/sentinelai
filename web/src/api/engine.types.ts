@@ -38,6 +38,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cameras/{camera_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Recent events for one camera (volatile console cache — NOT the event store)
+         * @description Recent anomaly events for one camera, plus the latest scene description.
+         *
+         *     **This is a volatile, bounded, in-memory view for the operator console. It is not
+         *     the event store and it is not an audit trail.** The durable record is the anomaly
+         *     event published to RabbitMQ and written down by the Phase 1C consumer. What this
+         *     endpoint reads is a per-camera ring inside the running engine that is emptied by
+         *     any restart and that silently discards the oldest entry once the camera has
+         *     produced more than `capacity` events. The absence of an event here means "not in
+         *     the last `capacity` events of this process run" — never "did not happen". Anyone
+         *     reconciling a custodial incident must go to the store, not here.
+         *
+         *     The ring is per camera rather than global on purpose, so that a busy camera can
+         *     only evict its own history and never a quiet camera's.
+         *
+         *     `latest` is the last element of `events`, lifted out for the live scene panel and
+         *     read from the same snapshot, so the panel and the chart cannot disagree about
+         *     which event is newest. `latest_description_state` distinguishes the three cases a
+         *     console must not confuse: `none` (nothing assembled yet in this process),
+         *     `available` (a real vision-model description), and `unavailable` (the vision model
+         *     could not answer, and `latest.description` is a metadata-derived stand-in rather
+         *     than a description of the scene).
+         *
+         *     An unknown camera is a 404, the same mapping every other camera route uses. A
+         *     configured camera that has not escalated yet is a 200 with an empty `events` list.
+         */
+        get: operations["get_camera_events_cameras__camera_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cameras/{camera_id}/telemetry": {
         parameters: {
             query?: never;
@@ -76,6 +119,53 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * CameraEventsResponse
+         * @description A **volatile, bounded, in-memory view for the operator console. Not the event
+         *     store, and not an audit trail.**
+         *
+         *     The durable record of what happened is RabbitMQ plus the Phase 1C consumer that
+         *     writes it down. This endpoint reads an in-process ring that (a) is emptied by any
+         *     restart of the engine, and (b) silently discards a camera's oldest entry once that
+         *     camera has produced more than `capacity` events. An absent event here therefore
+         *     means "not in the last `capacity` events of this process run" and never "did not
+         *     happen". Do not reconcile against it, do not report from it, and do not use it to
+         *     establish that nothing occurred.
+         */
+        CameraEventsResponse: {
+            /** Camera Id */
+            camera_id: string;
+            /**
+             * Capacity
+             * @description The per-camera ring bound. Once `returned` reaches it, every new event silently evicts the oldest — published here so a console can say how much history it is not showing.
+             */
+            capacity: number;
+            /**
+             * Events
+             * @description Retained events, oldest first — plot them in this order.
+             */
+            events: components["schemas"]["RecentEventEntry"][];
+            /** @description The most recent event, i.e. the last element of `events`, lifted out for the live scene panel. Read from the same snapshot as `events`, so the panel and the chart can never disagree about which event is newest. Null exactly when `latest_description_state` is 'none'. */
+            latest: components["schemas"]["RecentEventEntry"] | null;
+            /**
+             * Latest Description State
+             * @description Whether the live panel has a real description ('available'), a stand-in because the vision model could not answer ('unavailable'), or nothing at all yet ('none').
+             * @enum {string}
+             */
+            latest_description_state: "none" | "available" | "unavailable";
+            /**
+             * Returned
+             * @description How many events this response carries.
+             */
+            returned: number;
+            /**
+             * Volatile
+             * @description Always true, and present so it cannot be overlooked: this history is held in engine memory only and does not survive a restart. The event store is elsewhere.
+             * @default true
+             * @constant
+             */
+            volatile: true;
+        };
         /** CameraStatus */
         CameraStatus: {
             /** Camera Id */
@@ -132,6 +222,60 @@ export interface components {
             state: string;
             /** Vram Mib */
             vram_mib: number;
+        };
+        /**
+         * RecentEventEntry
+         * @description One event as the console sees it. A projection of the published anomaly event,
+         *     not the event itself: `clip_uri` is absent because a clip is attached after the
+         *     event is assembled and this view is written at assembly.
+         */
+        RecentEventEntry: {
+            /**
+             * Description
+             * @description The scene description — unless `description_unavailable` is true, in which case this is a metadata-derived stand-in and not a description of the scene.
+             */
+            description: string;
+            /**
+             * Description Unavailable
+             * @description True when the vision model could not answer and this event was assembled from cheap signals alone. Never conflate it with the absence of an event.
+             */
+            description_unavailable: boolean;
+            /**
+             * Event Id
+             * Format: uuid
+             */
+            event_id: string;
+            /** Labels */
+            labels: string[];
+            /**
+             * Occurred At
+             * @description Unix epoch seconds (UTC, fractional). Sort and plot on this — it is the same field, with the same meaning, as the published event's `occurred_at`.
+             */
+            occurred_at: number;
+            /**
+             * Reason
+             * @description Which of the seven escalation triggers fired.
+             */
+            reason: string;
+            /**
+             * Severity
+             * @description The band `threat_score` falls in.
+             */
+            severity: string;
+            /**
+             * Source Timestamp
+             * @description The camera source's own timeline for the same instant. Correlates with a clip's pts; meaningful only within one process run for one camera, so never sort or display on it.
+             */
+            source_timestamp: number | null;
+            /** Suggested Action */
+            suggested_action: string;
+            /**
+             * Threat Score
+             * @description The threat value, 0.0 to 1.0.
+             */
+            threat_score: number;
+            /** Track Ids */
+            track_ids: number[];
         };
         /** ValidationError */
         ValidationError: {
@@ -193,6 +337,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DescribeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_camera_events_cameras__camera_id__events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                camera_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CameraEventsResponse"];
                 };
             };
             /** @description Validation Error */

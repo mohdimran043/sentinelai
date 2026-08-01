@@ -1,51 +1,69 @@
 import { describe, expect, it } from 'vitest'
 import { buildThreatRibbon } from '@/lib/ribbon'
-import type { SentinelAIAnomalyEvent } from '@/events/anomalyEvent.types'
+import type { RecentEventEntry } from '@/api/engineClient'
 
-function makeEvent(overrides: Partial<SentinelAIAnomalyEvent>): SentinelAIAnomalyEvent {
+function makeEvent(overrides: Partial<RecentEventEntry> = {}): RecentEventEntry {
   return {
-    schema_version: 1,
     event_id: '11111111-1111-4111-8111-111111111111',
-    camera_id: 'avenue_01',
     occurred_at: 0,
+    source_timestamp: null,
     reason: 'new_salient_track',
     threat_score: 0.1,
     severity: 'info',
     description: 'test',
     suggested_action: 'none',
+    description_unavailable: false,
     labels: [],
     track_ids: [],
-    keyframe_uri: null,
-    clip_uri: null,
-    description_unavailable: false,
-    metadata: {},
     ...overrides,
   }
 }
 
 describe('buildThreatRibbon', () => {
-  it('produces bucketCount cells even with no events, all nominal (observed, nothing happened)', () => {
-    const cells = buildThreatRibbon([], { bucketCount: 10, spanSeconds: 100, now: 100_000 })
-    expect(cells).toHaveLength(10)
-    expect(cells.every((cell) => cell.tone === 'nominal')).toBe(true)
+  it('produces no cells for an empty ring rather than fabricating placeholder buckets', () => {
+    expect(buildThreatRibbon([])).toEqual([])
   })
 
-  it('escalates the bucket tone to the worst severity observed in it', () => {
-    const now = 100_000
-    const nowSeconds = now / 1000
+  it('produces exactly one cell per event, not a fixed bucket count', () => {
     const events = [
-      makeEvent({ occurred_at: nowSeconds - 5, severity: 'critical', event_id: 'a' }),
+      makeEvent({ event_id: 'a', severity: 'info' }),
+      makeEvent({ event_id: 'b', severity: 'medium' }),
+      makeEvent({ event_id: 'c', severity: 'critical' }),
     ]
-    const cells = buildThreatRibbon(events, { bucketCount: 10, spanSeconds: 100, now })
-    const breachCells = cells.filter((cell) => cell.tone === 'breach')
-    expect(breachCells).toHaveLength(1)
+    expect(buildThreatRibbon(events)).toHaveLength(3)
   })
 
-  it('ignores events outside the requested span', () => {
-    const now = 100_000
-    const nowSeconds = now / 1000
-    const events = [makeEvent({ occurred_at: nowSeconds - 10_000, severity: 'critical' })]
-    const cells = buildThreatRibbon(events, { bucketCount: 10, spanSeconds: 100, now })
-    expect(cells.every((cell) => cell.tone === 'nominal')).toBe(true)
+  it('preserves the ring order (oldest first) rather than sorting or reversing', () => {
+    const events = [
+      makeEvent({ event_id: 'a', occurred_at: 10, severity: 'info' }),
+      makeEvent({ event_id: 'b', occurred_at: 20, severity: 'critical' }),
+      makeEvent({ event_id: 'c', occurred_at: 30, severity: 'medium' }),
+    ]
+    const cells = buildThreatRibbon(events)
+    expect(cells.map((cell) => cell.tone)).toEqual(['nominal', 'breach', 'caution'])
+  })
+
+  it('colours info/low nominal (green), medium caution (amber), and high/critical breach (red)', () => {
+    const severities: [RecentEventEntry['severity'], string][] = [
+      ['info', 'nominal'],
+      ['low', 'nominal'],
+      ['medium', 'caution'],
+      ['high', 'breach'],
+      ['critical', 'breach'],
+    ]
+    for (const [severity, expectedTone] of severities) {
+      const cells = buildThreatRibbon([makeEvent({ severity })])
+      expect(cells[0]!.tone).toBe(expectedTone)
+    }
+  })
+
+  it('flags a description-unavailable event in its own tooltip description', () => {
+    const cells = buildThreatRibbon([makeEvent({ description_unavailable: true })])
+    expect(cells[0]!.description).toMatch(/description unavailable/i)
+  })
+
+  it('does not flag an ordinary event as description-unavailable', () => {
+    const cells = buildThreatRibbon([makeEvent({ description_unavailable: false })])
+    expect(cells[0]!.description).not.toMatch(/description unavailable/i)
   })
 })

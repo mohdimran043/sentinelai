@@ -5,6 +5,9 @@ export type HealthResponse = components['schemas']['HealthResponse']
 export type CamerasResponse = components['schemas']['CamerasResponse']
 export type CameraStatus = components['schemas']['CameraStatus']
 export type DescribeResponse = components['schemas']['DescribeResponse']
+export type CameraEventsResponse = components['schemas']['CameraEventsResponse']
+export type RecentEventEntry = components['schemas']['RecentEventEntry']
+export type LatestDescriptionState = CameraEventsResponse['latest_description_state']
 
 /** The engine did not answer at all — network failure, DNS, connection refused. */
 export class EngineUnreachableError extends Error {
@@ -68,4 +71,15 @@ export function describeCameraNow(cameraId: string): Promise<DescribeResponse> {
   return request<DescribeResponse>(`/cameras/${encodeURIComponent(cameraId)}/describe`, {
     method: 'POST',
   })
+}
+
+/**
+ * A volatile, bounded, in-memory ring of this camera's recent events (capped at
+ * `capacity`, currently 200 — see `CameraEventsResponse`'s own description). Not
+ * the event store: an absent event here means "not in the last `capacity` events
+ * of this process run", never "did not happen". `latest` is `events.at(-1)` read
+ * from the same snapshot, so the live panel and the chart cannot disagree.
+ */
+export function getCameraEvents(cameraId: string): Promise<CameraEventsResponse> {
+  return request<CameraEventsResponse>(`/cameras/${encodeURIComponent(cameraId)}/events`)
 }

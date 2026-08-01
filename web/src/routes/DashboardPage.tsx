@@ -147,8 +147,9 @@ export function DashboardPage() {
     <div>
       <h1>Dashboard</h1>
       <p className="lede">
-        Live from the AI engine (health, cameras, telemetry). The event feed and daily
-        counters below are mocked — see the note under &quot;Awaiting Phase 1C&quot;.
+        Live from the AI engine (health, cameras, telemetry). Open a camera for its live scene
+        description, threat chart and notifications. Daily counters below are not built yet —
+        see &quot;Awaiting Phase 1C&quot;.
       </p>
 
       {engineUnreachable ? (

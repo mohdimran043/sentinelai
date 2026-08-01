@@ -15,27 +15,16 @@ const queryClient = new QueryClient({
   },
 })
 
-/**
- * The event feed and history are mocked for the whole of this slice (Go is
- * Phase 1C — see events/eventClient.ts), so the MSW worker starts unconditionally
- * rather than only in dev. If `VITE_EVENTS_API_URL` is set, a real service is
- * assumed to be there instead and the worker is skipped.
- */
-async function enableMocking(): Promise<void> {
-  if (import.meta.env.VITE_EVENTS_API_URL) return
-  const { worker } = await import('@/events/mocks/browser')
-  await worker.start({
-    onUnhandledRequest: 'bypass',
-    quiet: true,
-  })
-}
-
-void enableMocking().then(() => {
-  createRoot(document.getElementById('root')!).render(
-    <StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <App />
-      </QueryClientProvider>
-    </StrictMode>,
-  )
-})
+// Anomaly events now come from the AI engine's own `/cameras/{id}/events`
+// route (see `api/engineClient.ts`'s `getCameraEvents`) via the same
+// `/engine` dev proxy every other engine call uses, so no MSW browser worker
+// is needed here — the mocked stand-in for a not-yet-built Go events service
+// this bootstrap used to start has been retired along with that service's
+// need to exist.
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
+  </StrictMode>,
+)

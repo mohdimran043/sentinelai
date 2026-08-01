@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router-dom'
-import { useCameraTelemetry, useDescribeCameraNow } from '@/api/queries'
-import { useEventFeed, useEventHistory } from '@/events/queries'
+import { useCameraEvents, useCameraTelemetry, useDescribeCameraNow } from '@/api/queries'
+import type { RecentEventEntry } from '@/api/engineClient'
 import { Panel } from '@/components/ui/Panel'
 import { Reading } from '@/components/ui/Reading'
 import { Pill } from '@/components/ui/Pill'
@@ -9,11 +9,86 @@ import { Absent } from '@/components/ui/Absent'
 import { Button } from '@/components/ui/Button'
 import { Ribbon } from '@/components/ui/Ribbon'
 import { buildThreatRibbon } from '@/lib/ribbon'
+import { panelStateFor, type PanelState } from '@/lib/descriptionPanel'
 import { cameraLiveness, toneForLiveness, toneForSeverity } from '@/lib/severity'
-import { formatAgo, formatClockTime, formatCount, formatThreatScore, humanizeEnum } from '@/lib/format'
-import type { SentinelAIAnomalyEvent } from '@/events/anomalyEvent.types'
+import {
+  formatAgo,
+  formatClockTime,
+  formatCount,
+  formatThreatScore,
+  humanizeEnum,
+} from '@/lib/format'
 
-function EventRow({ event }: { event: SentinelAIAnomalyEvent }) {
+/**
+ * What the vision-language model's read of a scene actually is, spelled out
+ * where an operator looking at the live panel will see it — not buried in a
+ * tooltip. It is a judgement about one sampled keyframe taken when an
+ * escalation fires, not continuous detection, and it has no pose or action
+ * model behind it (YOLO reports that a `person` box exists, never what that
+ * person is doing). Measured on real hardware ahead of this slice: grappling
+ * moved 0.3 -> 0.9 and a person lying motionless moved 0.2 -> 0.6, but a
+ * stretcher carry was missed entirely. Read it as a hint worth a look, never
+ * as a verdict.
+ */
+const VLM_CAVEAT =
+  'A vision-language model’s read of one still frame, taken when an escalation fires — ' +
+  'sampled judgement, not continuous detection, and not backed by any pose or action model. ' +
+  'A stretcher carry was missed entirely in testing. Treat this as a hint worth a look, never as a verdict.'
+
+function DescriptionEvent({
+  event,
+  degraded,
+}: {
+  event: RecentEventEntry
+  degraded: boolean
+}) {
+  const severityTone = toneForSeverity(event.severity)
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <Pill tone={severityTone}>{event.severity}</Pill>
+        <span className="readout text-[12px] text-dim">
+          {formatClockTime(event.occurred_at)} · {formatAgo(event.occurred_at)}
+        </span>
+      </div>
+      {degraded ? (
+        <Notice tone="caution" className="mb-2">
+          The vision model could not answer for this escalation. What follows is derived from
+          event metadata, not a description of the scene.
+        </Notice>
+      ) : null}
+      <p className="m-0 text-[13px] text-fg">{event.description}</p>
+      <p className="muted mt-2">
+        Threat {formatThreatScore(event.threat_score)} · Suggested: {event.suggested_action}
+        {event.labels.length > 0 ? ` · ${event.labels.join(', ')}` : ''}
+      </p>
+    </div>
+  )
+}
+
+/**
+ * The exhaustive switch `PanelState`'s own doc comment refers to. Adding the
+ * fourth state described there is: one more member on `PanelState`, one more
+ * `case` here.
+ */
+function renderPanelState(state: PanelState, cameraId: string) {
+  switch (state.kind) {
+    case 'none':
+      return (
+        <Absent title="No description yet">
+          Nothing has escalated on <code>{cameraId}</code> in this process yet — this is an
+          invitation, not an error. The panel fills in the moment the camera's first escalation
+          is described.
+        </Absent>
+      )
+    case 'available':
+      return <DescriptionEvent event={state.event} degraded={false} />
+    case 'unavailable':
+      return <DescriptionEvent event={state.event} degraded={true} />
+  }
+}
+
+function NotificationRow({ event }: { event: RecentEventEntry }) {
   const tone = toneForSeverity(event.severity)
   return (
     <li className="border-b border-line py-3 last:border-b-0">
@@ -26,7 +101,8 @@ function EventRow({ event }: { event: SentinelAIAnomalyEvent }) {
       </div>
       {event.description_unavailable ? (
         <p className="muted italic">
-          Description unavailable — the vision model timed out or refused this scene.
+          Description unavailable — the vision model could not answer; this line is a
+          metadata-derived stand-in, not a description of the scene.
         </p>
       ) : (
         <p className="m-0 text-[13px] text-fg">{event.description}</p>
@@ -35,6 +111,13 @@ function EventRow({ event }: { event: SentinelAIAnomalyEvent }) {
         Suggested: {event.suggested_action} · threat {formatThreatScore(event.threat_score)}
         {event.labels.length > 0 ? ` · ${event.labels.join(', ')}` : ''}
       </p>
+      {/* RecentEventEntry never carries clip_uri: `event_history.py`'s module
+          docstring explains why — the durable event's clip is attached after
+          this console projection is written, and a permanently-null field
+          would be worse than omitting it entirely. This volatile ring cannot
+          link to clips; the durable event store (Phase 1C) can. If a future
+          endpoint attaches one here, this is the one place to add
+          `<a href={clipHref}>Clip</a>`. */}
     </li>
   )
 }
@@ -42,8 +125,7 @@ function EventRow({ event }: { event: SentinelAIAnomalyEvent }) {
 export function CameraPage() {
   const { cameraId = '' } = useParams<{ cameraId: string }>()
   const telemetryQuery = useCameraTelemetry(cameraId)
-  const feedQuery = useEventFeed(cameraId)
-  const historyQuery = useEventHistory(cameraId)
+  const eventsQuery = useCameraEvents(cameraId)
   const describeMutation = useDescribeCameraNow(cameraId)
 
   const liveness =
@@ -64,8 +146,8 @@ export function CameraPage() {
         </Pill>
       </div>
       <p className="lede">
-        Telemetry is live from the AI engine. The event feed and history below are
-        mocked (MSW) — the real feed arrives via RabbitMQ → Go → Postgres in Phase 1C.
+        Telemetry, the scene description, the chart and notifications below are all live from
+        the AI engine.
       </p>
 
       {telemetryQuery.isError ? (
@@ -74,9 +156,9 @@ export function CameraPage() {
         </Notice>
       ) : null}
 
-      <Panel className="mb-4">
+      <Panel className="mb-4" data-testid="scene-description-panel">
         <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
-          <h2>Threat over time</h2>
+          <h2>Live scene description</h2>
           <Button
             variant="act"
             size="small"
@@ -86,30 +168,57 @@ export function CameraPage() {
             {describeMutation.isPending ? 'Describing…' : 'Describe now'}
           </Button>
         </div>
+        <p className="muted mb-3">{VLM_CAVEAT}</p>
         {describeMutation.isError ? (
-          <p className="err mt-1" data-testid="describe-feedback" role="alert">
+          <p className="err mt-1 mb-2" data-testid="describe-feedback" role="alert">
             {describeMutation.error.message}
           </p>
         ) : null}
         {describeMutation.isSuccess ? (
-          <p className="ok-text mt-1" data-testid="describe-feedback">
+          <p className="ok-text mt-1 mb-2" data-testid="describe-feedback">
             Requested — event <code>{describeMutation.data.event_id}</code> queued.
           </p>
         ) : null}
 
-        {historyQuery.isPending ? (
-          <p className="muted mt-3">Loading history…</p>
-        ) : historyQuery.isError ? (
-          <Absent title="History unavailable" className="mt-3">
-            The mocked event service did not respond.
+        {eventsQuery.isPending ? (
+          <p className="muted">Loading…</p>
+        ) : eventsQuery.isError ? (
+          <Notice tone="breach" className="mt-1">
+            Live scene description unreachable: {eventsQuery.error.message}
+          </Notice>
+        ) : (
+          renderPanelState(panelStateFor(eventsQuery.data), cameraId)
+        )}
+      </Panel>
+
+      <Panel className="mb-4" data-testid="chart-panel">
+        <h2>Threat over time</h2>
+        {eventsQuery.isPending ? (
+          <p className="muted mt-3">Loading…</p>
+        ) : eventsQuery.isError ? (
+          <Absent title="Chart unavailable" className="mt-3">
+            The AI engine did not answer: {eventsQuery.error.message}
+          </Absent>
+        ) : eventsQuery.data.events.length === 0 ? (
+          <Absent title="No events yet" className="mt-3">
+            Nothing has escalated on this camera in this process yet — the chart will begin
+            drawing threat over time the moment it does.
           </Absent>
         ) : (
-          <div className="mt-3 overflow-x-auto">
-            <Ribbon
-              cells={buildThreatRibbon(historyQuery.data)}
-              ariaLabel={`Threat level over the last 2 hours for ${cameraId}, 48 buckets of 2.5 minutes each`}
-            />
-          </div>
+          <>
+            <div className="mt-3 overflow-x-auto">
+              <Ribbon
+                cells={buildThreatRibbon(eventsQuery.data.events)}
+                ariaLabel={`Threat over time for ${cameraId}, oldest to newest, ${eventsQuery.data.events.length} of up to ${eventsQuery.data.capacity} retained events`}
+              />
+            </div>
+            <p className="muted mt-2" data-testid="chart-footnote">
+              Showing {formatCount(eventsQuery.data.returned)} of up to{' '}
+              {formatCount(eventsQuery.data.capacity)} retained events, oldest to newest.
+              Volatile — held in engine memory only and cleared on restart; this is not the
+              audit trail.
+            </p>
+          </>
         )}
         <div className="mt-3 flex flex-wrap gap-4 text-[12px] text-dim">
           <span className="flex items-center gap-1.5">
@@ -161,19 +270,19 @@ export function CameraPage() {
         )}
       </div>
 
-      <Panel>
-        <h2>Event feed</h2>
-        <p className="lede">Mocked — shaped by the anomaly event contract.</p>
-        {feedQuery.isPending ? (
+      <Panel data-testid="notifications-panel">
+        <h2>Notifications</h2>
+        <p className="lede">Recent events for this camera, newest first.</p>
+        {eventsQuery.isPending ? (
           <p className="muted">Loading…</p>
-        ) : feedQuery.isError ? (
-          <Absent title="Event feed unavailable">The mocked event service did not respond.</Absent>
-        ) : feedQuery.data.length === 0 ? (
-          <Absent title="No events recorded yet">Nothing has happened on this camera yet.</Absent>
+        ) : eventsQuery.isError ? (
+          <Absent title="Notifications unavailable">{eventsQuery.error.message}</Absent>
+        ) : eventsQuery.data.events.length === 0 ? (
+          <Absent title="No notifications yet">Nothing has happened on this camera yet.</Absent>
         ) : (
           <ul className="max-h-[46vh] list-none overflow-y-auto p-0">
-            {feedQuery.data.map((event) => (
-              <EventRow key={event.event_id} event={event} />
+            {[...eventsQuery.data.events].reverse().map((event) => (
+              <NotificationRow key={event.event_id} event={event} />
             ))}
           </ul>
         )}

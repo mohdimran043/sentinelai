@@ -12,8 +12,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc -b",
     "gen:api": "openapi-typescript ../contracts/openapi/ai-engine.yaml -o src/api/engine.types.ts",
-    "gen:events": "node scripts/gen-event-types.mjs",
-    "gen": "npm run gen:api && npm run gen:events"
+    "gen": "npm run gen:api"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
