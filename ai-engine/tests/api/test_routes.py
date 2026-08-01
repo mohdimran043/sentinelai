@@ -114,6 +114,10 @@ def test_camera_telemetry_for_an_unknown_camera_is_404() -> None:
         response = client.get("/cameras/does-not-exist/telemetry")
 
     assert response.status_code == 404
+    assert response.json() == {"detail": "unknown camera: does-not-exist"}, (
+        "UnknownCameraError subclasses KeyError, whose __str__ is repr(args[0]); "
+        "str(exc) would leak literal quotes onto the wire"
+    )
 
 
 def test_describe_now_returns_the_event_id() -> None:
@@ -132,6 +136,10 @@ def test_describe_now_for_an_unknown_camera_is_404() -> None:
         response = client.post("/cameras/does-not-exist/describe")
 
     assert response.status_code == 404
+    assert response.json() == {"detail": "unknown camera: does-not-exist"}, (
+        "UnknownCameraError subclasses KeyError, whose __str__ is repr(args[0]); "
+        "str(exc) would leak literal quotes onto the wire"
+    )
 
 
 def test_lifespan_starts_and_stops_the_service() -> None:

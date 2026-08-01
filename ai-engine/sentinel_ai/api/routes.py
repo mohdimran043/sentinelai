@@ -73,7 +73,10 @@ async def get_camera_telemetry(camera_id: str, service: ServiceDep) -> CameraSta
     try:
         telemetry = service.telemetry(camera_id)
     except UnknownCameraError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Not str(exc): UnknownCameraError subclasses KeyError, whose __str__ is
+        # repr(args[0]), so str() would put literal quotes on the wire —
+        # {"detail": "'unknown camera: cam-x'"}.
+        raise HTTPException(status_code=404, detail=f"unknown camera: {exc.camera_id}") from exc
     return CameraStatus.from_telemetry(telemetry)
 
 
@@ -82,5 +85,8 @@ async def describe_camera_now(camera_id: str, service: ServiceDep) -> DescribeRe
     try:
         event_id = await service.describe_now(camera_id)
     except UnknownCameraError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Not str(exc): UnknownCameraError subclasses KeyError, whose __str__ is
+        # repr(args[0]), so str() would put literal quotes on the wire —
+        # {"detail": "'unknown camera: cam-x'"}.
+        raise HTTPException(status_code=404, detail=f"unknown camera: {exc.camera_id}") from exc
     return DescribeResponse(event_id=event_id)
