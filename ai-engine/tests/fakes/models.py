@@ -8,6 +8,7 @@ from math import hypot
 from sentinel_ai.domain.entities import BBox, Detection, Track
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.frame_source import FrameData
+from sentinel_ai.ports.model_runtime import Capabilities, HealthReport, LifecycleState, ModelRuntime
 from sentinel_ai.ports.tracker import Tracker
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 
@@ -113,3 +114,54 @@ class FakeVisionLLM(VisionLanguageModel):
     @property
     def call_count(self) -> int:
         return len(self.requests)
+
+
+class FakeModelRuntime(ModelRuntime):
+    """A controllable `ModelRuntime`: tests drive its lifecycle state directly rather
+    than simulating a real load/warmup/shutdown sequence."""
+
+    def __init__(
+        self,
+        model_key: str,
+        kind: str = "vision",
+        vram_mib: int = 100,
+        initialize_error: Exception | None = None,
+    ) -> None:
+        self._model_key = model_key
+        self._kind = kind
+        self._vram_mib = vram_mib
+        self._initialize_error = initialize_error
+        self._state = LifecycleState.UNLOADED
+        self.initialize_calls = 0
+        self.warmup_calls = 0
+        self.shutdown_calls = 0
+        self.predict_calls: list[object] = []
+
+    async def initialize(self) -> None:
+        self.initialize_calls += 1
+        if self._initialize_error is not None:
+            self._state = LifecycleState.UNHEALTHY
+            raise self._initialize_error
+        self._state = LifecycleState.LOADED
+
+    async def warmup(self) -> None:
+        self.warmup_calls += 1
+        self._state = LifecycleState.HEALTHY
+
+    async def predict(self, request: object) -> object:
+        self.predict_calls.append(request)
+        return request
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self._state = LifecycleState.UNLOADED
+
+    def health(self) -> HealthReport:
+        vram = self._vram_mib if self._state != LifecycleState.UNLOADED else 0
+        return HealthReport(state=self._state, vram_mib=vram)
+
+    def version(self) -> str:
+        return "fake-1"
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(model_key=self._model_key, kind=self._kind, vram_mib=self._vram_mib)
