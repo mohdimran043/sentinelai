@@ -1,0 +1,37 @@
+name: Boundary Check
+
+# Enforces the one architectural rule that spans both trees: web/ and
+# ai-engine/ never import each other; contracts/ is the only sanctioned seam.
+# Neither ci.yml (Python-only) nor web-ci.yml (Node-only) can express this —
+# it is a cross-tree property, not a property of either toolchain — so it is
+# its own workflow rather than bolted onto one of them. The checker
+# (scripts/check_boundaries.py) needs only the Python standard library, so
+# this job installs nothing and runs in seconds, independent of both the
+# `pip install` in ci.yml and the `npm ci` in web-ci.yml.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Positive control, run every time: a checker that has never been
+      # observed to fail is a hypothesis, not a guard (see
+      # ai-engine/tests/test_architecture.py, which does the same for the
+      # Python layering rules). This proves scripts/check_boundaries.py
+      # actually catches a planted violation before trusting it to check the
+      # real tree below.
+      - name: Prove the checker catches a real violation (self-test)
+        run: python3 scripts/check_boundaries.py --self-test
+
+      - name: Check web/ and ai-engine/ do not import each other
+        run: python3 scripts/check_boundaries.py

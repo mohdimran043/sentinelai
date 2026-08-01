@@ -1,0 +1,54 @@
+name: Web CI
+
+# Separate file from ci.yml (which is Python-only) on purpose: the web console
+# and the AI engine are two independently managed trees (see contracts/), and
+# a broken `npm install` must never make the Python job wait, block on a
+# Node toolchain, or share a failure signal with it. GitHub Actions runs each
+# workflow file as its own independent trigger, so this and ci.yml already run
+# concurrently with no coordination needed.
+#
+# Until now nothing gated the web console at all: 170+ vitest tests, `tsc -b`,
+# lint and the production build all existed but were never wired into CI, so a
+# completely broken UI could merge.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          # `web/node_modules` is large; setup-node's built-in npm cache keys
+          # on the lockfile hash and restores ~/.npm (npm's own cache dir),
+          # which is what `npm ci` reads from instead of hitting the registry.
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      # `npm run build` is `tsc -b && vite build` (see web/package.json) — this
+      # is the actual production build, not a separate smoke check, so a
+      # config or import error that only surfaces at bundle time is caught
+      # here rather than in production.
+      - name: Build (production)
+        run: npm run build
