@@ -66,7 +66,11 @@ Which is exactly why an event carries two of them. `Event.source_timestamp` is t
 scene's own timeline, unmodified — the thing a clip's pts and the camera telemetry
 share. `Event.occurred_at` is Unix epoch seconds, rebased onto the wall clock through
 `_to_epoch` so a consumer can sort, display and compare events across restarts and
-across cameras. See `_to_epoch` for why the anchor is captured exactly once.
+across cameras. The rebasing is anchored **per camera**, lazily, from that camera's
+own first-seen `source_timestamp` — not from a single process-wide anchor — because
+`source_timestamp` does not share one timeline across sources: `RtspSource` stamps
+`time.monotonic()`, `FileSource` stamps container pts starting at 0.0 per file. See
+`_to_epoch` for the arithmetic and for the precision this trades away in exchange.
 """
 
 from __future__ import annotations
@@ -183,11 +187,12 @@ class VlmScheduler:
         self._dead_letter = dead_letter
         self._timeout_seconds = timeout_seconds
         self._clock = clock
-        # Read adjacently and exactly once — see `_to_epoch`. Both readings are
-        # injected rather than taken from `time` directly so no test needs a real
-        # clock to pin the arithmetic.
-        self._wall_at_anchor = wall_clock()
-        self._mono_at_anchor = clock()
+        # Injected rather than taken from `time` directly so no test needs a real
+        # clock to pin the arithmetic — see `_to_epoch` for how it is used.
+        self._wall_clock = wall_clock
+        # One anchor per camera, established lazily from that camera's own first
+        # event rather than once for the whole process — see `_to_epoch`.
+        self._camera_anchors: dict[str, tuple[float, float]] = {}
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
         self._publish_failures = 0
@@ -437,8 +442,8 @@ class VlmScheduler:
             self._resident_set.mark_unhealthy(self._vlm_model_key, detail)
             raise
 
-    def _to_epoch(self, source_timestamp: float) -> float:
-        """Rebase a source timestamp onto Unix epoch seconds through the boot anchor.
+    def _to_epoch(self, camera_id: str, source_timestamp: float) -> float:
+        """Rebase a source timestamp onto Unix epoch seconds through a per-camera anchor.
 
         `occurred_at` used to be `scene.timestamp` verbatim, which for an RTSP camera is
         `time.monotonic()` — a live run published `"occurred_at": 51181.128868795`. That
@@ -446,27 +451,51 @@ class VlmScheduler:
         the same process, and cannot be turned into a wall time by a consumer, while the
         codec's docstring tells the Go consumer to sort by it.
 
-        **Why the anchor is read once, at construction, and never again.** The obvious
+        **Why the anchor is per camera, not per process.** A first fix anchored the
+        whole process once, at construction, to `(wall_clock(), clock())`, and rebased
+        every event as `wall_at_anchor + (source_timestamp - mono_at_anchor)`. That is
+        exact only when a camera's `source_timestamp` shares `clock`'s timeline — true
+        for `RtspSource`, whose frames carry `time.monotonic()`, and false for
+        `FileSource`, whose frames carry the container's own pts starting at 0.0 per
+        file. `time.monotonic()` counts from boot, so a replay event's `occurred_at`
+        came out `wall_at_anchor - mono_at_anchor`, i.e. roughly one uptime in the past
+        — about 14 hours on the box the live run came from — and a replay camera and an
+        RTSP camera in the same process landed hours apart for events observed seconds
+        apart, even though both anchors were read correctly.
+
+        The fix is to stop assuming a shared timeline at all: each camera's anchor is
+        established lazily, from *that camera's own* first-seen `source_timestamp`
+        paired with the wall clock reading taken at that moment, and cached in
+        `_camera_anchors`. `clock()` never enters this calculation — only `wall_clock`
+        does, and only once per camera. A camera's first event therefore always lands
+        at the wall time it was assembled, whatever timeline its source counts on and
+        whatever `clock()` happens to read.
+
+        **Why the anchor is read once per camera, and never again.** The obvious
         alternative — `time.time()` per event — makes `occurred_at` a fresh sample of a
         clock that `ntpd`, `chronyd` or a hypervisor can step backwards at any moment. Two
         events a second apart could then land out of order relative to each other, which
         is precisely the ordering the consumer is told to rely on. Offsetting from one
         anchor instead makes the difference between any two `occurred_at` values from the
-        same source *exactly* the difference between their source timestamps: the
-        absolute value is as accurate as the anchor was, and the ordering is as reliable
-        as the monotonic clock, which is to say perfectly.
+        same camera *exactly* the difference between their source timestamps: the
+        absolute value is as accurate as that camera's anchor was, and the ordering is as
+        reliable as the source's own clock, which is to say perfectly.
 
-        **What this means per source kind.** The conversion is exact for any source on
-        the same monotonic timeline as `clock` — i.e. every live RTSP camera, which is
-        what `RtspSource` stamps frames with. `FileSource` restarts at 0.0 per file and
-        is *not* on that timeline, so a replayed event is stamped
-        `wall_at_anchor - mono_at_anchor + pts`, i.e. relative to the wall time at this
-        machine's monotonic origin rather than to now. It is a stable, ordered,
-        epoch-shaped number and it is fine for a replay corpus, but it is not the moment
-        the footage was observed; `source_timestamp` is the field to use when what you
-        want is a replay's position in its file.
+        **The consequence, honestly stated.** A camera's first event is anchored at
+        that event's assembly, not at some shared moment — so comparing `occurred_at`
+        across two different cameras is only precise to when each camera's anchor was
+        established, not to true simultaneity. That is a far smaller error than one
+        uptime (typically well under a second, since a camera's first escalation is
+        assembled shortly after the engine starts observing it), and unlike the
+        process-wide anchor it degrades gracefully: it is never off by more than each
+        camera's own anchoring delay, never by an unrelated system's uptime.
         """
-        return self._wall_at_anchor + (source_timestamp - self._mono_at_anchor)
+        anchor = self._camera_anchors.get(camera_id)
+        if anchor is None:
+            anchor = (self._wall_clock(), source_timestamp)
+            self._camera_anchors[camera_id] = anchor
+        wall_at_anchor, source_at_anchor = anchor
+        return wall_at_anchor + (source_timestamp - source_at_anchor)
 
     def _assemble(
         self,
@@ -487,7 +516,7 @@ class VlmScheduler:
         return Event(
             event_id=request.event_id,
             camera_id=request.camera_id,
-            occurred_at=self._to_epoch(request.scene.timestamp),
+            occurred_at=self._to_epoch(request.camera_id, request.scene.timestamp),
             source_timestamp=request.scene.timestamp,
             reason=request.reason,
             threat=threat,

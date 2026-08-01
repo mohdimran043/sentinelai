@@ -829,23 +829,29 @@ class TestEventTimestamps:
     cannot be converted to a wall time, while `event_codec`'s docstring tells the Go
     consumer to sort by it.
 
-    The monotonic anchor here is deliberately 51_181.0 — the live run's own reading —
-    rather than the frozen 0.0 the rest of this module uses, because at 0.0 the anchor
-    arithmetic degenerates to `wall + source` and an implementation that never
-    subtracts `mono_at_anchor` would pass.
+    A first fix anchored the whole *process* once, at construction, to
+    `(wall_clock(), clock())`. That is correct only when every camera's
+    `scene.timestamp` shares `clock`'s timeline, which is true for `RtspSource`
+    (`time.monotonic()`) and false for `FileSource` (container pts, starting at 0.0
+    per file): a replay event came out ~one uptime in the past, and a replay camera
+    and an RTSP camera in the same process landed hours apart for events observed
+    seconds apart. The fix here anchors **per camera, lazily, from that camera's own
+    first-seen `source_timestamp`** — not from `clock()` — so the anchor is always
+    correct for whatever timeline that particular source counts on, at the cost of
+    only being precise to when each camera's anchor was established (see
+    `_to_epoch`'s docstring).
     """
 
-    MONO_AT_ANCHOR = 51_181.0
     WALL_AT_ANCHOR = 1_700_000_000.0
 
     def _stepping_wall_clock(self) -> Callable[[], float]:
         """A wall clock that jumps 100s every time it is read.
 
-        Any implementation that samples it per event rather than once at construction
-        gets caught twice over: the absolute value is wrong, and — the part that
-        matters — the gap between two events stops matching the gap between their
-        source timestamps, which is exactly how an NTP step reorders two events
-        relative to each other.
+        Any implementation that samples it per event rather than once per camera
+        anchor gets caught twice over: the absolute value is wrong, and — the part
+        that matters — the gap between two events from the *same* camera stops
+        matching the gap between their source timestamps, which is exactly how an
+        NTP step reorders two events relative to each other.
         """
         reads = iter(self.WALL_AT_ANCHOR + 100.0 * step for step in range(100))
         return lambda: next(reads)
@@ -853,29 +859,36 @@ class TestEventTimestamps:
     def _scheduler(self, publisher: FakePublisher) -> VlmScheduler:
         return new_scheduler(
             publisher=publisher,
-            clock=lambda: self.MONO_AT_ANCHOR,
+            # A real elapsed-time reading standing in for a box with hours of
+            # uptime. Fixed and unrelated to any `source_timestamp` below, so any
+            # test failure that depends on it proves this value leaked into
+            # `occurred_at` — which the per-camera anchor must never let happen.
+            clock=lambda: 51_181.0,
             wall_clock=self._stepping_wall_clock(),
         )
 
-    async def test_occurred_at_is_the_source_timestamp_rebased_onto_unix_epoch(self) -> None:
-        """Fails against the old field with `occurred_at == 12.5` — a Thursday in
-        January 1970, and the same value on the next restart."""
+    async def test_a_cameras_first_event_is_anchored_at_its_own_assembly(self) -> None:
+        """The per-camera anchor: a camera's first event is stamped at the wall clock
+        reading taken when *it* was assembled, regardless of what its own
+        `source_timestamp` or the scheduler's `clock()` read."""
         publisher = FakePublisher()
         async with Worker(self._scheduler(publisher)) as scheduler:
             scheduler.submit(a_request(timestamp=12.5))
             await scheduler.drain()
 
-        expected = self.WALL_AT_ANCHOR + (12.5 - self.MONO_AT_ANCHOR)
-        assert publisher.events[0].occurred_at == pytest.approx(expected)
+        assert publisher.events[0].occurred_at == pytest.approx(self.WALL_AT_ANCHOR)
         assert publisher.events[0].occurred_at > 1_600_000_000.0, (
             "a plausible Unix epoch, not a monotonic reading"
         )
 
     async def test_two_events_are_exactly_their_source_delta_apart(self) -> None:
-        """The property the anchor exists for. Fails against a `time.time()` read per
-        event: the wall clock steps 100s between the two assemblies here, so the pair
-        would come out 108s apart instead of 8s — and a backwards step would put them
-        in the wrong order."""
+        """The property the anchor exists for, unchanged by the per-camera fix: two
+        events from the *same* camera differ by exactly their source-timestamp delta.
+        Fails against a `time.time()` read per event: the wall clock steps 100s
+        between the two assemblies here, so the pair would come out 108s apart
+        instead of 8s — and a backwards step would put them in the wrong order.
+        Fails equally against anything that re-anchors on the *second* event instead
+        of reusing the camera's first anchor."""
         publisher = FakePublisher()
         async with Worker(self._scheduler(publisher)) as scheduler:
             scheduler.submit(a_request(timestamp=12.5))
@@ -885,7 +898,11 @@ class TestEventTimestamps:
 
         first, second = (event.occurred_at for event in publisher.events)
         assert second - first == pytest.approx(8.0), (
-            "exactly the source delta — the anchor is read once, not per event"
+            "exactly the source delta — the anchor is read once per camera, not per event"
+        )
+        assert first == pytest.approx(self.WALL_AT_ANCHOR), (
+            "the wall clock must be read once, for the first event of this camera, "
+            "not again for the second"
         )
 
     async def test_the_raw_source_timeline_is_kept_alongside(self) -> None:
@@ -907,14 +924,73 @@ class TestEventTimestamps:
         dead_letter = FakeFailedEventSink()
         scheduler = new_scheduler(
             dead_letter=dead_letter,
-            clock=lambda: self.MONO_AT_ANCHOR,
+            clock=lambda: 51_181.0,
             wall_clock=self._stepping_wall_clock(),
         )
         assert scheduler.submit(a_request(timestamp=12.5))
         assert await scheduler.abandon_pending(RuntimeError("shutdown")) == 1
 
         stored = dead_letter.events[0]
-        assert stored.occurred_at == pytest.approx(
-            self.WALL_AT_ANCHOR + (12.5 - self.MONO_AT_ANCHOR)
-        )
+        assert stored.occurred_at == pytest.approx(self.WALL_AT_ANCHOR)
         assert stored.source_timestamp == pytest.approx(12.5)
+
+    async def test_a_replay_source_starting_near_zero_lands_at_assembly_wall_time(self) -> None:
+        """The defect this class exists to catch. `FileSource` stamps `scene.timestamp`
+        from the container's own pts, starting at 0.0 per file. The process-wide
+        anchor computed `occurred_at = wall_at_anchor + (source_timestamp -
+        mono_at_anchor)` with `mono_at_anchor` a real `time.monotonic()` reading —
+        i.e. seconds since boot, unrelated to this camera. On a box with ~14.2 hours
+        of uptime (`clock() == 51_181.0`, the live run's own reading) a replay event
+        with `source_timestamp == 0.02` used to land at `wall_at_anchor - 51_180.98`:
+        about 14 hours in the past. Per-camera anchoring fixes it: the camera's
+        first-seen `source_timestamp` *is* its own anchor, so the offset is always 0
+        for that first event, however small `source_timestamp` is and however large
+        `clock()` reads.
+
+        Fails against the process-wide anchor with `occurred_at` off by ~51_181
+        seconds (~14.2 hours in the past); passes with `occurred_at ==
+        WALL_AT_ANCHOR`.
+        """
+        publisher = FakePublisher()
+        async with Worker(self._scheduler(publisher)) as scheduler:
+            scheduler.submit(a_request(timestamp=0.02))
+            await scheduler.drain()
+
+        occurred_at = publisher.events[0].occurred_at
+        assert occurred_at == pytest.approx(self.WALL_AT_ANCHOR), (
+            "must land at the wall clock reading taken at assembly, not one uptime in the past"
+        )
+
+    async def test_two_cameras_on_different_timelines_land_within_seconds(self) -> None:
+        """The cross-source case D1 exists for. `FileSource` restarts its pts at 0.0
+        per file; `RtspSource` stamps `scene.timestamp` from `time.monotonic()`,
+        which on a long-uptime box is tens of thousands of seconds. Against the
+        process-wide anchor these two cameras' first events land ~one uptime apart —
+        see `test_a_replay_source_starting_near_zero_lands_at_assembly_wall_time` for
+        that arithmetic in isolation. Per-camera anchoring fixes the pair: each
+        camera anchors independently at its own first-seen `source_timestamp`, so
+        both land at (approximately) the wall-clock reading taken when each was
+        assembled — seconds apart if the two events were observed seconds apart,
+        never hours.
+        """
+        wall_reads = iter([self.WALL_AT_ANCHOR, self.WALL_AT_ANCHOR + 0.4])
+        publisher = FakePublisher()
+        scheduler = new_scheduler(
+            publisher=publisher,
+            clock=lambda: 51_181.0,
+            wall_clock=lambda: next(wall_reads),
+        )
+        file_camera = replace(a_request(timestamp=0.05), camera_id="file-cam")
+        rtsp_camera = replace(a_request(timestamp=51_181.3), camera_id="rtsp-cam")
+
+        async with Worker(scheduler) as running:
+            running.submit(file_camera)
+            await running.drain()
+            running.submit(rtsp_camera)
+            await running.drain()
+
+        by_camera = {event.camera_id: event.occurred_at for event in publisher.events}
+        assert abs(by_camera["file-cam"] - by_camera["rtsp-cam"]) < 5.0, (
+            "two cameras observed moments apart must land moments apart, not ~14 "
+            "hours apart (one uptime) as the process-wide anchor produced"
+        )
