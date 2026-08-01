@@ -14,6 +14,7 @@ import asyncio
 import inspect
 import json
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
@@ -430,7 +431,9 @@ def fake_models() -> Models:
     )
 
 
-def composed(tmp_path: Path, **overrides: object) -> tuple[Composition, Settings]:
+def composed(
+    tmp_path: Path, *, broker: BrokerLink | None = None, **overrides: object
+) -> tuple[Composition, Settings]:
     settings = Settings(
         source_realtime=False,
         event_spool_dir=str(tmp_path / "spool"),
@@ -451,7 +454,7 @@ def composed(tmp_path: Path, **overrides: object) -> tuple[Composition, Settings
     # over the real publisher (asserted structurally in `TestCompose`); here it is
     # swapped for one whose link is permanently down, which is also the state that
     # makes the publisher spool — the property the end-to-end test below asserts.
-    return replace(composition, broker=_offline_broker_link()), settings
+    return replace(composition, broker=broker or _offline_broker_link()), settings
 
 
 def _offline_broker_link() -> BrokerLink:
@@ -463,6 +466,41 @@ def _offline_broker_link() -> BrokerLink:
         max_seconds=3600.0,
         replay_interval_seconds=3600.0,
     )
+
+
+class StubbornBrokerLink(BrokerLink):
+    """A link whose task refuses to finish cancelling.
+
+    That makes `stop()`'s wait for it the *only* interruptible await left, which is
+    what lets the test deliver a cancellation at exactly that point. It is not a
+    contrived shape: uvicorn sends the graceful-shutdown cancellation and then, on a
+    second signal, cancels again — so a second cancellation genuinely can land while
+    `stop()` is already unwinding.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            RecordingBroker(up=False),
+            initial_seconds=3600.0,
+            max_seconds=3600.0,
+            replay_interval_seconds=3600.0,
+        )
+        self.stepped = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def run_forever(self, should_stop: Callable[[], bool]) -> None:
+        try:
+            await self._release.wait()
+        except asyncio.CancelledError:
+            # Deliberately ignores it, so the awaiting `stop()` stays parked.
+            await self._release.wait()
+
+    async def step(self) -> bool:
+        self.stepped.set()
+        return True
+
+    def release(self) -> None:
+        self._release.set()
 
 
 class TestCompose:
@@ -535,6 +573,52 @@ class TestComposedService:
 
         assert not composition.publisher.connected
         assert service.cameras() == ()
+
+    async def test_a_cancellation_landing_in_the_teardown_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """`create_app`'s lifespan awaits `stop()` in exactly the position uvicorn's
+        `--timeout-graceful-shutdown` cancels, and a second signal cancels again while
+        that shutdown is already unwinding. `EngineService._cancel` was fixed to
+        re-raise rather than march on when the cancellation is aimed at *it*; this is
+        the caller that makes that reachable in production, and it must not reintroduce
+        the same defect one layer out.
+
+        The cancellation is delivered while `stop()` is waiting for the broker task,
+        which is the one await in the teardown. Against a teardown that wraps that wait
+        in a blanket `suppress(CancelledError)` the cancellation is swallowed, `stop()`
+        runs on and returns normally, and the lifespan reports a truncated shutdown to
+        uvicorn as a completed one: `stop_task.cancelled()` is False and no
+        `CancelledError` is raised.
+
+        Note the narrower case — a cancellation landing in `service.stop()` — does
+        *not* discriminate: a `try/finally` re-raises it regardless of what the
+        `finally` suppresses. Only a cancellation delivered inside the suppressed await
+        itself tells the two apart, which is why the link below refuses to finish
+        cancelling.
+        """
+        link = StubbornBrokerLink()
+        composition, _ = composed(tmp_path, broker=link)
+        service = ComposedService(lambda: composition)
+        await service.start()
+        try:
+            stop_task = asyncio.create_task(service.stop())
+            # `step()` is the last call before the teardown and does not await, so when
+            # this returns `stop_task` has already suspended on the wait that follows.
+            async with asyncio.timeout(10.0):
+                await link.stepped.wait()
+
+            stop_task.cancel()
+            # `asyncio.wait` rather than `await stop_task`: bounded, and it separates
+            # the two ways this can go wrong. A teardown that suppresses the
+            # cancellation and then parks on the same never-finishing task hangs; one
+            # that suppresses it and completes returns normally. Both are failures, and
+            # they deserve different messages.
+            _done, pending = await asyncio.wait({stop_task}, timeout=5.0)
+            assert not pending, "stop() hung in its teardown instead of propagating"
+            assert stop_task.cancelled(), "a shutdown cut short must not look like a clean one"
+        finally:
+            link.release()
 
     async def test_start_feeds_the_measured_vram_back_into_the_specs(self, tmp_path: Path) -> None:
         composition, _ = composed(tmp_path)

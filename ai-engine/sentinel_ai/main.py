@@ -60,7 +60,6 @@ a `cameras.json` present.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import time
@@ -549,9 +548,29 @@ class ComposedService:
         refresh_specs_from_capabilities(composition.registry)
 
     async def stop(self) -> None:
+        """Unwind what `EngineService` does not own — and let a cut-short shutdown
+        stay cut short.
+
+        This is the caller that makes `EngineService._cancel`'s `cancelling()`
+        bookkeeping matter in production: uvicorn's `--timeout-graceful-shutdown`
+        cancels the ASGI lifespan's shutdown task, and `create_app`'s lifespan awaits
+        this method in exactly that position. So the same discipline applies one layer
+        out — nothing here may swallow a `CancelledError` aimed at *this* coroutine,
+        because doing so reports a truncated shutdown to uvicorn as a clean one.
+
+        The broker link is therefore cancelled **first and synchronously**: `cancel()`
+        cannot itself be interrupted, so the link stops even if the very next `await`
+        never returns. Everything after that is an await and any of them may be the one
+        that is cut short, so they are ordered by what it costs to lose them. Losing
+        `publisher.close()` costs an AMQP socket that the exiting process closes anyway;
+        losing `service.stop()` would cost events, which is why it goes first.
+        """
         composition, self._composition = self._composition, None
+        broker_task, self._broker_task = self._broker_task, None
         if composition is None:
             return
+        if broker_task is not None:
+            broker_task.cancel()
         try:
             # The engine first: its own shutdown ordering publishes the escalations
             # the runners preserve, and those publishes must still have somewhere to
@@ -560,11 +579,13 @@ class ComposedService:
             await composition.service.stop()
             await composition.broker.step()
         finally:
-            if self._broker_task is not None:
-                self._broker_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._broker_task
-                self._broker_task = None
+            if broker_task is not None:
+                # `gather(..., return_exceptions=True)` rather than
+                # `suppress(CancelledError)`: it absorbs the *task's* cancellation as a
+                # result while still propagating one delivered to *us*. A blanket
+                # suppress cannot tell those apart — the defect fixed in
+                # `EngineService._cancel`, which is reachable here for the same reason.
+                await asyncio.gather(broker_task, return_exceptions=True)
             await composition.publisher.close()
 
     def cameras(self) -> tuple[CameraTelemetry, ...]:
