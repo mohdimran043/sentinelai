@@ -239,6 +239,40 @@ class TestNeverLoseAnEvent:
             "a clip failure says nothing about whether the description succeeded"
         )
 
+    async def test_a_vlm_exception_other_than_timeout_still_publishes_and_frees_admission(
+        self,
+    ) -> None:
+        """§9's rescue path must not narrow to `except TimeoutError` — any VLM failure
+        mode (a provider outage, a CUDA OOM) must still yield a fallback event, and the
+        admission slot it held must still be free for the next escalation.
+
+        Fails against a `_describe` that only catches `TimeoutError`: the `RuntimeError`
+        here would propagate out of `_process` uncaught by anything but the worker's own
+        top-level `except Exception`, so no event would ever reach the publisher and
+        `publisher.events` would stay empty after `drain()`.
+        """
+        admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(
+            vlm=FakeVisionLLM(error=RuntimeError("cuda oom")),
+            publisher=publisher,
+            admission=admission,
+        )
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            assert len(publisher.events) == 1
+            assert publisher.events[0].description_unavailable is True
+            assert admission.in_flight == 0
+
+            # Proof the gate is genuinely reusable, not merely reporting zero —
+            # would hang forever if the first call ever leaked the slot.
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert len(publisher.events) == 2
+        assert admission.in_flight == 0
+
 
 class TestAdmissionSlotIsNeverLeaked:
     async def test_a_publish_failure_still_releases_the_slot_and_the_worker_survives(
