@@ -66,7 +66,7 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'models',
     label: 'Models',
-    built: false,
+    built: true,
     endpoints: ['GET /api/models'],
     summary: 'Which model reads the footage, where it runs, and what it costs.',
   },

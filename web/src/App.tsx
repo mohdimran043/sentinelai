@@ -6,6 +6,7 @@ import { CameraPage } from '@/routes/CameraPage'
 import { RequireSession } from '@/routes/RequireSession'
 import { SectionNotBuiltPage } from '@/routes/recorder/SectionNotBuiltPage'
 import { AlertsPage } from '@/routes/recorder/AlertsPage'
+import { ModelsPage } from '@/routes/recorder/ModelsPage'
 
 /**
  * Two products, two route namespaces.
@@ -32,6 +33,7 @@ export function App() {
 
           <Route path="/recorder" element={<Navigate to="/recorder/alerts" replace />} />
           <Route path="/recorder/alerts" element={<AlertsPage />} />
+          <Route path="/recorder/models" element={<ModelsPage />} />
           {/* Sections with a built screen get their own route above this one.
               Everything else falls through to a page that says so out loud. */}
           <Route path="/recorder/:section" element={<SectionNotBuiltPage />} />
