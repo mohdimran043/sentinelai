@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
@@ -140,7 +139,15 @@ class EngineService:
           2. then the cameras, awaited to completion, so every `finally` runs and
              every in-flight escalation is on the queue while the worker still lives;
           3. then the drain, bounded, so a wedged VLM cannot hold shutdown open;
-          4. then the worker itself.
+          4. then the worker itself;
+          5. and if the cap in (3) expired, whatever the worker never got to is
+             dead-lettered instead of evaporating with it.
+
+        Step 5 exists because the cap in step 3 reproduced the very defect steps 1-4
+        were added to fix. `suppress(TimeoutError)` followed by cancelling the worker
+        left the still-queued escalations counted, unpublished, and absent from every
+        counter — C3's signature again, through a different door. See
+        `VlmScheduler.abandon_pending`.
 
         Resident models are deliberately *not* unloaded: process exit reclaims the
         VRAM, and an unload here would only slow shutdown down.
@@ -151,13 +158,26 @@ class EngineService:
         await self._cancel(*self._camera_tasks)
         self._camera_tasks = []
 
+        expiry: TimeoutError | None = None
         if self._scheduler_task is not None and not self._scheduler_task.done():
-            with contextlib.suppress(TimeoutError):
+            try:
                 await asyncio.wait_for(
                     self._scheduler.drain(), timeout=self._shutdown_drain_timeout_seconds
                 )
+            except TimeoutError as error:
+                expiry = error
+                logger.error(
+                    "the escalation queue did not drain within %.1fs; "
+                    "dead-lettering whatever is left rather than losing it",
+                    self._shutdown_drain_timeout_seconds,
+                )
         await self._cancel(self._scheduler_task)
         self._scheduler_task = None
+        if expiry is not None:
+            # After the worker is cancelled, never before: `abandon_pending()` empties
+            # the queue, so running it against a live worker would race it for the same
+            # request and could publish and dead-letter the same event.
+            await self._scheduler.abandon_pending(expiry)
 
     @staticmethod
     async def _cancel(*tasks: asyncio.Task[None] | None) -> None:

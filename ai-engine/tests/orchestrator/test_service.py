@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
@@ -637,6 +638,100 @@ async def test_one_cameras_decode_error_does_not_abort_the_rest_of_shutdown(
     assert service.telemetry("cam-b").escalations_dropped == 0
     assert handle_b.event_id in {event.event_id for event in publisher.events}, (
         "cam-b's preserved escalation must still be published (spec §9)"
+    )
+
+
+class NeverReturningVlm(VisionLanguageModel):
+    """A describe that starts and never finishes — a wedged VLM, or simply a real
+    multi-second Qwen generate that the drain cap runs out of patience for."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def describe(self, request: VisionRequest) -> SceneDescription:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def test_a_drain_that_runs_out_of_budget_dead_letters_instead_of_losing_events() -> None:
+    """B5: the bounded drain reproduced C3 through its own cap.
+
+    `stop()` wrapped `drain()` in `suppress(TimeoutError)` and then cancelled the
+    worker, so everything still queued — and the request the worker was midway through
+    describing, which is no longer on the queue at all — simply evaporated. The
+    reviewer's probe with `shutdown_drain_timeout_seconds=0.2` against a slower
+    describe:
+
+        escalations counted : 1     published : 0
+        escalations_dropped : 0     dead-lettered : 0
+        scheduler.dropped   : 0     publish_failures : 0
+        warnings/errors     : []
+
+    Counted, never published, never counted as dropped, invisible to every telemetry
+    read. Reachable with the shipped numbers: a 10s cap against `vlm_timeout_seconds`
+    30s and a queue depth of four real Qwen describes each spaced by
+    `vlm_global_min_interval_seconds`.
+
+    The cap is pinned at 0.0 here rather than 0.2: `asyncio.wait_for` short-circuits a
+    non-positive timeout without sleeping, so this costs no wall-clock time at all and
+    cannot flake on a loaded CI box. It is the same expiry branch either way.
+
+    Fails against the suppressing version with `abandoned == 0` and an empty
+    dead-letter spool.
+    """
+    registry = ModelRegistry()
+    registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+    registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+    resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+
+    publisher = FakePublisher()
+    dead_letter = FakeFailedEventSink()
+    vlm = NeverReturningVlm()
+    scheduler = VlmScheduler(
+        vlm=vlm,
+        publisher=publisher,
+        admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+        resident_set=resident_set,
+        vlm_model_key="qwen25vl3b",
+        dead_letter=dead_letter,
+        maxsize=4,
+        timeout_seconds=5.0,
+        clock=clock,
+    )
+    service = EngineService(
+        cameras={},
+        registry=registry,
+        resident_set=resident_set,
+        scheduler=scheduler,
+        required_model_keys=("yolo11s", "qwen25vl3b"),
+        clock=clock,
+        shutdown_drain_timeout_seconds=0.0,
+    )
+    await service.start()
+
+    in_flight = an_escalation_request()
+    handle = FakeClipHandle("cam-1", uuid4())
+    still_queued = replace(an_escalation_request(), clip=handle)
+    assert scheduler.submit(in_flight)
+    assert scheduler.submit(still_queued)
+    await asyncio.wait_for(vlm.started.wait(), timeout=5.0)
+
+    await service.stop()
+
+    assert publisher.events == [], "test setup: the wedged describe must publish nothing"
+    assert scheduler.abandoned == 2, (
+        "both the mid-describe request and the queued one must be accounted for"
+    )
+    assert {event.event_id for event in dead_letter.events} == {
+        in_flight.event_id,
+        still_queued.event_id,
+    }, "an escalation the drain cap cut short must reach the dead-letter sink (spec §9)"
+    assert all(event.description_unavailable for event in dead_letter.events), (
+        "no VLM ever spoke for these, and the event must say so"
+    )
+    assert handle.aborted is True, (
+        "a clip riding on an abandoned request leaks a PyAV container and a temp file"
     )
 
 

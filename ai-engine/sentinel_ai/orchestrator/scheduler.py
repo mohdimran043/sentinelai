@@ -176,6 +176,12 @@ class VlmScheduler:
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
         self._publish_failures = 0
+        self._abandoned = 0
+        self._in_flight: EscalationRequest | None = None
+        """The request the worker is currently describing, kept so that a shutdown
+        which cancels the worker mid-describe can still account for it. Cleared on
+        every normal outcome; deliberately *not* cleared on cancellation — see
+        `run()` and `abandon_pending()`."""
 
     def submit(self, request: EscalationRequest) -> bool:
         """Non-blocking. Returns False and counts a drop when the queue is full.
@@ -195,8 +201,16 @@ class VlmScheduler:
         """The single worker loop. Cancel to stop."""
         while True:
             request = await self._queue.get()
+            self._in_flight = request
             try:
                 await self._process(request)
+            except asyncio.CancelledError:
+                # Shutdown cut this describe short. `_in_flight` stays set on purpose:
+                # the request is no longer on the queue and the worker will never
+                # finish it, so `abandon_pending()` is the only thing left that can
+                # keep spec §9 true for it.
+                self._queue.task_done()
+                raise
             except Exception:
                 # `asyncio.CancelledError` is a `BaseException`, so cancelling the
                 # worker still stops it cleanly; anything else is one bad escalation,
@@ -207,8 +221,59 @@ class VlmScheduler:
                     request.camera_id,
                     request.event_id,
                 )
-            finally:
-                self._queue.task_done()
+            self._in_flight = None
+            self._queue.task_done()
+
+    async def abandon_pending(self, reason: BaseException) -> int:
+        """Dead-letter every escalation this worker will now never process (spec §9).
+
+        Called by `EngineService.stop()` when the bounded drain expires. Without it
+        that cap reproduced C3's exact signature through a different door: the
+        escalations still queued (and the one the worker was midway through) were
+        counted in `escalations`, never published, never counted in
+        `escalations_dropped`, and invisible in every telemetry read — the reviewer's
+        probe measured `escalations 1 / published 0 / dropped 0 / dead-lettered 0 /
+        publish_failures 0 / warnings []`. Reachable with the shipped numbers: a cap of
+        10s against `vlm_timeout_seconds` 30s and a queue of four real Qwen describes
+        spaced by `vlm_global_min_interval_seconds`, and the team's own live runs used
+        `--timeout-graceful-shutdown 2`, which cuts `stop()` off well before the cap.
+
+        Each abandoned request becomes the same §9 fallback event a failed describe
+        produces — `description_unavailable=True` — and goes to the `FailedEventSink`
+        rather than the publisher: past the cap there is no time budget left to spend
+        on a broker that may itself be the reason we are late, and the sink's whole
+        job is the event that has nowhere else to go. Any clip handle still riding on
+        the request is aborted, or it would leak the same PyAV container and temp file
+        a failed pre-roll seed used to.
+
+        Must be called only once the worker is no longer running, or it races the
+        worker for the queue.
+        """
+        pending: list[EscalationRequest] = []
+        if self._in_flight is not None:
+            pending.append(self._in_flight)
+            self._in_flight = None
+        while True:
+            try:
+                pending.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+
+        for request in pending:
+            self._abandoned += 1
+            logger.error(
+                "shutdown abandoned escalation for camera %s event %s before it could be "
+                "published; dead-lettering it (%s)",
+                request.camera_id,
+                request.event_id,
+                reason,
+            )
+            if request.clip is not None:
+                with contextlib.suppress(Exception):
+                    await request.clip.abort()
+            await self._dead_letter.store(self._unavailable_event(request), reason)
+        return len(pending)
 
     async def drain(self) -> None:
         """Await completion of everything currently queued.
@@ -236,6 +301,15 @@ class VlmScheduler:
         no counter at all.
         """
         return self._publish_failures
+
+    @property
+    def abandoned(self) -> int:
+        """Escalations `abandon_pending()` dead-lettered because shutdown ran out of
+        drain budget. A third counter rather than a reuse of either of the others: this
+        is neither load-shedding (`dropped`) nor a publisher refusing an assembled event
+        (`publish_failures`), and conflating it would hide the one number an operator
+        needs to see after a `docker compose down` cut a queue short."""
+        return self._abandoned
 
     async def _process(self, request: EscalationRequest) -> None:
         await self._admission.acquire(self._clock())
@@ -348,8 +422,47 @@ class VlmScheduler:
             self._resident_set.mark_unhealthy(self._vlm_model_key, detail)
             raise
 
-    async def _describe(self, request: EscalationRequest) -> Event:
+    def _assemble(
+        self,
+        request: EscalationRequest,
+        *,
+        threat: ThreatScore,
+        description: str,
+        suggested_action: str,
+        description_unavailable: bool,
+    ) -> Event:
+        """The one place in the system that constructs an `Event` (S14).
+
+        Every path — a good describe, a failed one, and a shutdown that abandoned the
+        escalation before it was ever described — comes through here, precisely so no
+        error path can produce a differently-shaped event, or none at all.
+        """
         labels, track_ids = _labels_and_tracks(request.scene)
+        return Event(
+            event_id=request.event_id,
+            camera_id=request.camera_id,
+            occurred_at=request.scene.timestamp,
+            reason=request.reason,
+            threat=threat,
+            description=description,
+            suggested_action=suggested_action,
+            labels=labels,
+            track_ids=track_ids,
+            description_unavailable=description_unavailable,
+        )
+
+    def _unavailable_event(self, request: EscalationRequest) -> Event:
+        """Spec §9's degraded event: everything the metadata already knows, and an
+        honest flag saying the VLM never spoke."""
+        return self._assemble(
+            request,
+            threat=ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE),
+            description=_metadata_description(request),
+            suggested_action=_UNAVAILABLE_ACTION,
+            description_unavailable=True,
+        )
+
+    async def _describe(self, request: EscalationRequest) -> Event:
         vlm_request = VisionRequest(
             keyframe=request.keyframe,
             scene=request.scene,
@@ -367,9 +480,6 @@ class VlmScheduler:
             # dropped entirely -- the one thing spec §9 forbids. Here it degrades to the
             # same `description_unavailable=True` fallback as any other VLM failure.
             threat = ThreatScore.from_value(description.threat_value)
-            description_text = description.description
-            suggested_action = description.suggested_action
-            unavailable = False
         except Exception as error:
             logger.warning(
                 "vlm describe failed for camera %s event %s: %s",
@@ -377,23 +487,13 @@ class VlmScheduler:
                 request.event_id,
                 error,
             )
-            threat = ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE)
-            description_text = _metadata_description(request)
-            suggested_action = _UNAVAILABLE_ACTION
-            unavailable = True
-        # One construction site, both paths: S14 owns event assembly precisely so that
-        # no error path can produce a differently-shaped event, or none at all.
-        return Event(
-            event_id=request.event_id,
-            camera_id=request.camera_id,
-            occurred_at=request.scene.timestamp,
-            reason=request.reason,
+            return self._unavailable_event(request)
+        return self._assemble(
+            request,
             threat=threat,
-            description=description_text,
-            suggested_action=suggested_action,
-            labels=labels,
-            track_ids=track_ids,
-            description_unavailable=unavailable,
+            description=description.description,
+            suggested_action=description.suggested_action,
+            description_unavailable=False,
         )
 
     async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:
