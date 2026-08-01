@@ -74,15 +74,29 @@ files = ["sentinel_ai", "tests"]
 
 [[tool.mypy.overrides]]
 module = [
-    "ultralytics.*",
+    "torch.*",
     "supervision.*",
     "av.*",
     "bitsandbytes.*",
     "qwen_vl_utils.*",
     "minio.*",
     "jsonschema.*",
+    "yaml.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `ultralytics.*` gets its own override, separate from the plain
+# ignore_missing_imports block above: unlike the others, this package *is*
+# installed in this dev environment (the gpu extra), so mypy actually reads
+# its source instead of treating it as missing. Its top-level `__init__.py`
+# does not explicitly re-export `YOLO` the way `no_implicit_reexport` (part of
+# `strict`) requires, and `model.predict(...)`'s real return type is a wide,
+# awkward union. `follow_imports = "skip"` makes both the installed-here and
+# not-installed-in-CI cases behave identically: the module is `Any` either way.
+module = ["ultralytics.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

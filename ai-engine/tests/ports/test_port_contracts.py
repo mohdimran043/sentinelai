@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector
 from sentinel_ai.domain.entities import (
     BBox,
     Detection,
@@ -125,6 +126,14 @@ def test_lifecycle_states_cover_all_eight_from_spec_section_5() -> None:
 )
 def test_fakes_satisfy_their_ports(fake: type, port: type) -> None:
     assert issubclass(fake, port)
+
+
+def test_yolo11_detector_satisfies_object_detector_and_model_runtime() -> None:
+    """Class-level only — no instantiation, no weights, no GPU needed, so
+    this belongs beside the fakes' contract checks, not behind @pytest.mark.gpu.
+    """
+    assert issubclass(Yolo11Detector, ObjectDetector)
+    assert issubclass(Yolo11Detector, ModelRuntime)
 
 
 class TestFakeDetector:
