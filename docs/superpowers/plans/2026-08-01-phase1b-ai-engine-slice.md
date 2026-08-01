@@ -6478,7 +6478,24 @@ EOF
 - **Device selection.** `device` is a required constructor argument (S13), not computed internally, because Ultralytics does not probe CUDA availability itself — passing `device="cuda"` on a machine with none raises deep inside torch, not at construction, which would be a confusing place to discover it. `select_device()` is the one place that calls `torch.cuda.is_available()` and returns `"cuda"` or `"cpu"`; whatever composes this adapter (already-landed orchestrator wiring, out of this task's file scope) is expected to call it before constructing.
 - **COCO name mapping.** Ultralytics' bundled `coco.yaml` (ships inside the `ultralytics` package, no download needed) names index 0 `person`, 1 `bicycle`, 2 `car`, 3 `motorcycle`, 5 `bus`, 7 `truck`, 24 `backpack`, 26 `handbag`, 28 `suitcase` — an exact string match, lowercase and singular, for every member of `DEFAULT_SALIENT_CLASSES`. `initialize()` asserts `DEFAULT_SALIENT_CLASSES <= set(model.names.values())` at load time and raises loudly (marking the runtime `UNHEALTHY`) rather than silently proceeding, because a mismatched `names` mapping (e.g. a custom-trained checkpoint) would otherwise disable every salient-class escalation trigger with no error anywhere.
 - **Thresholds.** `conf`/`iou`/`imgsz` are passed straight through to `model.predict(...)` per call; the constructor just stores them (`detector_conf_threshold`, `detector_iou_threshold`, `detector_imgsz` from S1).
-- **`Capabilities`.** `vram_mib` is measured, not guessed: `warmup()` runs one real inference and then reads `torch.cuda.memory_allocated()`, so `capabilities().vram_mib` is 0 until warmed and real afterward. `labels` is the live `model.names` set, not a hardcoded literal — so a future checkpoint swap can never drift silently from what `capabilities()` reports.
+- **`Capabilities`.** `vram_mib` is measured, not guessed: `warmup()` runs one real inference and then reads the VRAM cost, so `capabilities().vram_mib` is 0 until warmed and real afterward.
+> **CORRECTED 2026-08-01 after the Task 11 review.** `torch.cuda.memory_allocated()` counts only
+> currently-live tensors. It excludes the caching allocator's reserved pool, the CUDA context
+> itself (~150–300 MiB, created on first kernel launch and held until process exit), and
+> cuDNN/cuBLAS workspaces — all of which `nvidia-smi` sees and the GPU genuinely holds. Measured
+> on YOLO11s: `memory_allocated()` 68 MiB, `memory_reserved()` 132 MiB, real `nvidia-smi` delta
+> ~281 MiB. A ~4× understatement.
+>
+> This number feeds `plan_residency()`, the system's GPU admission control, which does hard
+> arithmetic against 6144 MiB usable. Under-reporting makes it authorise residency combinations
+> that do not fit, and the OOM surfaces on whichever model allocates next — plausibly the VLM
+> mid-escalation.
+>
+> **Use `torch.cuda.memory_reserved()` plus `_CUDA_CONTEXT_OVERHEAD_MIB` (a documented constant,
+> 300 MiB) rather than `memory_allocated()`.** The constant is a deliberate over-estimate: the
+> planner erring toward evicting one model too early is recoverable; erring toward an OOM
+> mid-escalation is not.
+ `labels` is the live `model.names` set, not a hardcoded literal — so a future checkpoint swap can never drift silently from what `capabilities()` reports.
 - **`FrameData.pixels` narrowing.** `pixels` is typed `object` at the port boundary (it carries a numpy array at runtime, but the port cannot import numpy). `detect()` does an explicit `isinstance(frame.pixels, np.ndarray)` check and raises `TypeError` naming the offending type otherwise — this is the narrowing mypy strict needs, and it turns a silent wrong-type bug into a loud one.
 - **Threading.** `detect()` offloads the blocking Ultralytics call to the default executor itself via `loop.run_in_executor`, so it is safe to call directly from the pipeline's event loop regardless of whether `CameraRunner` (spec §5.3) also wraps it in its own executor — a harmless redundant hop if so.
 
@@ -6717,7 +6734,8 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
         import torch
 
         if torch.cuda.is_available():
-            self._vram_mib = int(torch.cuda.memory_allocated(self._device) // (1024 * 1024))
+            reserved = torch.cuda.memory_reserved(self._device) // (1024 * 1024)
+            self._vram_mib = int(reserved) + _CUDA_CONTEXT_OVERHEAD_MIB
         self._state = LifecycleState.HEALTHY
 
     async def detect(self, frame: FrameData) -> tuple[Detection, ...]:
@@ -7089,7 +7107,7 @@ pins <0.28 to dodge ByteTrack's deprecation warning under -W error."
 - **Parsing robustness.** `_parse_response` finds the first `{...}` block, `json.loads`s it, validates the three required keys and types, and clamps `threat_value` into `[0, 1]` (a raw value of `1.4` or `-0.2` must not blow up `ThreatScore.from_value` downstream). Any failure at any step — no JSON found, invalid JSON, wrong types, missing keys — falls through to a fixed, safe `SceneDescription` built from the raw text, **not an exception**: a VLM that returns prose instead of JSON is a formatting slip, not an infrastructure failure, and per spec §9 must not be confused with the timeout/OOM path that flags `description_unavailable=True` at the scheduler (S14). This class's `describe()` always returns a `SceneDescription`.
 - **No model identity leak (spec §3.3).** Neither `_build_text_prompt` nor `_parse_response` nor the `SceneDescription` they produce ever contains "Qwen" or any model name. `version()` and `Capabilities.model_key` do carry the model id, but that is orchestrator-internal (the registry's health view) — a different boundary than the published `Event`, which is assembled elsewhere (S14) from `SceneDescription` alone.
 - **Idle-unload interaction.** The 600 s idle-unload (`vlm_idle_unload_seconds`, S1) is entirely `ResidentSet`'s decision (Task 7, already landed) via `ModelSpec(idle_unload_seconds=600.0)` — this class has no timer of its own. Its only obligations toward that mechanism: `shutdown()` must actually free VRAM (`del` the model, `torch.cuda.empty_cache()`) so the 600 s reclaim is real, not nominal, and `initialize()` must be safe to call again afterward so `ResidentSet.ensure()` can reload on the next escalation.
-- **`Capabilities.vram_mib` measured, not guessed.** `warmup()` runs one real `describe()` call (on a synthetic frame) and then reads `torch.cuda.memory_allocated()`. Spec §7 puts the bitsandbytes fallback at "~3.5 GB"; the AWQ path is expected to land near the same figure. Neither number is hardcoded — this is what the spike's own measurement is for.
+- **`Capabilities.vram_mib` measured, not guessed.** `warmup()` runs one real `describe()` call (on a synthetic frame) and then reads `torch.cuda.memory_reserved()` plus `_CUDA_CONTEXT_OVERHEAD_MIB` — see the correction under Task 11; do NOT use `memory_allocated()`. Spec §7 puts the bitsandbytes fallback at "~3.5 GB"; the AWQ path is expected to land near the same figure. Neither number is hardcoded — this is what the spike's own measurement is for.
 - **Keyframe handoff.** `VisionRequest.keyframe.pixels` is `object` at the port boundary; `describe()` does the same `isinstance(..., np.ndarray)` narrowing as `Yolo11Detector.detect`, then wraps it as `PIL.Image.fromarray(...)` for the processor's chat-template image slot.
 - **Determinism.** `do_sample=False, num_beams=1` (greedy decoding) — so the same frame and the same prompt produce a comparable description run to run, which matters for dedup/testing and for a human reviewing two similar events.
 
@@ -7416,7 +7434,8 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
         await self.describe(request)
         assert self._torch is not None
         if self._torch.cuda.is_available():
-            self._vram_mib = int(self._torch.cuda.memory_allocated(self._device) // (1024 * 1024))
+            reserved = self._torch.cuda.memory_reserved(self._device) // (1024 * 1024)
+            self._vram_mib = int(reserved) + _CUDA_CONTEXT_OVERHEAD_MIB
         self._state = LifecycleState.HEALTHY
 
     async def describe(self, request: VisionRequest) -> SceneDescription:
