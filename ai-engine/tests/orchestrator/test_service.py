@@ -19,7 +19,13 @@ from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 from sentinel_ai.ports.model_runtime import LifecycleState
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
-from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.io import (
+    FakeClipHandle,
+    FakeClipWriter,
+    FakeFailedEventSink,
+    FakePublisher,
+    FakeSource,
+)
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
 DETECTOR_SPEC = ModelSpec(model_key="yolo11s", vram_mib=900, priority=100, idle_unload_seconds=None)
@@ -48,6 +54,7 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
+        dead_letter=FakeFailedEventSink(),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -283,6 +290,7 @@ async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
+        dead_letter=FakeFailedEventSink(),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -343,6 +351,7 @@ async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> N
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
+        dead_letter=FakeFailedEventSink(),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -462,6 +471,7 @@ async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
+        dead_letter=FakeFailedEventSink(),
         maxsize=4,
         timeout_seconds=5.0,
         clock=ticking_clock,

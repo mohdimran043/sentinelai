@@ -73,6 +73,7 @@ from uuid import UUID
 from fastapi import FastAPI
 
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector, select_device
+from sentinel_ai.adapters.publishers.dead_letter import DeadLetterSpool
 from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
 from sentinel_ai.adapters.sources.file import FileSource
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
@@ -92,6 +93,7 @@ from sentinel_ai.pipeline.runner import CameraRunner, CameraTelemetry
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from sentinel_ai.ports.clip_writer import ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
+from sentinel_ai.ports.event_publisher import FailedEventSink
 from sentinel_ai.ports.frame_source import FrameSource
 from sentinel_ai.ports.model_runtime import HealthReport
 from sentinel_ai.ports.vision_llm import VisionLanguageModel
@@ -107,6 +109,7 @@ __all__ = [
     "Models",
     "app",
     "build_clip_writer",
+    "build_dead_letter",
     "build_models",
     "build_publisher",
     "build_source",
@@ -322,6 +325,10 @@ def build_publisher(settings: Settings) -> RabbitMQPublisher:
     )
 
 
+def build_dead_letter(settings: Settings) -> FailedEventSink:
+    return DeadLetterSpool(Path(settings.dead_letter_dir))
+
+
 def build_clip_writer(settings: Settings) -> ClipWriter:
     return MinioClipWriter(
         endpoint=settings.minio_endpoint,
@@ -441,6 +448,7 @@ def compose(
     models: Models,
     publisher: RabbitMQPublisher,
     clip_writer: ClipWriter | None,
+    dead_letter: FailedEventSink,
 ) -> Composition:
     """Wire everything into one `EngineService`. Call with a running event loop.
 
@@ -462,6 +470,7 @@ def compose(
         ),
         resident_set=resident_set,
         vlm_model_key=models.vlm_key,
+        dead_letter=dead_letter,
         maxsize=settings.vlm_queue_maxsize,
         timeout_seconds=settings.vlm_timeout_seconds,
         # Real elapsed time, deliberately: `AdmissionGate` spaces admissions with
@@ -588,6 +597,7 @@ def create_default_app() -> FastAPI:
             build_models(settings),
             build_publisher(settings),
             build_clip_writer(settings),
+            build_dead_letter(settings),
         )
 
     return create_app(ComposedService(build))

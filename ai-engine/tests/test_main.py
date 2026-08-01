@@ -439,7 +439,14 @@ def composed(tmp_path: Path, **overrides: object) -> tuple[Composition, Settings
         **overrides,  # type: ignore[arg-type]
     )
     cameras = (CameraConfig("cam-1", "Camera One", str(ASSET), _profile("cam-1")),)
-    composition = compose(settings, cameras, fake_models(), main.build_publisher(settings), None)
+    composition = compose(
+        settings,
+        cameras,
+        fake_models(),
+        main.build_publisher(settings),
+        None,
+        main.build_dead_letter(settings),
+    )
     # The one thing CI may not have: a broker. `compose` builds a real `BrokerLink`
     # over the real publisher (asserted structurally in `TestCompose`); here it is
     # swapped for one whose link is permanently down, which is also the state that
@@ -496,6 +503,7 @@ class TestCompose:
             fake_models(),
             publisher,
             None,
+            main.build_dead_letter(settings),
         )
         assert composition.publisher is publisher
         assert composition.broker._publisher is publisher

@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     Spec §9's disk buffer is only half a guarantee without something that replays
     it; this is the period of the component that does."""
 
+    dead_letter_dir: str = "./var/spool/dead-letter"
+    """Last resort for an event the publisher itself would not take (spec §9).
+    Distinct from `event_spool_dir`, which holds validated payloads waiting for a
+    broker that is merely down; this one holds events that failed for a reason
+    replay cannot fix, so mixing them would strand the healthy spool."""
+
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "sentinel"
     minio_secret_key: str = "sentinel123"

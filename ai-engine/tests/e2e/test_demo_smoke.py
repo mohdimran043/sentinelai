@@ -25,7 +25,7 @@ from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
-from tests.fakes.io import FakePublisher
+from tests.fakes.io import FakeFailedEventSink, FakePublisher
 
 AVENUE_CLIP = Path(__file__).resolve().parents[3] / "datasets" / "avenue" / "avenue_01.mp4"
 
@@ -64,6 +64,7 @@ async def test_full_pipeline_produces_a_real_event_with_real_models() -> None:
         admission,
         resident_set=resident_set,
         vlm_model_key=VLM_SPEC.model_key,
+        dead_letter=FakeFailedEventSink(),
         maxsize=4,
         timeout_seconds=30.0,
         clock=time.monotonic,

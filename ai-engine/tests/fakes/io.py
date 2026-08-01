@@ -9,7 +9,7 @@ import numpy as np
 
 from sentinel_ai.domain.entities import Event
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
-from sentinel_ai.ports.event_publisher import EventPublisher
+from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 
 
@@ -106,6 +106,23 @@ class FakePublisher(EventPublisher):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeFailedEventSink(FailedEventSink):
+    """Records what the publisher would not take. Never raises, per the port."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.stored: list[tuple[Event, BaseException]] = []
+        self._error = error
+
+    async def store(self, event: Event, error: BaseException) -> None:
+        if self._error is not None:
+            raise self._error
+        self.stored.append((event, error))
+
+    @property
+    def events(self) -> list[Event]:
+        return [event for event, _ in self.stored]
 
 
 class FakeClipHandle(ClipHandle):

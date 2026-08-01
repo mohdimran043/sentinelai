@@ -21,7 +21,7 @@ from sentinel_ai.pipeline import runner as runner_module
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData
-from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.io import FakeClipWriter, FakeFailedEventSink, FakePublisher, FakeSource
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
 NEAR = Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0))
@@ -209,6 +209,7 @@ def new_scheduler(
         admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=new_resident_set(),
         vlm_model_key=VLM_KEY,
+        dead_letter=FakeFailedEventSink(),
         maxsize=maxsize,
         timeout_seconds=5.0,
         clock=lambda: 0.0,

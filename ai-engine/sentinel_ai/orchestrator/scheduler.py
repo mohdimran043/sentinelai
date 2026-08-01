@@ -9,16 +9,28 @@ when it happens the drop is counted, never raised.
 Event assembly happens here and only here (S14): this is the one place in the system
 that constructs an `Event`. Every error path below still produces one — spec §9's
 governing rule is that an anomaly event is never lost to an infrastructure failure.
-That rule is enforced in three places:
+That rule is enforced in four places:
 
   * a failed or timed-out `describe()` -- or one that returns an unusable threat
     value -- yields a metadata-derived description flagged
     `description_unavailable=True`;
   * a failed `ClipHandle.finish()` yields an event with `clip_uri=None`;
-  * a failure anywhere — including the publisher itself — still releases the admission
-    slot in a `finally` and leaves the worker alive for the next escalation. A leaked
-    slot at concurrency 1 wedges the GPU for the lifetime of the process, and a worker
-    that dies on one poisoned request silently stops describing everything after it.
+  * a `publish()` that *raises* hands the event to the `FailedEventSink` instead of
+    dropping it, and counts it in `publish_failures`;
+  * a failure anywhere still releases the admission slot in a `finally` and leaves the
+    worker alive for the next escalation. A leaked slot at concurrency 1 wedges the
+    GPU for the lifetime of the process, and a worker that dies on one poisoned
+    request silently stops describing everything after it.
+
+The third of those is the boundary worth being precise about. `RabbitMQPublisher`
+already spools when the *broker* is unreachable, and that is the common case; it
+returns normally, so nothing here fires and the event is not handled twice. But three
+reachable paths raise out of `publish()` instead — a schema-invalid event
+(`encode_event` validates before the transport guard), a spool directory that cannot
+be written, and any unexpected transport error — and each of those used to end with
+the event existing nowhere. The sink is here rather than inside the publisher because
+spec §9 is a property of the system, not of RabbitMQ: it has to hold for whatever
+`EventPublisher` is wired in.
 
 VLM residency
 -------------
@@ -63,7 +75,7 @@ from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, Thr
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.ports.clip_writer import ClipHandle
-from sentinel_ai.ports.event_publisher import EventPublisher
+from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.frame_source import FrameData
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 
@@ -145,6 +157,7 @@ class VlmScheduler:
         *,
         resident_set: ResidentSet,
         vlm_model_key: str,
+        dead_letter: FailedEventSink,
         maxsize: int,
         timeout_seconds: float,
         clock: Callable[[], float],
@@ -154,10 +167,15 @@ class VlmScheduler:
         self._admission = admission
         self._resident_set = resident_set
         self._vlm_model_key = vlm_model_key
+        # Required, not optional, for the same reason `resident_set` is: an
+        # unwired last resort is indistinguishable from no last resort, and the
+        # failure it guards against is silent by construction.
+        self._dead_letter = dead_letter
         self._timeout_seconds = timeout_seconds
         self._clock = clock
         self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
+        self._publish_failures = 0
 
     def submit(self, request: EscalationRequest) -> bool:
         """Non-blocking. Returns False and counts a drop when the queue is full.
@@ -207,15 +225,42 @@ class VlmScheduler:
     def dropped(self) -> int:
         return self._dropped
 
+    @property
+    def publish_failures(self) -> int:
+        """Events the publisher refused and the dead-letter sink took instead.
+
+        A counter distinct from `dropped`: a drop is the queue rejecting an
+        escalation under load, which the governors make an expected event, while
+        this is an assembled event that could not be delivered. All three of the
+        paths this covers previously left `dropped == 0`, so the loss showed up in
+        no counter at all.
+        """
+        return self._publish_failures
+
     async def _process(self, request: EscalationRequest) -> None:
         await self._admission.acquire(self._clock())
         try:
             await self._ensure_vlm_resident()
             event = await self._describe(request)
             event = await self._attach_clip(event, request)
-            await self._publisher.publish(event)
+            await self._publish(event)
         finally:
             self._admission.release(self._clock())
+
+    async def _publish(self, event: Event) -> None:
+        """Publish, and keep the event if the publisher will not take it (spec §9).
+
+        A raise from `publish()` means the publisher handled nothing — a spooling
+        publisher returns normally, so the disk spool and this sink never both act on
+        the same event. The exception is swallowed after the event is safe: re-raising
+        would abandon the admission slot to the `finally` above and log the same
+        failure twice, and there is nothing further the worker could do about it.
+        """
+        try:
+            await self._publisher.publish(event)
+        except Exception as error:
+            self._publish_failures += 1
+            await self._dead_letter.store(event, error)
 
     async def _ensure_vlm_resident(self) -> None:
         """Reload an evicted VLM, and freshen its idle clock so it is not evicted again

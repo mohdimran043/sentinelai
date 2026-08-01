@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import replace
+from pathlib import Path
 from types import TracebackType
 from uuid import uuid4
 
 import pytest
+from jsonschema import ValidationError
 
+from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import (
     BBox,
@@ -25,10 +29,10 @@ from sentinel_ai.orchestrator.scheduler import (
     _is_out_of_memory,
 )
 from sentinel_ai.ports.clip_writer import ClipHandle
-from sentinel_ai.ports.event_publisher import EventPublisher
+from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.model_runtime import LifecycleState
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
-from tests.fakes.io import FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.io import FakeClipWriter, FakeFailedEventSink, FakePublisher, FakeSource
 from tests.fakes.models import FakeModelRuntime, FakeVisionLLM
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
@@ -181,6 +185,7 @@ def new_scheduler(
     admission: AdmissionGate | None = None,
     timeout_seconds: float = 5.0,
     resident_set: ResidentSet | None = None,
+    dead_letter: FailedEventSink | None = None,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -195,6 +200,7 @@ def new_scheduler(
         admission=admission or AdmissionGate(concurrency=1, min_interval_seconds=0.0),
         resident_set=resident_set or RecordingResidentSet(),
         vlm_model_key=VLM_KEY,
+        dead_letter=dead_letter or FakeFailedEventSink(),
         maxsize=maxsize,
         timeout_seconds=timeout_seconds,
         clock=clock,
@@ -638,6 +644,131 @@ class TestNeverLoseAnEvent:
         assert admission.in_flight == 0
 
 
+class TestAPublisherFailureNeverLosesTheEvent:
+    """Spec §9's last mile. `RabbitMQPublisher` spools when the *broker* is down and
+    returns normally, so that path is already safe and must not be handled twice. The
+    three paths that *raise* out of `publish()` all used to end with the event existing
+    nowhere and every counter reading zero.
+
+    Each case below runs the real `RabbitMQPublisher`, not a fake that raises: the
+    point is that these are reachable through the shipped adapter.
+    """
+
+    @staticmethod
+    def _publisher(spool_dir: Path) -> RabbitMQPublisher:
+        return RabbitMQPublisher(
+            url="amqp://unused", exchange="sentinel.events", spool_dir=spool_dir
+        )
+
+    async def test_the_ordinary_broker_outage_still_spools_and_is_not_double_handled(
+        self, tmp_path: Path
+    ) -> None:
+        """The boundary. A spooling publish returns normally, so the dead-letter sink
+        must stay untouched — otherwise every offline event would be recorded twice,
+        once as recoverable and once as lost."""
+        publisher = self._publisher(tmp_path / "spool")
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(publisher=publisher, dead_letter=dead_letter)
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert len(list((tmp_path / "spool").glob("*.json"))) == 1
+        assert dead_letter.stored == []
+        assert scheduler.publish_failures == 0
+
+    async def test_a_schema_invalid_event_is_kept_instead_of_vanishing(
+        self, tmp_path: Path
+    ) -> None:
+        """`encode_event` validates *before* the transport guard, so a payload the
+        schema rejects raises straight out of `publish()` — past the spool. Provoked
+        here with an empty `camera_id`, which `Event` permits and the schema does not.
+
+        Fails against the old scheduler with `dead_letter.stored == []` and no spool
+        file either: the event was gone.
+        """
+        publisher = self._publisher(tmp_path / "spool")
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(publisher=publisher, dead_letter=dead_letter)
+        request = replace(a_request(), camera_id="")
+
+        async with Worker(scheduler):
+            scheduler.submit(request)
+            await scheduler.drain()
+
+        assert list((tmp_path / "spool").glob("*.json")) == [], "the schema rejected it"
+        assert [event.event_id for event in dead_letter.events] == [request.event_id]
+        assert isinstance(dead_letter.stored[0][1], ValidationError)
+        assert scheduler.publish_failures == 1
+
+    async def test_a_spool_that_cannot_be_written_is_not_the_end_of_the_event(
+        self, tmp_path: Path
+    ) -> None:
+        """`_spool` is called *from* the transport-error handler and from the
+        `_exchange is None` branch, neither of which guards it, so an `OSError` there
+        escapes `publish()` entirely — the disk-backed buffer failing takes the event
+        with it."""
+        spool = tmp_path / "spool"
+        publisher = self._publisher(spool)
+        spool.chmod(0o500)  # readable, not writable
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(publisher=publisher, dead_letter=dead_letter)
+        try:
+            async with Worker(scheduler):
+                scheduler.submit(a_request())
+                await scheduler.drain()
+        finally:
+            spool.chmod(0o700)
+
+        assert isinstance(dead_letter.stored[0][1], OSError)
+        assert scheduler.publish_failures == 1
+
+    async def test_an_unexpected_publisher_error_is_kept_and_counted_apart_from_drops(
+        self,
+    ) -> None:
+        """`dropped` counts the queue rejecting an escalation under load, which the
+        governors make expected. This is an assembled event that could not be
+        delivered, and it needs its own number: all three paths above previously left
+        `dropped == 0`, so the loss appeared in no counter at all."""
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(
+            publisher=FakePublisher(error=RuntimeError("transport exploded")),
+            dead_letter=dead_letter,
+        )
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert scheduler.publish_failures == 1
+        assert scheduler.dropped == 0
+        assert len(dead_letter.stored) == 1
+
+    async def test_a_dead_letter_sink_that_itself_fails_does_not_kill_the_worker(
+        self,
+    ) -> None:
+        """The port says `store` must not raise. If one does anyway, the loss is
+        already unavoidable — but it must not also stop every later escalation from
+        being described, and it must not leak the admission slot."""
+        admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
+        publisher = FlakyPublisher(fail_first=1)
+        scheduler = new_scheduler(
+            publisher=publisher,
+            admission=admission,
+            dead_letter=FakeFailedEventSink(error=OSError("disk full")),
+        )
+
+        async with Worker(scheduler):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert len(publisher.events) == 1, "the worker survived and published the second"
+        assert admission.in_flight == 0
+
+
 class TestAdmissionSlotIsNeverLeaked:
     async def test_a_publish_failure_still_releases_the_slot_and_the_worker_survives(
         self,
@@ -651,7 +782,8 @@ class TestAdmissionSlotIsNeverLeaked:
         """
         admission = AdmissionGate(concurrency=1, min_interval_seconds=0.0)
         publisher = FlakyPublisher(fail_first=1)
-        scheduler = new_scheduler(publisher=publisher, admission=admission)
+        dead_letter = FakeFailedEventSink()
+        scheduler = new_scheduler(publisher=publisher, admission=admission, dead_letter=dead_letter)
 
         async with Worker(scheduler):
             scheduler.submit(a_request())
@@ -659,6 +791,11 @@ class TestAdmissionSlotIsNeverLeaked:
 
             assert publisher.attempts == 1
             assert publisher.events == [], "the first publish failed"
+            # This assertion used to stop at the line above, which made the loss the
+            # specification: spec §9 says the event survives an infrastructure
+            # failure, and the publisher refusing it is one.
+            assert len(dead_letter.stored) == 1, "the refused event is kept, not dropped"
+            assert scheduler.publish_failures == 1
             assert admission.in_flight == 0, "the slot must be released even on failure"
 
             # Proof the gate is genuinely reusable, not merely reporting zero.
