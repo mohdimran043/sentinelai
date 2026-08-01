@@ -27,12 +27,11 @@
       "id": "replay_01",
       "label": "Recorded footage (file replay)",
       "url": "./datasets/avenue/avenue_01.mp4",
-      "zone": "room",
       "profile": {
         "cooldown_seconds": 5.0,
         "summary_interval_seconds": 45.0
       },
-      "_note": "Not a URL \u2014 anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description."
+      "_note": "Not a URL \u2014 anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description. Deliberately has no zone: the field is optional, and this is what an ungrouped camera looks like. Give it one from the console (PATCH /cameras/replay_01) and this file is rewritten in place."
     }
   ]
 }

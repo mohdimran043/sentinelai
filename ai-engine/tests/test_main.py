@@ -83,8 +83,8 @@ def test_settings_default_camera_file_and_the_example_file_agree() -> None:
     config that the loader rejects is worse than none."""
     example = Path(__file__).resolve().parents[1] / "cameras.example.json"
     cameras = load_cameras(example)
-    assert [camera.camera_id for camera in cameras] == ["avenue_01", "replay_01"]
-    assert cameras[1].profile.cooldown_seconds == 5.0
+    assert [camera.camera_id for camera in cameras] == ["avenue_01", "demo_live", "replay_01"]
+    assert cameras[2].profile.cooldown_seconds == 5.0
 
 
 class TestCameraConfig:
