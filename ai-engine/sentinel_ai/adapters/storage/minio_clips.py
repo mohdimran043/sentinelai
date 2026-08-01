@@ -122,6 +122,7 @@ class _RemuxSession:
         self._out_stream: av.VideoStream | None = None
         self._pts_queue: deque[float] = deque()
         self._start_pts: float | None = None
+        self._last_ticks: int | None = None
         self._closed = False
 
     @property
@@ -205,6 +206,23 @@ class _RemuxSession:
         # PTS/DTS rebasing: the clip's own clock starts at 0 regardless of where the
         # camera's monotonic pts happened to be.
         ticks = round((au_pts - self._start_pts) / float(_OUTPUT_TIME_BASE))
+        if self._last_ticks is not None and ticks <= self._last_ticks:
+            # A non-increasing DTS makes ffmpeg's mov muxer return EINVAL, which reaches
+            # here as `av.error.ArgumentError: ... returned 22` — the 1-in-5 clip loss.
+            # It is not a rare race: on RTSP `au_pts` is packet *arrival* time
+            # (`rtsp.py`), and a TCP-interleaved socket delivers a burst after any
+            # stall, so two access units routinely land inside one 11.1 us tick and
+            # `round()` maps them to the same integer. Arrival order regressing
+            # outright does the same thing.
+            #
+            # Nudging to `last + 1` rather than dropping the access unit: one tick is
+            # 1/90 000 s, so the displacement is three orders of magnitude below a frame
+            # at any framerate in scope and invisible on playback, while dropping would
+            # silently delete evidence — and a burst is exactly the moment something is
+            # happening. It only ever moves a timestamp forward, so the rebased zero
+            # point and the clip's overall span are untouched.
+            ticks = self._last_ticks + 1
+        self._last_ticks = ticks
         parsed.pts = ticks
         parsed.dts = ticks  # no B-frames on the low-latency IPPP profiles in scope
         parsed.time_base = _OUTPUT_TIME_BASE

@@ -8,7 +8,9 @@ excluded from CI.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
+from itertools import pairwise
 from pathlib import Path
 from uuid import uuid4
 
@@ -64,6 +66,30 @@ def _annexb_packets_from_fixture(camera_id: str) -> list[EncodedPacket]:
     # keyframe to land on.
     assert any(p.is_keyframe for p in packets[1:]), "fixture needs a second keyframe"
     return packets
+
+
+def _sub_tick_pair(packets: list[EncodedPacket]) -> list[EncodedPacket]:
+    """Two access units 1 µs apart — inside a single 1/90 000 s output tick."""
+    shaped = list(packets)
+    shaped[3] = replace(shaped[3], pts=shaped[2].pts + 1e-6)
+    return shaped
+
+
+def _tcp_burst(packets: list[EncodedPacket]) -> list[EncodedPacket]:
+    """Seven access units stamped with one arrival instant — what a TCP-interleaved
+    RTSP socket delivers the moment a stall clears."""
+    shaped = list(packets)
+    for index in range(2, 9):
+        shaped[index] = replace(shaped[index], pts=packets[2].pts)
+    return shaped
+
+
+def _arrival_regression(packets: list[EncodedPacket]) -> list[EncodedPacket]:
+    """One access unit that arrives *before* its predecessor. `au_pts` is arrival
+    time, not encoder time, so nothing guarantees it is ordered."""
+    shaped = list(packets)
+    shaped[4] = replace(shaped[4], pts=packets[3].pts - 0.005)
+    return shaped
 
 
 class TestRemuxSession:
@@ -213,6 +239,102 @@ class TestRemuxSession:
         muxed_span = float((last_pts - first_pts) * time_base)
         assert muxed_span == pytest.approx(packets[-1].pts - packets[0].pts, abs=1e-4), (
             "rebasing moves the origin; it must not stretch or compress the timeline"
+        )
+
+    @pytest.mark.parametrize(
+        ("shape", "make"),
+        [
+            ("sub_tick_pair", _sub_tick_pair),
+            ("tcp_burst", _tcp_burst),
+            ("arrival_regression", _arrival_regression),
+        ],
+    )
+    def test_arrival_timestamps_that_are_not_strictly_increasing_still_remux(
+        self,
+        tmp_path: Path,
+        shape: str,
+        make: Callable[[list[EncodedPacket]], list[EncodedPacket]],
+    ) -> None:
+        """B4 — the 1-in-5 clip loss, reproduced on CPU with no RTSP.
+
+        `_mux` converted `au_pts` to 1/90 000 ticks with `round()` and muxed with no
+        monotonicity guard. On RTSP `au_pts` is packet *arrival* time (`rtsp.py` stamps
+        it from the receive side), and a TCP-interleaved socket delivers a burst after
+        any stall — so two access units routinely land inside one 11.1 µs tick and
+        `round()` maps them onto the same integer. ffmpeg's mov muxer then gets a
+        non-increasing DTS and returns EINVAL, which surfaces as
+        `av.error.ArgumentError: ... returned 22` — the exact error in 9ae73ac's commit
+        message, and the whole clip is lost.
+
+        This was invisible because every existing test here feeds evenly spaced pts:
+        the fixture is a 25 fps encode, so consecutive packets are 3600 ticks apart and
+        no amount of rounding can collide them. Each of the three shapes below raises
+        `ArgumentError` against the unguarded `_mux`.
+
+        The assertions are deliberately stronger than "did not raise": every appended
+        packet must reach the file (a guard that dropped colliding access units would
+        pass a not-raises test while silently deleting evidence from exactly the burst
+        where something is happening), the DTS sequence must be strictly increasing,
+        and the clip must still start at its own zero.
+        """
+        packets = make(_annexb_packets_from_fixture("cam-1"))
+        temp_path = tmp_path / "clip.mp4"
+
+        session = _RemuxSession(temp_path, fps=25.0)
+        for packet in packets:
+            session.append(packet)
+        session.finish()
+
+        out = av.open(str(temp_path))
+        out_stream = out.streams.video[0]
+        out_packets = [p for p in out.demux(out_stream) if p.dts is not None]
+        out.close()
+
+        assert len(out_packets) == len(packets), f"{shape}: an access unit was dropped"
+        # `out_packets` is already filtered on `p.dts is not None`; the comprehension
+        # re-states it so mypy sees `list[int]` rather than `list[int | None]`.
+        dts = [p.dts for p in out_packets if p.dts is not None]
+        assert all(later > earlier for earlier, later in pairwise(dts)), (
+            f"{shape}: the muxer needs a strictly increasing dts, got {dts[:12]}"
+        )
+        assert out_packets[0].pts == 0, f"{shape}: the clip must still start at its own zero"
+
+    def test_a_sub_tick_nudge_moves_the_timestamp_by_one_tick_and_no_more(
+        self, tmp_path: Path
+    ) -> None:
+        """The guard must be a nudge, not a re-timing.
+
+        A fix that resolved the collision by spacing packets out (say `last + 3600`)
+        would also pass the test above, and would stretch a 2-second clip into a
+        several-second one whose audio-free playback runs slow. One tick is 1/90 000 s
+        — three orders of magnitude below a frame at any framerate in scope — so the
+        collided access unit must land exactly one tick after its predecessor and every
+        later packet must keep its own true position.
+        """
+        packets = _sub_tick_pair(_annexb_packets_from_fixture("cam-1"))
+        temp_path = tmp_path / "clip.mp4"
+
+        session = _RemuxSession(temp_path, fps=25.0)
+        for packet in packets:
+            session.append(packet)
+        session.finish()
+
+        out = av.open(str(temp_path))
+        out_stream = out.streams.video[0]
+        out_packets = [p for p in out.demux(out_stream) if p.dts is not None]
+        assert out_stream.time_base is not None
+        time_base = out_stream.time_base
+        out.close()
+
+        # packets[2] and packets[3] collide; the nudged one is the fourth muxed packet.
+        collided, nudged = out_packets[2].pts, out_packets[3].pts
+        assert collided is not None and nudged is not None
+        assert nudged == collided + 1, "the collision must cost one tick"
+        last_pts = out_packets[-1].pts
+        assert last_pts is not None
+        muxed_span = float(last_pts * time_base)
+        assert muxed_span == pytest.approx(packets[-1].pts - packets[0].pts, abs=1e-4), (
+            "nudging one access unit must not stretch the clip's timeline"
         )
 
     def test_unsupported_codec_raises_on_the_first_packet(self, tmp_path: Path) -> None:
