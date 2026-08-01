@@ -25,6 +25,41 @@ Spec §3.3: the event carries no model identity. `_build_text_prompt` and
 `SceneDescription` this class returns; `version()` and
 `Capabilities.model_key` are orchestrator-internal (the registry's health
 view) — a different boundary from the published event.
+
+Harm assessment: what it is, and what it is not
+-----------------------------------------------
+`_build_text_prompt` asks the model to check the keyframe specifically for a
+person who is collapsed, fallen or unresponsive, for a physical altercation
+between people, and for other apparent distress or harm, and to weight
+`threat_value` upwards when it sees one. That is worth having — without it a
+fight comes back as calm prose scored 0.2, which is worse than useless for
+triage. But it is **a vision-language model's opinion about one still frame**,
+and nothing downstream may treat it as a trained classifier:
+
+  * **Sampled, not continuous.** The frame the model sees is the keyframe of an
+    escalation the gate already chose to spend a GPU slot on (spec §4.1's seven
+    triggers), and `CameraProfile`'s token bucket and cooldown bound how often
+    that happens — roughly once per 10 s per camera at most. A fall that begins
+    and ends between two escalations is never looked at by anything.
+  * **No pose or action recognition anywhere in this phase.**
+    `adapters/detectors/yolo11.py` is an object detector: it reports that a
+    `person` box exists, never what that person is doing. Nothing in Phase 1B
+    estimates pose, tracks limbs, or classifies actions. Spec §4 defers
+    behaviour detection and the 18 anomaly detectors to Phase 4, and this
+    prompt is not a down payment on them.
+  * **Fallible in both directions.** A single frame cannot reliably separate
+    someone lying down from someone who has collapsed, or horseplay from an
+    assault, and the model will confidently assert either. Treat a high
+    `threat_score` as a reason to look at the clip, never as a finding.
+  * **No new event reason.** The seven `EscalationReason` values are unchanged.
+    There is deliberately no `fight_detected` reason, because a reason of that
+    name would imply a detector that does not exist.
+
+The assessment reaches the wire only through the fields that already exist:
+prose in `description`, weighting in `threat_score`/`severity`. Nothing was
+added to `contracts/events/anomaly_event.schema.json` for it, precisely because
+a dedicated structured field (`fall_detected: true`) would read to the Phase 1C
+consumer as a detector output with a detector's reliability.
 """
 
 from __future__ import annotations
@@ -72,6 +107,72 @@ whatever real scene detail the raw text might have carried on this
 in `_parse_response` for operators — logs are operator-facing infrastructure,
 not the published event, so that is not a spec §3.3 concern.
 """
+
+HARM_CHECKS: tuple[str, ...] = (
+    "a person who is collapsed, fallen, lying on the ground, or appears unresponsive",
+    "a physical altercation between people — fighting, striking, grappling, pushing",
+    "any other apparent distress or harm to a person — someone being restrained or "
+    "dragged, someone clutching an injury, someone fleeing, a weapon held or raised",
+)
+"""The three things the prompt makes the model look for by name.
+
+Named and enumerated rather than buried in one long paragraph so the set is
+reviewable, testable, and extendable without rewriting the prompt around it.
+Public (no underscore) because `tests/adapters/vision/test_qwen25vl.py` asserts
+every entry actually reaches the prompt: a check that silently stopped being
+asked for would be invisible otherwise, and this is the whole of T3's behaviour.
+
+These are *questions put to a vision-language model about one frame*, not
+detector outputs. See the module docstring for exactly what that does and does
+not buy.
+"""
+
+_HARM_THREAT_FLOOR = 0.7
+_HARM_THREAT_FLOOR_SEVERE = 0.85
+"""Floors asked for, not floors enforced. 0.7 lands in `Severity.HIGH` and 0.85
+in `Severity.CRITICAL` (`domain/entities.py`'s bands), which is the point:
+without them the model narrates a fight accurately and then scores it 0.3, and
+the event arrives as `low` in an operator's list sorted by severity.
+
+Only the *published* severity moves. The escalation gate decides whether to
+describe a frame at all long before a threat value exists (spec §4.1), so this
+cannot make a camera escalate more often.
+
+Measured on this box (RTX 4060, Qwen2.5-VL-3B NF4, greedy decode, same frames
+through the old prompt and this one):
+
+    two people grappling      0.3 "possibly a sport" -> 0.9 "a physical altercation"
+    a person lying motionless 0.2                    -> 0.6
+    a person seated on grass  0.2                    -> 0.0
+    two men shouting, no contact  0.3                -> 0.3
+    an ordinary concourse     0.2                    -> 0.2
+    a stretcher being carried 0.2                    -> 0.3   (missed)
+
+Read that honestly. The two clearest harms move from `low` to `high`/`critical`
+and none of the ordinary scenes moves at all — but the lying-down frame came
+back at 0.6, *under* the 0.7 the prompt asks for, and the stretcher was missed
+outright. A 3B model treats these numbers as suggestions. They are worth stating
+because they shift the distribution the right way; they are not a guarantee, and
+nothing downstream may be written as though they were.
+"""
+
+
+def _format_harm_checks() -> str:
+    return "\n".join(f"- {check};" for check in HARM_CHECKS)
+
+
+_HARM_ASSESSMENT = (
+    "Before you answer, look at the frame specifically for each of the following, "
+    "and state plainly in the description whether you see it:\n"
+    f"{_format_harm_checks()}\n"
+    f"If any of these is present, treat the situation as serious: set threat_value to "
+    f"at least {_HARM_THREAT_FLOOR}, and to at least {_HARM_THREAT_FLOOR_SEVERE} when a "
+    "person appears injured, unresponsive, or under attack. Report only what is visible "
+    "in this frame — if you are unsure whether someone has fallen or is simply sitting "
+    "or crouching, say which you think it is and why, rather than asserting either. "
+    "If none of these is present, say so, and score the frame on ordinary security "
+    "grounds instead."
+)
 
 _RESPONSE_INSTRUCTIONS = (
     "Respond with ONLY a JSON object of this exact shape, no other text:\n"
@@ -130,7 +231,13 @@ def _format_history(history: tuple[str, ...]) -> str:
 
 
 def _build_text_prompt(request: VisionRequest) -> str:
-    """Pure string construction — no image, no model."""
+    """Pure string construction — no image, no model.
+
+    Carries the harm assessment (`_HARM_ASSESSMENT`) as well as the description
+    request. Read the module docstring before treating what comes back as a
+    detection: this asks a vision-language model what it thinks of one keyframe,
+    and there is no pose or action recognition behind it.
+    """
     return (
         "You are a security monitoring assistant describing a single still frame "
         f"from a fixed security camera named '{request.camera_label}'.\n"
@@ -140,7 +247,9 @@ def _build_text_prompt(request: VisionRequest) -> str:
         "Prior descriptions for this camera, most recent last:\n"
         f"{_format_history(request.history)}\n\n"
         "Describe what is visible, assess how concerning it is, and suggest one "
-        f"action for a human reviewer.\n{_RESPONSE_INSTRUCTIONS}"
+        "action for a human reviewer.\n"
+        f"{_HARM_ASSESSMENT}\n"
+        f"{_RESPONSE_INSTRUCTIONS}"
     )
 
 
