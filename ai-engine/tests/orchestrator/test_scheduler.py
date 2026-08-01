@@ -238,6 +238,10 @@ class TestNeverLoseAnEvent:
         assert publisher.events[0].description_unavailable is False, (
             "a clip failure says nothing about whether the description succeeded"
         )
+        assert handle.aborted, (
+            "a failed finish() can leave the muxer's container open and its temp file "
+            "on disk; abort() is idempotent and never raises, so the worker must call it"
+        )
 
     async def test_an_out_of_range_threat_value_degrades_instead_of_dropping_the_event(
         self,

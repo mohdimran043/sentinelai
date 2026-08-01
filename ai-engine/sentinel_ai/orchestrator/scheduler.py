@@ -213,5 +213,9 @@ class VlmScheduler:
                 request.event_id,
                 error,
             )
+            # A failed finish() can leave the muxer's container open and its temp file
+            # on disk. abort() is contractually idempotent and never raises, so this is
+            # always safe — and without it every failed clip leaks a file handle.
+            await request.clip.abort()
             return event
         return replace(event, clip_uri=clip_uri)
