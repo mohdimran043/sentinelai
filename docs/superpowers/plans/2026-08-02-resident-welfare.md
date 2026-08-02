@@ -63,7 +63,9 @@ The schema addition must be **optional** with `additionalProperties: false` pres
 
 ### Task 3: Ask the model, and parse what it says
 
-**Files:** Modify `ai-engine/sentinel_ai/adapters/vision/qwen25vl.py`; Test: its existing test file (find it under `ai-engine/tests/adapters/vision/`).
+**Files:** Modify `ai-engine/sentinel_ai/adapters/vision/qwen25vl.py` AND `ai-engine/sentinel_ai/orchestrator/scheduler.py`; Tests: the vision adapter's existing test file (under `ai-engine/tests/adapters/vision/`) and the scheduler's.
+
+**This task also owns the wiring**, found missing during Task 2: `scheduler.py`'s `_assemble` builds the `Event` from the `SceneDescription` but does not copy `welfare` across, so `Event.welfare` would stay `WelfareAssessment.none()` in production no matter what the model reported — and Task 10 would then notify on nothing, silently, forever. Producing the assessment and carrying it to the event belong together; a test must assert an assessment produced by the adapter reaches the assembled event.
 
 `_build_text_prompt` gains explicit questions for collapse/unresponsiveness, physical altercation, apparent self-harm, apparent medication or unlabelled-container ingestion, and other visible distress. `_parse_response` parses an optional `welfare` array into `WelfareAssessment`.
 
