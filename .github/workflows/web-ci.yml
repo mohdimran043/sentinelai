@@ -37,6 +37,25 @@ jobs:
       - name: Install
         run: npm ci
 
+      # `src/api/engine.types.ts` is generated from
+      # `contracts/openapi/ai-engine.yaml` and committed. Nothing downstream
+      # catches it going stale: a stale generated file is internally
+      # consistent, so `tsc` stays green while the console typechecks against
+      # a schema the engine no longer serves, and the failure surfaces at
+      # runtime as a field that is `undefined`. It has already happened once —
+      # the camera-editing contract landed with the types 197 lines behind it.
+      #
+      # Runs before Typecheck deliberately: a drifted contract should fail as
+      # "you forgot to regenerate", not as a confusing type error in a test
+      # fixture several steps later.
+      - name: Check generated API types are current
+        run: |
+          npm run gen:api
+          if ! git diff --exit-code -- src/api/engine.types.ts; then
+            echo "::error file=web/src/api/engine.types.ts::Generated API types are stale. Run 'npm run gen' in web/ and commit the result."
+            exit 1
+          fi
+
       - name: Typecheck
         run: npm run typecheck
 
