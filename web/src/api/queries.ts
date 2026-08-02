@@ -5,6 +5,9 @@ import {
   getCameraTelemetry,
   getHealth,
   listCameras,
+  updateCamera,
+  EngineHttpError,
+  type CameraEditRequest,
   type CameraEventsResponse,
   type CameraStatus,
   type CamerasResponse,
@@ -89,6 +92,33 @@ export function useDescribeCameraNow(cameraId: string) {
       void queryClient.invalidateQueries({
         queryKey: ['engine', 'cameras', cameraId, 'events'],
       })
+    },
+  })
+}
+
+/**
+ * Edit a camera's stored record.
+ *
+ * Invalidating `['engine', 'cameras']` also refreshes that camera's telemetry:
+ * TanStack matches query keys by prefix, and the telemetry key is
+ * `['engine', 'cameras', id, 'telemetry']`. One call covers both.
+ *
+ * A 403 invalidates too. It means the engine's `config_writable` disagrees with
+ * what this console last read — writes were turned off underneath it — and
+ * refetching is what flips the panel to read-only instead of leaving an
+ * operator retrying a control that cannot work.
+ */
+export function useUpdateCamera(cameraId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (edit: CameraEditRequest) => updateCamera(cameraId, edit),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'cameras'] })
+    },
+    onError: (error: Error) => {
+      if (error instanceof EngineHttpError && error.status === 403) {
+        void queryClient.invalidateQueries({ queryKey: ['engine', 'cameras'] })
+      }
     },
   })
 }
