@@ -119,6 +119,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -162,19 +165,34 @@ in `_parse_response` for operators — logs are operator-facing infrastructure,
 not the published event, so that is not a spec §3.3 concern.
 """
 
-HARM_CHECKS: tuple[str, ...] = (
-    "a person who is collapsed, fallen, lying on the ground, or appears unresponsive",
-    "a physical altercation between people — fighting, striking, grappling, pushing",
-    "apparent self-harm — a person cutting, striking, or otherwise deliberately "
-    "injuring themselves",
-    "a person appearing to swallow pills, liquid, or the contents of an unlabelled "
-    "container — an apparent medication or unlabelled-container ingestion; state "
-    "only that this was seen and describe what was visible, never what the "
-    "substance is",
-    "any other apparent distress or harm to a person — someone being restrained or "
-    "dragged, someone clutching an injury, someone fleeing, a weapon held or raised",
+HARM_CHECKS: Mapping[ConcernKind, str] = MappingProxyType(
+    {
+        ConcernKind.COLLAPSE: (
+            "a person who is collapsed, fallen, lying on the ground, or appears unresponsive"
+        ),
+        ConcernKind.ALTERCATION: (
+            "a physical altercation between people — fighting, striking, grappling, pushing"
+        ),
+        ConcernKind.SELF_HARM: (
+            "apparent self-harm — a person cutting, striking, or otherwise deliberately "
+            "injuring themselves"
+        ),
+        ConcernKind.MEDICATION: (
+            "a person appearing to swallow pills, liquid, or the contents of an unlabelled "
+            "container — an apparent medication or unlabelled-container ingestion; state "
+            "only that this was seen and describe what was visible, never what the "
+            "substance is"
+        ),
+        ConcernKind.DISTRESS: (
+            "any other apparent distress or harm to a person — someone being restrained or "
+            "dragged, someone clutching an injury, someone fleeing, a weapon held or raised"
+        ),
+    }
 )
-"""The five things the prompt makes the model look for by name.
+"""The five things the prompt makes the model look for by name, one per
+`ConcernKind` except `OTHER` (which is not a check to look for — it is what
+`_parse_concern_kind` falls back to when the model names something none of
+these five cover).
 
 Named and enumerated rather than buried in one long paragraph so the set is
 reviewable, testable, and extendable without rewriting the prompt around it.
@@ -182,22 +200,42 @@ Public (no underscore) because `tests/adapters/vision/test_qwen25vl.py` asserts
 every entry actually reaches the prompt: a check that silently stopped being
 asked for would be invisible otherwise, and this is the whole of T3's behaviour.
 
+Keyed by `ConcernKind` rather than a bare tuple (Task 3 review, MINOR 2): a
+`tuple[str, ...]` has no structural link to the enum it is meant to cover, so
+`len(HARM_CHECKS) == len(ConcernKind) - 1` could not tell a real, distinct
+check from an accidental duplicate — two identical strings would still pass
+that length assertion. A mapping keyed by `ConcernKind` makes "one check per
+kind" a property of the type itself, checkable as `set(HARM_CHECKS) ==
+set(ConcernKind) - {ConcernKind.OTHER}`, and `_WELFARE_KIND_GUIDE` below is
+now *built from this mapping* rather than hand-typed a second time — that
+second hand-typed list was the root cause of the review finding this module's
+own history records: a deleted `HARM_CHECKS` entry left the guide's echo of
+the same vocabulary in place, so a test asserting against the *whole prompt*
+kept passing even though the model was no longer being asked to look for that
+harm at all.
+
 These are *questions put to a vision-language model about one frame*, not
 detector outputs. See the module docstring for exactly what that does and does
 not buy, and for why the medication check is worded the way it is: no
 substance name, no dose, no judgement about whether it was prescribed.
 """
 
-_WELFARE_KIND_GUIDE = (
-    f'"{ConcernKind.COLLAPSE.value}" for the collapsed/fallen/unresponsive check, '
-    f'"{ConcernKind.ALTERCATION.value}" for the physical-altercation check, '
-    f'"{ConcernKind.SELF_HARM.value}" for apparent self-harm, '
-    f'"{ConcernKind.MEDICATION.value}" for an apparent medication or '
-    "unlabelled-container ingestion, "
-    f'"{ConcernKind.DISTRESS.value}" for any other apparent distress or harm, and '
-    f'"{ConcernKind.OTHER.value}" only if none of those fit'
-)
-"""Built from `ConcernKind`'s own values, not hand-typed strings, so the prompt's
+
+def _format_kind_guide() -> str:
+    """Build the `kind` vocabulary sentence in `_RESPONSE_INSTRUCTIONS` from
+    `HARM_CHECKS` itself, not a second hand-typed list of the same five
+    concepts — see `HARM_CHECKS`'s docstring for why that duplication was the
+    root cause of an earlier review finding. Reusing each check's own text
+    (rather than a hand-authored paraphrase) means a check deleted from
+    `HARM_CHECKS` disappears from the guide too, in the same edit, instead of
+    needing a second, easy-to-forget deletion.
+    """
+    named = [f'"{kind.value}" for {text}' for kind, text in HARM_CHECKS.items()]
+    return ", ".join(named) + f', and "{ConcernKind.OTHER.value}" only if none of those fit'
+
+
+_WELFARE_KIND_GUIDE = _format_kind_guide()
+"""Derived from `HARM_CHECKS`, not hand-typed strings, so the prompt's
 vocabulary can never drift from `domain/welfare.py`'s enum — a hand-typed "self_harm"
 here that the enum later renamed would silently stop round-tripping through
 `_parse_welfare`, which maps anything it does not recognise to `OTHER`."""
@@ -233,7 +271,7 @@ nothing downstream may be written as though they were.
 
 
 def _format_harm_checks() -> str:
-    return "\n".join(f"- {check};" for check in HARM_CHECKS)
+    return "\n".join(f"- {check};" for check in HARM_CHECKS.values())
 
 
 _HARM_ASSESSMENT = (
@@ -450,7 +488,17 @@ what was seen is filled in with the truth that it was not stated. This is
 still not extended to `ConcernKind.OTHER`: an item that names nothing
 recognisable *and* has no evidence carries no signal at all, and manufacturing
 a concern out of it would be the opposite failure — noise dressed up as a
-finding, which drowns real alerts and gets the alarm muted."""
+finding, which drowns real alerts and gets the alarm muted.
+
+Whenever this placeholder is substituted, `_parse_welfare` also sets
+`WelfareConcern.evidence_stated=False` (Task 3 review, MINOR 3). This string
+used to be the *only* way to tell "named but not described" from a real,
+evidenced concern — which meant a caller outside this module (a notification
+router, say) would have to string-match a leading-underscore adapter constant
+across the ports boundary to make that distinction, or simply never make it.
+`evidence_stated` moved that signal into `domain/welfare.py` where it belongs;
+this placeholder text still exists for a human reading the event, but routing
+logic should read the flag, not this string."""
 
 
 def _parse_welfare(raw: object) -> WelfareAssessment:
@@ -461,18 +509,24 @@ def _parse_welfare(raw: object) -> WelfareAssessment:
     by field — `kind` through `_parse_concern_kind`, `confidence` through
     `_parse_confidence`. `evidence` absent, null, non-string or blank is
     handled two different ways depending on `kind`: a *recognised* kind keeps
-    the concern with `_EVIDENCE_UNSTATED` substituted in (see that constant's
-    docstring for why dropping it was the wrong direction to fail), while
+    the concern with `_EVIDENCE_UNSTATED` substituted in and
+    `evidence_stated=False` (see that constant's docstring for why dropping it
+    was the wrong direction to fail, and why the flag, not the placeholder
+    string, is what a caller outside this module should read), while
     `ConcernKind.OTHER` — nothing recognisable named, and no evidence either —
     is dropped, same as before this change. Either way
     `WelfareConcern.__post_init__`'s ban on blank evidence is never hit here:
     every concern this function constructs already carries either the model's
-    own text or the fixed placeholder.
+    own text (with `evidence_stated=True`) or the fixed placeholder (with
+    `evidence_stated=False`).
 
     Deliberately never `WelfareAssessment(**item)` or `WelfareConcern(**item)`:
     spreading the payload into the constructor would let it set fields it must
     never control, `basis` above all — this function never reads a `basis` key
     from anywhere, `WelfareAssessment`'s own default is the only source of it.
+    A payload key literally named `evidence_stated` is read no differently:
+    this function decides that flag itself from whether real evidence text was
+    found, never by trusting a same-named key the payload might contain.
     """
     if not isinstance(raw, list):
         return WelfareAssessment.none()
@@ -484,6 +538,7 @@ def _parse_welfare(raw: object) -> WelfareAssessment:
         evidence = item.get("evidence")
         if isinstance(evidence, str) and evidence.strip():
             evidence_text = evidence.strip()
+            evidence_stated = True
         elif kind is ConcernKind.OTHER:
             # Nothing recognisable named, and no evidence either — there is no
             # signal here to keep. Manufacturing an OTHER concern out of this
@@ -493,12 +548,17 @@ def _parse_welfare(raw: object) -> WelfareAssessment:
             # A recognised kind with unusable evidence is still a concern the
             # model actually raised; see `_EVIDENCE_UNSTATED`'s docstring for
             # why dropping it, not keeping it, was the finding here.
+            # `evidence_stated=False` records the same fact structurally, so a
+            # caller does not have to compare `evidence` against this fixed
+            # string to learn it.
             evidence_text = _EVIDENCE_UNSTATED
+            evidence_stated = False
         concerns.append(
             WelfareConcern(
                 kind=kind,
                 confidence=_parse_confidence(item.get("confidence")),
                 evidence=evidence_text,
+                evidence_stated=evidence_stated,
             )
         )
     return WelfareAssessment(concerns=tuple(concerns))
@@ -526,6 +586,21 @@ def _parse_response(raw_text: str) -> SceneDescription:
     produce any other malformed reply, and this docstring's "never an
     exception" has to cover that case too, so both exception types fall
     through to the same fixed fallback below.
+
+    `json.loads` also accepts the non-standard `NaN`, `Infinity` and
+    `-Infinity` tokens by default — a Python extension to JSON, not something
+    a spec-compliant model reply should contain, but nothing stops a garbled
+    generation from emitting one. Without an explicit finiteness check,
+    `threat_value: NaN` reaches `_clamp01`'s `min(1.0, value)`, and `min` with
+    a `NaN` operand returns whichever argument happened to be its first
+    positional operand by Python's `<` semantics — here that resolves to
+    `1.0`, so a garbled float silently becomes a maximum-severity CRITICAL
+    event (Task 3 review, MINOR 4). `+Infinity`/`-Infinity` clamp "correctly"
+    to 1.0/0.0 under the plain `min`/`max` arithmetic, which is exactly the
+    problem: a value that was never a real model opinion reads as a
+    confident, in-range score. `math.isfinite` rejects all three before
+    `_clamp01` ever sees them, sending the reply down the same safe fallback
+    as any other malformed `threat_value`.
     """
     candidate = raw_text.strip()
     json_block = _extract_json_block(candidate)
@@ -543,6 +618,7 @@ def _parse_response(raw_text: str) -> SceneDescription:
                 and description.strip()
                 and isinstance(threat_value, int | float)
                 and not isinstance(threat_value, bool)
+                and math.isfinite(threat_value)
                 and isinstance(suggested_action, str)
                 and suggested_action.strip()
             ):

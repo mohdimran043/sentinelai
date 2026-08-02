@@ -94,6 +94,30 @@ class WelfareConcern:
     kind: ConcernKind
     confidence: Confidence
     evidence: str
+    evidence_stated: bool = True
+    """`False` means the model named this concern but described nothing —
+    `evidence` then holds a fixed, honest placeholder
+    (`adapters/vision/qwen25vl.py`'s `_EVIDENCE_UNSTATED`), not something the
+    model actually said. `True` (the default) means `evidence` is the model's
+    own text.
+
+    This started as a private adapter-only distinction: the only way to tell
+    "named but not described" from "actually evidenced" was to string-match
+    `_EVIDENCE_UNSTATED`, a leading-underscore adapter constant, from whatever
+    later reads `WelfareConcern` to route a notification. That forces a
+    ports-boundary violation (importing an adapter internal from wherever
+    routing lives) or, worse, a routing rule that just never makes the
+    distinction and treats a placeholder the same as a real observation. Given
+    a muted alarm is the worst outcome this system is built to avoid, the
+    flag belongs here, in the domain, where every consumer can read it without
+    knowing which adapter produced it or what string it used.
+
+    Kept a plain `bool`, not folded into `Confidence`: whether evidence was
+    given and how sure the model is are independent axes — a `likely` concern
+    can arrive with no evidence text, and a `possible` one can arrive with a
+    detailed observation. Collapsing them would lose information either
+    reading could need.
+    """
 
     def __post_init__(self) -> None:
         if not self.evidence.strip():
@@ -108,7 +132,9 @@ class WelfareAssessment:
     instead of being stored twice: a model reporting `collapse` under two
     prompt phrasings is describing one person's one situation, and keeping
     both would double-count it in any routing rule built on `len(concerns)`
-    or on iterating concerns by kind.
+    or on iterating concerns by kind. At equal confidence, the concern with
+    `evidence_stated=True` wins over one without — see `__post_init__` for
+    why evidence, not just confidence, decides the tie.
     """
 
     concerns: tuple[WelfareConcern, ...]
@@ -125,8 +151,23 @@ class WelfareAssessment:
         best_by_kind: dict[ConcernKind, WelfareConcern] = {}
         for concern in self.concerns:
             existing = best_by_kind.get(concern.kind)
+            # Rank by (confidence, evidence_stated), in that order. Confidence
+            # dominates: a `likely` concern with no evidence text still outranks
+            # a `possible` one that has evidence, because confidence is the
+            # model's own judgement of how sure it is, and a placeholder
+            # evidence string must not be allowed to override that judgement.
+            # `evidence_stated` only breaks a tie *within* the same confidence
+            # tier — between two `likely` (or two `possible`) reports of the
+            # same kind, the one a human can actually weigh against a real
+            # observation should win over the one that only says "reported,
+            # not described" (`_EVIDENCE_UNSTATED`). `bool` orders `False <
+            # True` in Python, so this needs no extra rank table.
             if existing is None or (
-                _CONFIDENCE_RANK[concern.confidence] > _CONFIDENCE_RANK[existing.confidence]
+                _CONFIDENCE_RANK[concern.confidence],
+                concern.evidence_stated,
+            ) > (
+                _CONFIDENCE_RANK[existing.confidence],
+                existing.evidence_stated,
             ):
                 best_by_kind[concern.kind] = concern
         if len(best_by_kind) != len(self.concerns):

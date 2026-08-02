@@ -14,8 +14,11 @@ def _concern(
     kind: ConcernKind = ConcernKind.COLLAPSE,
     confidence: Confidence = Confidence.POSSIBLE,
     evidence: str = "person lying motionless on the floor",
+    evidence_stated: bool = True,
 ) -> WelfareConcern:
-    return WelfareConcern(kind=kind, confidence=confidence, evidence=evidence)
+    return WelfareConcern(
+        kind=kind, confidence=confidence, evidence=evidence, evidence_stated=evidence_stated
+    )
 
 
 class TestWelfareConcern:
@@ -24,6 +27,26 @@ class TestWelfareConcern:
         assert concern.kind is ConcernKind.COLLAPSE
         assert concern.confidence is Confidence.POSSIBLE
         assert concern.evidence == "person lying motionless on the floor"
+
+    def test_evidence_stated_defaults_to_true(self) -> None:
+        """MINOR 3 (Task 3 review): a concern built without naming
+        `evidence_stated` explicitly must default to `True` — the ordinary
+        case of a well-formed reply where the model actually described what
+        it saw, which is every existing caller and fixture in this suite."""
+        assert _concern().evidence_stated is True
+
+    def test_evidence_stated_can_be_set_false(self) -> None:
+        """`False` is how the domain represents "named but not described"
+        without any caller needing to know the adapter's
+        `_EVIDENCE_UNSTATED` placeholder string — see the field's docstring
+        on `WelfareConcern` for why this moved out of the adapter."""
+        concern = WelfareConcern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="The model reported this concern without describing what it saw.",
+            evidence_stated=False,
+        )
+        assert concern.evidence_stated is False
 
     def test_is_immutable(self) -> None:
         concern = _concern()
@@ -100,6 +123,65 @@ class TestWelfareAssessment:
         assessment = WelfareAssessment(concerns=(low, high))
         assert len(assessment.concerns) == 1
         assert assessment.concerns[0].confidence is Confidence.LIKELY
+
+    def test_duplicate_kinds_at_equal_confidence_prefer_the_one_with_evidence(self) -> None:
+        """MINOR 3 (Task 3 review): confidence alone cannot break this tie — both
+        concerns are `likely` — so the one a human can actually weigh against a
+        real observation must win over the one that only says "reported, not
+        described"."""
+        unevidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="The model reported this concern without describing what it saw.",
+            evidence_stated=False,
+        )
+        evidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="lying motionless near the doorway, not moving",
+        )
+        assessment = WelfareAssessment(concerns=(unevidenced, evidenced))
+        assert len(assessment.concerns) == 1
+        assert assessment.concerns[0] is evidenced
+
+    def test_duplicate_kinds_at_equal_confidence_prefer_evidence_regardless_of_order(
+        self,
+    ) -> None:
+        unevidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="The model reported this concern without describing what it saw.",
+            evidence_stated=False,
+        )
+        evidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="lying motionless near the doorway, not moving",
+        )
+        assessment = WelfareAssessment(concerns=(evidenced, unevidenced))
+        assert len(assessment.concerns) == 1
+        assert assessment.concerns[0] is evidenced
+
+    def test_higher_confidence_wins_even_without_evidence(self) -> None:
+        """Confidence dominates the tie-break, not the reverse: a `likely`
+        concern with no evidence text still outranks a `possible` one that
+        has evidence, because confidence is the model's own judgement of how
+        sure it is, and a placeholder evidence string must not override
+        that."""
+        likely_unevidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.LIKELY,
+            evidence="The model reported this concern without describing what it saw.",
+            evidence_stated=False,
+        )
+        possible_evidenced = _concern(
+            kind=ConcernKind.COLLAPSE,
+            confidence=Confidence.POSSIBLE,
+            evidence="lying motionless near the doorway, not moving",
+        )
+        assessment = WelfareAssessment(concerns=(possible_evidenced, likely_unevidenced))
+        assert len(assessment.concerns) == 1
+        assert assessment.concerns[0] is likely_unevidenced
 
     def test_duplicate_kinds_collapse_regardless_of_order(self) -> None:
         low = _concern(kind=ConcernKind.DISTRESS, confidence=Confidence.POSSIBLE)

@@ -17,6 +17,7 @@ from sentinel_ai.adapters.vision.qwen25vl import (
     _HARM_ASSESSMENT,
     _HARM_THREAT_FLOOR,
     _HARM_THREAT_FLOOR_SEVERE,
+    _RESPONSE_INSTRUCTIONS,
     HARM_CHECKS,
     Qwen25VLDescriber,
     _base_checkpoint,
@@ -129,14 +130,24 @@ class TestTheHarmAssessment:
         )
 
     def test_every_concern_kind_has_a_check(self) -> None:
-        """Ties `HARM_CHECKS`'s length to `ConcernKind` itself so a deleted
-        entry is a test failure on its own, without relying on a specific
-        phrase happening to catch it. `test_every_declared_harm_check_actually_
+        """Ties `HARM_CHECKS` to `ConcernKind` itself so a deleted entry is a
+        test failure on its own, without relying on a specific phrase
+        happening to catch it. `test_every_declared_harm_check_actually_
         reaches_the_prompt` below iterates `HARM_CHECKS` and would pass
-        vacuously on a shortened tuple; this test cannot, because it compares
-        the tuple's length against a count it does not control.
-        """
-        assert len(HARM_CHECKS) == len(ConcernKind) - 1  # every kind but OTHER
+        vacuously on a shortened mapping; this test cannot.
+
+        MINOR 2 (Task 3 review): `HARM_CHECKS` moved from a bare
+        `tuple[str, ...]` to a `Mapping[ConcernKind, str]` precisely because a
+        length comparison alone could not tell a real check from a
+        near-duplicate — two identical strings under two different keys would
+        still satisfy `len(HARM_CHECKS) == len(ConcernKind) - 1`. `set(...)
+        == set(...)` pins the *keys* (one check per kind, no kind missing, no
+        stray extra), and the second assertion pins that the check *text*
+        itself is not degenerate (no two kinds sharing one near-duplicate
+        check that would pass the key check but ask the model nothing
+        distinct)."""
+        assert set(HARM_CHECKS) == set(ConcernKind) - {ConcernKind.OTHER}
+        assert len(set(HARM_CHECKS.values())) == len(HARM_CHECKS)  # no near-duplicate checks
 
     _BANNED_MEDICATION_WORDS = (
         "dose",
@@ -173,10 +184,10 @@ class TestTheHarmAssessment:
         assert "never what the substance is" in _HARM_ASSESSMENT
 
     def test_every_declared_harm_check_actually_reaches_the_prompt(self) -> None:
-        """`HARM_CHECKS` is the reviewable list of what is asked; a check that was
-        added to the tuple but never rendered into the prompt would be invisible."""
+        """`HARM_CHECKS` is the reviewable mapping of what is asked; a check that
+        was added to it but never rendered into the prompt would be invisible."""
         prompt = _build_text_prompt(_request())
-        for check in HARM_CHECKS:
+        for check in HARM_CHECKS.values():
             assert check in prompt
 
     def test_the_prompt_ties_harm_to_a_high_threat_value(self) -> None:
@@ -194,11 +205,54 @@ class TestTheHarmAssessment:
     def test_the_prompt_still_asks_for_the_same_json_shape(self) -> None:
         """The parser is unchanged, so the contract with it must be too — a prompt
         that asked for a new key would silently take every reply down the malformed
-        fallback path."""
+        fallback path.
+
+        Extended (Task 3 review, IMPORTANT): the original version of this test
+        only pinned the three-field description/threat_value/suggested_action
+        shape, predating the `welfare` array `_parse_welfare` (`qwen25vl.py`)
+        reads out of the same reply. Nothing here asserted the prompt still
+        *asks* for that field at all — verified: deleting the entire welfare
+        block from `_RESPONSE_INSTRUCTIONS` left this test, and the full 686-test
+        suite, green. `welfare`/`kind`/`confidence`/`evidence` close that gap.
+        """
         prompt = _build_text_prompt(_request())
         assert '"description"' in prompt
         assert '"threat_value"' in prompt
         assert '"suggested_action"' in prompt
+        assert '"welfare"' in prompt
+        assert '"kind"' in prompt
+        assert '"confidence"' in prompt
+        assert '"evidence"' in prompt
+
+    def test_the_prompt_names_every_concern_kind_and_confidence_tier(self) -> None:
+        """Against `_RESPONSE_INSTRUCTIONS`, not the whole prompt — `_HARM_ASSESSMENT`
+        contains 'collapsed'/'distress' independently and would mask a deleted guide.
+
+        Verified mutations (Task 3 review, IMPORTANT), each against the full
+        suite before this test existed: deleting `_WELFARE_KIND_GUIDE` from the
+        prompt, and deleting the possible/likely confidence guidance, both left
+        686/686 green. `_HARM_ASSESSMENT` (built from `HARM_CHECKS`) happens to
+        contain the same English words ("collapsed", "distress", ...) for a
+        different reason — describing what to look for in the frame, not what
+        JSON value to emit — so asserting against the whole prompt would have
+        passed vacuously on either deletion. This asserts specifically against
+        `_RESPONSE_INSTRUCTIONS`, the half of the prompt that tells the model to
+        emit the `welfare` array and what values it accepts, so it actually
+        discriminates a deleted guide or a deleted confidence clause.
+        """
+        for kind in ConcernKind:
+            assert f'"{kind.value}"' in _RESPONSE_INSTRUCTIONS
+        for tier in Confidence:
+            assert f'"{tier.value}"' in _RESPONSE_INSTRUCTIONS
+
+    def test_the_response_instructions_keep_the_substance_name_restraint(self) -> None:
+        """Verified mutation (Task 3 review, IMPORTANT): deleting "never a
+        substance name" from `_RESPONSE_INSTRUCTIONS` left 686/686 green —
+        `test_the_medication_check_keeps_its_restraint_clause` above pins the
+        sibling clause in `_HARM_ASSESSMENT` ("never what the substance is"),
+        a different string in a different half of the prompt, and does not
+        cover this one."""
+        assert "never a substance name" in _RESPONSE_INSTRUCTIONS
 
     def test_the_harm_assessment_introduces_no_new_wire_field(self) -> None:
         """A reply in the documented shape must still parse into exactly the three
@@ -264,6 +318,7 @@ class TestWelfareParsing:
                 ),
             )
         )
+        assert result.welfare.concerns[0].evidence_stated is True
 
     def test_an_unknown_kind_maps_to_other_rather_than_raising(self) -> None:
         raw = (
@@ -318,8 +373,14 @@ class TestWelfareParsing:
         collapse = next(c for c in result.welfare.concerns if c.kind == ConcernKind.COLLAPSE)
         assert collapse.confidence == Confidence.LIKELY
         assert collapse.evidence == _EVIDENCE_UNSTATED
+        # MINOR 3 (Task 3 review): the structural flag, not just the placeholder
+        # string, must say this evidence was not stated — a caller routing on
+        # `evidence_stated` should never have to compare `evidence` to
+        # `_EVIDENCE_UNSTATED` (an adapter-private constant) to learn this.
+        assert collapse.evidence_stated is False
         distress = next(c for c in result.welfare.concerns if c.kind == ConcernKind.DISTRESS)
         assert distress.evidence == "shouting near the gate"
+        assert distress.evidence_stated is True
 
     def test_a_recognised_kind_with_a_missing_evidence_key_is_kept_with_a_placeholder(
         self,
@@ -341,6 +402,7 @@ class TestWelfareParsing:
         assert concern.kind == ConcernKind.COLLAPSE
         assert concern.confidence == Confidence.LIKELY
         assert concern.evidence == _EVIDENCE_UNSTATED
+        assert concern.evidence_stated is False
 
     def test_an_unrecognised_kind_with_no_evidence_is_still_dropped(self) -> None:
         """The mirror case, and the reason `_EVIDENCE_UNSTATED` is not applied
@@ -429,6 +491,25 @@ def test_parse_response_clamps_a_negative_threat_value() -> None:
     assert _parse_response(raw).threat_value == 0.0
 
 
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_parse_response_falls_back_on_a_non_finite_threat_value(literal: str) -> None:
+    """MINOR 4 (Task 3 review, pre-existing): `json.loads` accepts the
+    non-standard `NaN`/`Infinity`/`-Infinity` tokens by default, and
+    `_clamp01`'s `max(0.0, min(1.0, value))` turns `NaN` and `+Infinity` into
+    `1.0` (`min(1.0, nan) == 1.0` in Python) and `-Infinity` into `0.0` — a
+    garbled float would otherwise clamp "successfully" into a maximum-severity
+    CRITICAL event, the same cry-wolf direction as every other finding in this
+    module. `isinstance(threat_value, int | float)` alone does not catch this:
+    a Python float `nan`/`inf` passes that check cleanly. This must instead
+    fall through to the safe, fixed fallback, same as any other malformed
+    `threat_value`.
+    """
+    raw = f'{{"description": "X", "threat_value": {literal}, "suggested_action": "Y"}}'
+    result = _parse_response(raw)
+    assert result.description == _FALLBACK_DESCRIPTION
+    assert 0.0 <= result.threat_value <= 1.0
+
+
 def test_parse_response_falls_back_on_prose_with_no_json() -> None:
     """F1 (Task 13 review): the fallback path must use the fixed
     `_FALLBACK_DESCRIPTION`, never the raw text verbatim — see
@@ -459,6 +540,27 @@ def test_parse_response_falls_back_on_wrong_typed_threat_value() -> None:
     result = _parse_response(raw)
     assert result.description == _FALLBACK_DESCRIPTION
     assert 0.0 <= result.threat_value <= 1.0
+
+
+def test_pathologically_nested_json_falls_back_rather_than_raising() -> None:
+    """MINOR 1 (Task 3 review): `_parse_response`'s docstring claims
+    `json.loads`'s `RecursionError` on deeply nested JSON is caught alongside
+    `json.JSONDecodeError`, but nothing exercised that path — reverting the
+    `except (json.JSONDecodeError, RecursionError):` clause to the
+    single-exception `except json.JSONDecodeError:` it evolved from still
+    passed all 686 tests, while 200,000 levels of nesting genuinely raises
+    `RecursionError` through `json.loads`. This must fall through to the same
+    fixed, safe fallback as any other malformed reply, never propagate.
+    """
+    raw = (
+        '{"description":"X","threat_value":0.5,"suggested_action":"Y","welfare":'
+        + "[" * 200_000
+        + "]" * 200_000
+        + "}"
+    )
+    result = _parse_response(raw)
+    assert result.description == _FALLBACK_DESCRIPTION
+    assert result.welfare == WelfareAssessment.none()
 
 
 def test_parse_response_never_leaks_a_model_name_via_the_fallback_description() -> None:
