@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from sentinel_ai.adapters.vision.qwen25vl import (
+    _EVIDENCE_UNSTATED,
     _FALLBACK_DESCRIPTION,
     _HARM_ASSESSMENT,
     _HARM_THREAT_FLOOR,
@@ -113,9 +114,29 @@ class TestTheHarmAssessment:
         ],
     )
     def test_the_prompt_asks_about_each_kind_of_harm(self, phrase: str, what: str) -> None:
-        assert phrase in _build_text_prompt(_request()).lower(), (
+        """Asserted against `_HARM_ASSESSMENT` — not the whole prompt via
+        `_build_text_prompt` — because `_WELFARE_KIND_GUIDE` echoes this same
+        vocabulary ("collapsed/fallen/unresponsive", "self-harm", "medication",
+        "distress") into the full prompt independently of `HARM_CHECKS`. Against
+        the full prompt this test kept passing after deleting the collapse check
+        *and* the self-harm check from `HARM_CHECKS` entirely — the model would
+        never have been asked to look for either — because the kind guide alone
+        supplied the words. `_HARM_ASSESSMENT` renders only `HARM_CHECKS`, so it
+        actually discriminates a deleted check.
+        """
+        assert phrase in _HARM_ASSESSMENT.lower(), (
             f"the prompt no longer asks the model to check for {what}"
         )
+
+    def test_every_concern_kind_has_a_check(self) -> None:
+        """Ties `HARM_CHECKS`'s length to `ConcernKind` itself so a deleted
+        entry is a test failure on its own, without relying on a specific
+        phrase happening to catch it. `test_every_declared_harm_check_actually_
+        reaches_the_prompt` below iterates `HARM_CHECKS` and would pass
+        vacuously on a shortened tuple; this test cannot, because it compares
+        the tuple's length against a count it does not control.
+        """
+        assert len(HARM_CHECKS) == len(ConcernKind) - 1  # every kind but OTHER
 
     _BANNED_MEDICATION_WORDS = (
         "dose",
@@ -142,6 +163,14 @@ class TestTheHarmAssessment:
         apparent ingestion was seen and for a description of what was visible — never
         for a clinical assessment a still frame cannot honestly support."""
         assert word not in _build_text_prompt(_request()).lower()
+
+    def test_the_medication_check_keeps_its_restraint_clause(self) -> None:
+        """Only the banned-word list was tested above; nothing pinned the
+        positive half of the constraint, so deleting the clause that actually
+        tells the model never to name the substance — `"; state only that this
+        was seen and describe what was visible, never what the substance is"`
+        — would break nothing else here. This pins the clause itself."""
+        assert "never what the substance is" in _HARM_ASSESSMENT
 
     def test_every_declared_harm_check_actually_reaches_the_prompt(self) -> None:
         """`HARM_CHECKS` is the reviewable list of what is asked; a check that was
@@ -267,10 +296,17 @@ class TestWelfareParsing:
         )
         assert _parse_response(raw).welfare == WelfareAssessment.none()
 
-    def test_a_concern_with_blank_evidence_is_skipped_not_raised(self) -> None:
-        """`WelfareConcern.__post_init__` rejects empty evidence; unvalidated model
-        output reaching the constructor directly would raise straight through
-        `_parse_response` rather than degrading safely."""
+    def test_a_recognised_kind_with_blank_evidence_is_kept_with_a_placeholder(self) -> None:
+        """`WelfareConcern.__post_init__` rejects empty evidence, so unvalidated
+        model output reaching the constructor directly would raise straight
+        through `_parse_response`. That is guarded against here not by dropping
+        the concern (the pre-fix behaviour) but by substituting
+        `_EVIDENCE_UNSTATED`: `kind` named a real, recognised concern
+        ("collapse"), and dropping it entirely because only the evidence text
+        was blank would make `WelfareAssessment.none()` indistinguishable from
+        the model genuinely finding nothing — see `_EVIDENCE_UNSTATED`'s
+        docstring on `qwen25vl.py` for why that is the wrong direction to fail
+        in a custodial welfare system."""
         raw = (
             '{"description": "X", "threat_value": 0.1, "suggested_action": "Y", '
             '"welfare": [{"kind": "collapse", "confidence": "likely", "evidence": "   "}, '
@@ -278,8 +314,66 @@ class TestWelfareParsing:
             '"evidence": "shouting near the gate"}]}'
         )
         result = _parse_response(raw)
+        assert len(result.welfare.concerns) == 2
+        collapse = next(c for c in result.welfare.concerns if c.kind == ConcernKind.COLLAPSE)
+        assert collapse.confidence == Confidence.LIKELY
+        assert collapse.evidence == _EVIDENCE_UNSTATED
+        distress = next(c for c in result.welfare.concerns if c.kind == ConcernKind.DISTRESS)
+        assert distress.evidence == "shouting near the gate"
+
+    def test_a_recognised_kind_with_a_missing_evidence_key_is_kept_with_a_placeholder(
+        self,
+    ) -> None:
+        """Verified failure mode (IMPORTANT 2): a 3B model's well-formed JSON
+        reply that names a real concern at `likely` confidence but omits the
+        `evidence` key entirely — not blank, simply absent — is an ordinary
+        slip for a small model, and the model did say "collapse, likely". The
+        structured record must say the same, with an honest placeholder standing
+        in for the description it never gave, not silently agree with nothing."""
+        raw = (
+            '{"description": "A person is lying motionless on the floor.", '
+            '"threat_value": 0.9, "suggested_action": "Dispatch a responder now.", '
+            '"welfare": [{"kind": "collapse", "confidence": "likely"}]}'
+        )
+        result = _parse_response(raw)
         assert len(result.welfare.concerns) == 1
-        assert result.welfare.concerns[0].kind == ConcernKind.DISTRESS
+        concern = result.welfare.concerns[0]
+        assert concern.kind == ConcernKind.COLLAPSE
+        assert concern.confidence == Confidence.LIKELY
+        assert concern.evidence == _EVIDENCE_UNSTATED
+
+    def test_an_unrecognised_kind_with_no_evidence_is_still_dropped(self) -> None:
+        """The mirror case, and the reason `_EVIDENCE_UNSTATED` is not applied
+        unconditionally: an item naming nothing recognisable (`kind` maps to
+        `ConcernKind.OTHER`) and carrying no evidence either has no signal in
+        it at all. Keeping it would manufacture a concern out of pure noise —
+        the cry-wolf direction, which drowns real alerts and gets the alarm
+        muted. `{"foo": 1}` (no recognisable `kind` key at all) must be dropped
+        the same way."""
+        raw = (
+            '{"description": "X", "threat_value": 0.5, "suggested_action": "Y", '
+            '"welfare": [{"kind": "sasquatch", "confidence": "possible"}, {"foo": 1}]}'
+        )
+        result = _parse_response(raw)
+        assert result.welfare == WelfareAssessment.none()
+
+    def test_confidence_survives_trailing_punctuation_without_rounding_up(self) -> None:
+        """MINOR 3: a 3B model ending a sentence with a period or exclamation
+        mark is reflexive formatting noise, not a signal to downgrade a real
+        `likely` to `possible`. `"likely."` and `"likely!"` must still parse to
+        `LIKELY` — stripping trailing punctuation can only reveal a value the
+        enum already recognises (see `test_an_unknown_confidence_rounds_down_to_
+        possible_never_up` above, unchanged and still passing: `"extremely
+        certain"` has no punctuation to strip and still rounds down)."""
+        for confidence_text in ("likely.", "likely!"):
+            raw = (
+                '{"description": "X", "threat_value": 0.5, "suggested_action": "Y", '
+                '"welfare": [{"kind": "collapse", "confidence": "'
+                + confidence_text
+                + '", "evidence": "lying motionless"}]}'
+            )
+            result = _parse_response(raw)
+            assert result.welfare.concerns[0].confidence == Confidence.LIKELY, confidence_text
 
     def test_malformed_json_falls_back_to_none_and_the_fixed_description(self) -> None:
         """The existing malformed-response fallback path (`_FALLBACK_DESCRIPTION`)

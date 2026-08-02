@@ -84,9 +84,26 @@ already treats the rest of the reply: untrusted text, never trusted structure.
 An unrecognised `kind` becomes `ConcernKind.OTHER`, an unrecognised
 `confidence` becomes `Confidence.POSSIBLE` — the weaker tier, always rounded
 down, never up into a routing decision that wakes someone at 3am or, just as
-bad, suppresses a real concern under a false `LIKELY`. A concern with blank
-`evidence` is dropped rather than raised through `WelfareConcern.__post_init__`,
-and a missing or malformed `welfare` key yields `WelfareAssessment.none()`
+bad, suppresses a real concern under a false `LIKELY`. A concern whose
+`evidence` is absent, null, non-string or blank is handled two different ways
+depending on whether `kind` named something real: if `kind` parsed to
+`ConcernKind.OTHER` — nothing recognisable was named either — the item carries
+no signal at all and is dropped, same as before. But if `kind` parsed to a
+*recognised* kind, dropping it would be the wrong direction to fail in a
+custodial welfare system: a reply of `{"kind": "collapse", "confidence":
+"likely"}` with no `evidence` key is the model naming a real concern and
+merely omitting the description of what it saw, an ordinary slip for a small
+model — dropping it silently degrades to `WelfareAssessment.none()`, which the
+event codec then omits from the wire entirely, and the schema's own words say
+an omitted welfare object reads as "not assessed". "Collapse, likely" becoming
+indistinguishable from "nothing found" fails toward false reassurance, which
+is worse than the alternative of raising a concern whose evidence field
+honestly says the model did not describe what it saw. So that case is kept,
+with `_EVIDENCE_UNSTATED` substituted for the missing text — a fixed, honest
+placeholder that can never leak model text, matching the discipline
+`_FALLBACK_DESCRIPTION` already keeps for the description path.
+
+A missing or malformed `welfare` key yields `WelfareAssessment.none()`
 without ever failing the surrounding description. `WelfareAssessment` is built
 field by field from validated values, never `WelfareAssessment(**payload)`:
 `basis` always comes from the type's own constant, never the payload, or a
@@ -242,10 +259,19 @@ _RESPONSE_INSTRUCTIONS = (
     "Include one welfare entry for each concern from the checks above that you "
     "actually observed in this frame; use an empty array when none apply. For "
     f"kind use {_WELFARE_KIND_GUIDE}. For confidence use "
-    f'"{Confidence.POSSIBLE.value}" when you are not sure, and '
-    f'"{Confidence.LIKELY.value}" only when you are. For the medication kind, '
-    "evidence must describe only what was visible — never a substance name."
+    f'"{Confidence.LIKELY.value}" when what you see clearly supports it, and '
+    f'"{Confidence.POSSIBLE.value}" when an innocent explanation is equally '
+    "consistent. For the medication kind, evidence must describe only what "
+    "was visible — never a substance name."
 )
+"""`Confidence.LIKELY`'s bar used to be worded as being *sure* — but
+`domain/welfare.py` has no `Confidence.CERTAIN` precisely because a single
+frame can never earn that, so asking the model to be "sure" before it will
+say `likely` set a bar the prompt's own domain model says is unreachable, and
+could only push genuine concerns down into `possible` or out of the array
+altogether. "Clearly supports it" vs. "an innocent explanation is equally
+consistent" asks the model to compare explanations instead of asserting
+certainty it cannot honestly have."""
 
 _CUDA_CONTEXT_OVERHEAD_MIB = 300
 """Fixed tax added on top of `torch.cuda.memory_reserved()` in `warmup()`.
@@ -384,13 +410,47 @@ def _parse_confidence(raw: object) -> Confidence:
     decision treats as more actionable (waking someone at 3am), while rounding
     down at worst under-states a real concern that a human still sees in the
     description text and `threat_value`. `POSSIBLE` is always the safe default.
+
+    Trailing punctuation (`"likely."`, `"likely!"`) is stripped alongside
+    whitespace before the lookup — the same class of sentence-ending noise a
+    small model tacks on regardless of instruction, and indistinguishable in
+    intent from `"likely"` on its own. This can only ever *reveal* a value the
+    enum already recognises; it cannot invent one, so `"extremely certain."`
+    still falls through to `POSSIBLE` exactly as `"extremely certain"` did —
+    the round-down guarantee above is unchanged by this.
     """
     if isinstance(raw, str):
+        normalized = raw.strip().strip(".!,;").strip().lower()
         try:
-            return Confidence(raw.strip().lower())
+            return Confidence(normalized)
         except ValueError:
             pass
     return Confidence.POSSIBLE
+
+
+_EVIDENCE_UNSTATED = "The model reported this concern without describing what it saw."
+"""Fixed, honest stand-in for `WelfareConcern.evidence` when a *recognised*
+`kind` arrives with no usable evidence text (`_parse_welfare` below).
+
+Verified failure mode this exists for: a 3B model can reply with otherwise
+well-formed JSON — `{"kind": "collapse", "confidence": "likely"}` — and simply
+omit the `evidence` key, an ordinary slip. The pre-fix code dropped that item
+outright because `WelfareConcern.__post_init__` rejects blank evidence and the
+old code never gave it anything else to construct with; with the array then
+empty, `_parse_response` returns `WelfareAssessment.none()`, which the event
+codec omits from the wire entirely — and the schema's own words say an
+omitted welfare object reads as "not assessed". The model said "collapse,
+likely" and the structured record said nothing was found: silent, and in a
+custodial welfare system, silent in exactly the direction (false reassurance)
+that gets someone hurt. A fixed placeholder — never the raw payload, so it
+cannot leak model text any more than `_FALLBACK_DESCRIPTION` can — keeps the
+concern visible while being honest that the *evidence itself* is missing;
+nothing about `kind` or `confidence` is invented, only the description of
+what was seen is filled in with the truth that it was not stated. This is
+still not extended to `ConcernKind.OTHER`: an item that names nothing
+recognisable *and* has no evidence carries no signal at all, and manufacturing
+a concern out of it would be the opposite failure — noise dressed up as a
+finding, which drowns real alerts and gets the alarm muted."""
 
 
 def _parse_welfare(raw: object) -> WelfareAssessment:
@@ -399,9 +459,15 @@ def _parse_welfare(raw: object) -> WelfareAssessment:
     Untrusted model output end to end: anything other than a list yields
     `WelfareAssessment.none()` rather than raising, and each item is read field
     by field — `kind` through `_parse_concern_kind`, `confidence` through
-    `_parse_confidence`, `evidence` required to be a non-blank string or the
-    item is dropped (`WelfareConcern.__post_init__` would otherwise raise on
-    exactly the blank-evidence case a formatting slip is likely to produce).
+    `_parse_confidence`. `evidence` absent, null, non-string or blank is
+    handled two different ways depending on `kind`: a *recognised* kind keeps
+    the concern with `_EVIDENCE_UNSTATED` substituted in (see that constant's
+    docstring for why dropping it was the wrong direction to fail), while
+    `ConcernKind.OTHER` — nothing recognisable named, and no evidence either —
+    is dropped, same as before this change. Either way
+    `WelfareConcern.__post_init__`'s ban on blank evidence is never hit here:
+    every concern this function constructs already carries either the model's
+    own text or the fixed placeholder.
 
     Deliberately never `WelfareAssessment(**item)` or `WelfareConcern(**item)`:
     spreading the payload into the constructor would let it set fields it must
@@ -414,14 +480,25 @@ def _parse_welfare(raw: object) -> WelfareAssessment:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        kind = _parse_concern_kind(item.get("kind"))
         evidence = item.get("evidence")
-        if not isinstance(evidence, str) or not evidence.strip():
+        if isinstance(evidence, str) and evidence.strip():
+            evidence_text = evidence.strip()
+        elif kind is ConcernKind.OTHER:
+            # Nothing recognisable named, and no evidence either — there is no
+            # signal here to keep. Manufacturing an OTHER concern out of this
+            # would be the cry-wolf direction: noise reported as a finding.
             continue
+        else:
+            # A recognised kind with unusable evidence is still a concern the
+            # model actually raised; see `_EVIDENCE_UNSTATED`'s docstring for
+            # why dropping it, not keeping it, was the finding here.
+            evidence_text = _EVIDENCE_UNSTATED
         concerns.append(
             WelfareConcern(
-                kind=_parse_concern_kind(item.get("kind")),
+                kind=kind,
                 confidence=_parse_confidence(item.get("confidence")),
-                evidence=evidence.strip(),
+                evidence=evidence_text,
             )
         )
     return WelfareAssessment(concerns=tuple(concerns))
@@ -442,13 +519,20 @@ def _parse_response(raw_text: str) -> SceneDescription:
     path (S14): that one fires on timeout/OOM (infrastructure failure); this
     one fires on a malformed *success* (a formatting slip), and callers must
     not conflate the two.
+
+    `json.loads` raises `RecursionError`, not `json.JSONDecodeError`, on JSON
+    nested deep enough to blow the interpreter's recursion limit — a model
+    can produce that by looping on a malformed structure the same way it can
+    produce any other malformed reply, and this docstring's "never an
+    exception" has to cover that case too, so both exception types fall
+    through to the same fixed fallback below.
     """
     candidate = raw_text.strip()
     json_block = _extract_json_block(candidate)
     if json_block is not None:
         try:
             payload = json.loads(json_block)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             payload = None
         if isinstance(payload, dict):
             description = payload.get("description")
