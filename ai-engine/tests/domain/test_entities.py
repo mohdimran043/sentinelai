@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 
 from sentinel_ai.domain.entities import (
     BBox,
     Detection,
     EscalationReason,
+    Event,
     SceneState,
     Severity,
     ThreatScore,
     Track,
 )
+from sentinel_ai.domain.welfare import WelfareAssessment
 
 
 def _scene(signature: tuple[float, ...]) -> SceneState:
@@ -104,6 +108,51 @@ class TestThreatScore:
     def test_out_of_range_values_are_rejected(self, value: float) -> None:
         with pytest.raises(ValueError, match=r"between 0\.0 and 1\.0"):
             ThreatScore.from_value(value)
+
+
+class TestEventWelfareDefault:
+    """Task 2: `Event.welfare` must default to `WelfareAssessment.none()` so every
+    existing construction site (every call in this repo predates the field) keeps
+    working untouched."""
+
+    def test_welfare_defaults_to_none(self) -> None:
+        event = Event(
+            event_id=uuid4(),
+            camera_id="cam-1",
+            occurred_at=0.0,
+            reason=EscalationReason.SPEED_ANOMALY,
+            threat=ThreatScore.from_value(0.5),
+            description="A person is running toward the gate.",
+            suggested_action="Review the clip.",
+        )
+        assert event.welfare == WelfareAssessment.none()
+
+    def test_two_default_constructed_events_do_not_share_a_welfare_instance(self) -> None:
+        """Pins the mutable-default trap: `welfare: WelfareAssessment = WelfareAssessment.none()`
+        would evaluate the default once at class-definition time and share it across
+        every instance. `WelfareAssessment` is frozen, so aliasing would not corrupt
+        state here today — but `field(default_factory=...)` is still the correct
+        mechanism, and this test would fail loudly if a future edit swapped it for a
+        bare shared default that stopped being safe to alias."""
+        first = Event(
+            event_id=uuid4(),
+            camera_id="cam-1",
+            occurred_at=0.0,
+            reason=EscalationReason.SPEED_ANOMALY,
+            threat=ThreatScore.from_value(0.5),
+            description="",
+            suggested_action="",
+        )
+        second = Event(
+            event_id=uuid4(),
+            camera_id="cam-2",
+            occurred_at=0.0,
+            reason=EscalationReason.SPEED_ANOMALY,
+            threat=ThreatScore.from_value(0.5),
+            description="",
+            suggested_action="",
+        )
+        assert first.welfare is not second.welfare
 
 
 def test_escalation_reasons_cover_all_seven_spec_triggers() -> None:

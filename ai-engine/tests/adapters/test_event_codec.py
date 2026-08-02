@@ -8,11 +8,18 @@ from jsonschema import ValidationError
 
 from sentinel_ai.adapters.serialization.event_codec import (
     EVENT_SCHEMA_PATH,
+    _decode_welfare,
     decode_event,
     encode_event,
     validate_payload,
 )
 from sentinel_ai.domain.entities import EscalationReason, Event, Severity, ThreatScore
+from sentinel_ai.domain.welfare import (
+    ConcernKind,
+    Confidence,
+    WelfareAssessment,
+    WelfareConcern,
+)
 
 
 def make_event(**overrides: object) -> Event:
@@ -228,5 +235,117 @@ class TestNonFiniteNumbersNeverReachTheWire:
         check would pass it through to the schema — which is where a non-number
         belongs, with its own error message."""
         payload = {**encode_event(make_event()), "occurred_at": True}
+        with pytest.raises(ValidationError):
+            validate_payload(payload)
+
+
+class TestWelfareOnTheWire:
+    """Task 2: the vision model's welfare assessment travels with the event.
+
+    An empty assessment (`WelfareAssessment.none()`, `Event`'s default) must omit
+    `welfare` from the payload entirely rather than emit an empty object: an empty
+    object reads as "assessed, nothing found" while omission reads as "not
+    assessed", and those are different facts the wire must not conflate.
+    """
+
+    def _assessment(self) -> WelfareAssessment:
+        return WelfareAssessment(
+            concerns=(
+                WelfareConcern(
+                    kind=ConcernKind.COLLAPSE,
+                    confidence=Confidence.LIKELY,
+                    evidence="person lying motionless on the floor, not responding",
+                ),
+                WelfareConcern(
+                    kind=ConcernKind.DISTRESS,
+                    confidence=Confidence.POSSIBLE,
+                    evidence="raised voice, arms waving",
+                ),
+            )
+        )
+
+    def test_an_event_with_no_concerns_omits_welfare_from_the_payload(self) -> None:
+        payload = encode_event(make_event(welfare=WelfareAssessment.none()))
+        assert "welfare" not in payload
+
+    def test_an_event_with_no_concerns_is_not_encoded_as_an_empty_object(self) -> None:
+        """Pinning the exact failure mode: `{"welfare": {"concerns": [], "basis": ...}}`
+        would validate against a naive schema but claims something false — that the
+        frame was assessed and nothing was found — when nothing ran an assessment at
+        all in this build."""
+        payload = encode_event(make_event(welfare=WelfareAssessment.none()))
+        assert payload.get("welfare") != {"concerns": [], "basis": "single_frame_vlm"}
+
+    def test_an_event_with_concerns_round_trips_through_the_codec(self) -> None:
+        original = make_event(welfare=self._assessment())
+        payload = encode_event(original)
+        assert payload["welfare"] == {
+            "concerns": [
+                {
+                    "kind": "collapse",
+                    "confidence": "likely",
+                    "evidence": "person lying motionless on the floor, not responding",
+                },
+                {
+                    "kind": "distress",
+                    "confidence": "possible",
+                    "evidence": "raised voice, arms waving",
+                },
+            ],
+            "basis": "single_frame_vlm",
+        }
+        restored = decode_event(payload)
+        assert restored.welfare == original.welfare
+        assert restored == original
+
+    def test_an_encoded_event_with_concerns_validates_against_the_schema(self) -> None:
+        validate_payload(encode_event(make_event(welfare=self._assessment())))
+
+    def test_a_payload_from_before_this_change_still_validates(self) -> None:
+        """The disk spool holds payloads written by an older build, with no `welfare`
+        key at all — `replay_spool` must not choke on them."""
+        payload = encode_event(make_event())
+        assert "welfare" not in payload
+        validate_payload(payload)
+
+    def test_a_payload_from_before_this_change_still_decodes_to_no_concerns(self) -> None:
+        payload = encode_event(make_event())
+        payload.pop("welfare", None)
+        assert decode_event(payload).welfare == WelfareAssessment.none()
+
+    def test_a_tampered_basis_is_rejected_by_the_schema(self) -> None:
+        """`basis` is `const: "single_frame_vlm"` on the wire, so a payload claiming
+        any other provenance is rejected before it ever reaches decoding."""
+        payload = encode_event(make_event(welfare=self._assessment()))
+        tampered = {**payload, "welfare": {**payload["welfare"], "basis": "hallucinated"}}  # type: ignore[dict-item]
+        with pytest.raises(ValidationError):
+            validate_payload(tampered)
+
+    def test_decoding_never_trusts_a_payloads_basis_field_even_bypassing_the_schema(
+        self,
+    ) -> None:
+        """Security-sensitive, and deeper than the schema check above: `WelfareAssessment.basis`
+        is `Literal["single_frame_vlm"]` enforced by mypy only, and the codec deserializes
+        untrusted JSON. This exercises the decoder's own internals directly — bypassing
+        `validate_payload`'s schema `const` guard — to prove the *decoding code itself*
+        never reads a payload's `basis` key, rather than relying solely on the schema to
+        stop a malicious or malformed value. Fails against a `_decode_welfare` written as
+        `WelfareAssessment(**raw_welfare)`, which would spread a wire-controlled `basis`
+        straight into the object every consumer is meant to trust for provenance."""
+        tampered_raw = {
+            "welfare": {
+                "concerns": [
+                    {"kind": "collapse", "confidence": "likely", "evidence": "on the floor"}
+                ],
+                "basis": "hallucinated",
+            }
+        }
+        assert _decode_welfare(tampered_raw).basis == "single_frame_vlm"
+
+    def test_welfare_schema_rejects_an_empty_object(self) -> None:
+        """`welfare: {}` is neither a valid assessment (missing required keys) nor
+        the encoder's own output — the schema must not silently accept it as a
+        stand-in for "assessed, nothing found"."""
+        payload = {**encode_event(make_event()), "welfare": {}}
         with pytest.raises(ValidationError):
             validate_payload(payload)

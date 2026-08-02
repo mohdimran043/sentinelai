@@ -16,6 +16,12 @@ from uuid import UUID
 from jsonschema import Draft202012Validator
 
 from sentinel_ai.domain.entities import EscalationReason, Event, Severity, ThreatScore
+from sentinel_ai.domain.welfare import (
+    ConcernKind,
+    Confidence,
+    WelfareAssessment,
+    WelfareConcern,
+)
 
 SCHEMA_VERSION = 1
 
@@ -99,8 +105,53 @@ def encode_event(event: Event) -> dict[str, object]:
         "description_unavailable": event.description_unavailable,
         "metadata": dict(event.metadata),
     }
+    # Present only when there is something to report. `WelfareAssessment.none()`
+    # (the field's default, and today the only value anything in this codebase
+    # produces) must not appear as `{"concerns": [], "basis": ...}` — that would
+    # read as "assessed, nothing found", a different fact from "not assessed",
+    # which is what an event predating a describe step (or this field) actually
+    # means. Omission is the only wire representation that does not conflate them.
+    if event.welfare.concerns:
+        payload["welfare"] = {
+            "concerns": [
+                {
+                    "kind": concern.kind.value,
+                    "confidence": concern.confidence.value,
+                    "evidence": concern.evidence,
+                }
+                for concern in event.welfare.concerns
+            ],
+            "basis": event.welfare.basis,
+        }
     validate_payload(payload)
     return payload
+
+
+def _decode_welfare(payload: Mapping[str, object]) -> WelfareAssessment:
+    """Rebuild `WelfareAssessment` field by field — never `WelfareAssessment(**raw)`.
+
+    `basis` is `Literal["single_frame_vlm"]`, enforced by mypy only; the schema's
+    `const` already rejects any other value before this function runs, but this
+    function does not even read the payload's `basis` key, let alone assign it.
+    The dataclass's own default supplies it, so there is no code path here through
+    which a wire payload could ever set what a consumer trusts as provenance.
+    Absent `welfare` (a payload from before this field existed, or an event with
+    nothing to report — the two are indistinguishable on the wire, by design; see
+    `encode_event`) decodes to `WelfareAssessment.none()`.
+    """
+    raw = payload.get("welfare")
+    if raw is None:
+        return WelfareAssessment.none()
+    raw_welfare = cast(dict[str, Any], raw)
+    concerns = tuple(
+        WelfareConcern(
+            kind=ConcernKind(item["kind"]),
+            confidence=Confidence(item["confidence"]),
+            evidence=item["evidence"],
+        )
+        for item in cast(list[dict[str, Any]], raw_welfare["concerns"])
+    )
+    return WelfareAssessment(concerns=concerns)
 
 
 def decode_event(payload: Mapping[str, object]) -> Event:
@@ -125,4 +176,5 @@ def decode_event(payload: Mapping[str, object]) -> Event:
         clip_uri=data.get("clip_uri"),
         description_unavailable=bool(data["description_unavailable"]),
         metadata=dict(data["metadata"]),
+        welfare=_decode_welfare(data),
     )

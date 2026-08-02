@@ -16,6 +16,7 @@ from sentinel_ai.domain.entities import (
     SceneState,
     ThreatScore,
 )
+from sentinel_ai.domain.welfare import WelfareAssessment
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.event_publisher import EventPublisher
@@ -182,6 +183,17 @@ class TestFakeDetector:
     def test_an_empty_script_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="at least one entry"):
             FakeDetector(script=[])
+
+
+def test_scene_description_welfare_defaults_to_none() -> None:
+    """Task 2: every existing construction site (none of which pass `welfare`)
+    must keep working untouched."""
+    description = SceneDescription(
+        description="A person is standing near the door.",
+        threat_value=0.1,
+        suggested_action="No action required.",
+    )
+    assert description.welfare == WelfareAssessment.none()
 
 
 class TestFakeVisionLLM:

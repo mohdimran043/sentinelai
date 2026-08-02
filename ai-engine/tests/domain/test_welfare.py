@@ -67,6 +67,15 @@ class TestWelfareAssessment:
         assessment = WelfareAssessment(concerns=())
         assert assessment.basis == "single_frame_vlm"
 
+    def test_a_basis_other_than_single_frame_vlm_is_rejected_at_runtime(self) -> None:
+        """`basis: Literal["single_frame_vlm"]` is enforced by mypy only — nothing
+        stops `WelfareAssessment(concerns=(), basis="anything")` at runtime unless
+        `__post_init__` checks it too. This module deserializes into untrusted-JSON
+        boundaries (the event codec, later the VLM's own response), so the guard
+        earns its keep here rather than relying on every caller to remember."""
+        with pytest.raises(ValueError, match="basis"):
+            WelfareAssessment(concerns=(), basis="anything")  # type: ignore[arg-type]
+
     def test_is_immutable(self) -> None:
         assessment = WelfareAssessment(concerns=())
         with pytest.raises(AttributeError):

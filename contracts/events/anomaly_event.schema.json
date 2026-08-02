@@ -62,6 +62,43 @@
     "metadata": {
       "type": "object",
       "additionalProperties": { "type": "string" }
+    },
+    "welfare": {
+      "type": "object",
+      "description": "A vision-language model's opinion about this keyframe (spec §5) — never a detector's verdict, and never present unless the model reported at least one concern. Optional: omitted entirely, not an empty object, when there is nothing to report. An empty `{\"concerns\": [], \"basis\": ...}` would read as 'assessed, nothing found'; omission reads as 'not assessed' — the two are different facts and this field must not conflate them. Absent on any payload written before this field existed.",
+      "additionalProperties": false,
+      "required": ["concerns", "basis"],
+      "properties": {
+        "concerns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "confidence", "evidence"],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["collapse", "altercation", "self_harm", "medication", "distress", "other"]
+              },
+              "confidence": {
+                "type": "string",
+                "description": "Deliberately not a float and never 'certain' — a single still frame cannot honestly support more than these two grades.",
+                "enum": ["possible", "likely"]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The model's own words about what in the frame prompted this concern. Never a substance name, dose, or clinical judgement for kind=medication — only what was observed."
+              }
+            }
+          }
+        },
+        "basis": {
+          "type": "string",
+          "const": "single_frame_vlm",
+          "description": "Always this value today. A constant, not a free-form string, so a consumer can trust where the opinion came from without a side channel; a future second source gets its own basis value rather than silently widening what this one means."
+        }
+      }
     }
   }
 }

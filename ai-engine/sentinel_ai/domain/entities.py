@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import UUID
 
+from sentinel_ai.domain.welfare import WelfareAssessment
+
 
 @dataclass(frozen=True, slots=True)
 class BBox:
@@ -156,6 +158,14 @@ class Event:
 
     Neither is derived here: `domain/` reads no clock, so both arrive already computed
     (see `VlmScheduler._assemble`, the one place an `Event` is constructed).
+
+    `welfare` is a vision-language model's opinion about this keyframe (spec §5),
+    never a detector's verdict — see `domain/welfare.py`. It defaults to
+    `WelfareAssessment.none()` via `field(default_factory=...)`, not a bare default:
+    a bare `WelfareAssessment.none()` is evaluated once at class-definition time and
+    would be shared by every `Event` that never passes its own. `WelfareAssessment`
+    is frozen, so aliasing it would not corrupt state today, but the factory is
+    still the correct mechanism to reach for, not a shortcut that happens to work.
     """
 
     event_id: UUID
@@ -172,3 +182,4 @@ class Event:
     clip_uri: str | None = None
     description_unavailable: bool = False
     metadata: dict[str, str] = field(default_factory=dict)
+    welfare: WelfareAssessment = field(default_factory=WelfareAssessment.none)

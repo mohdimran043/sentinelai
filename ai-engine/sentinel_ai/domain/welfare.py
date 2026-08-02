@@ -115,6 +115,13 @@ class WelfareAssessment:
     basis: Literal["single_frame_vlm"] = "single_frame_vlm"
 
     def __post_init__(self) -> None:
+        # `Literal["single_frame_vlm"]` is a mypy-only guarantee: nothing stops
+        # `WelfareAssessment(concerns=(), basis="anything")` at runtime otherwise.
+        # This type is reconstructed at untrusted-JSON boundaries (the event codec
+        # today; a later task's VLM-response parser), so the check belongs here,
+        # once, rather than relying on every such caller to remember it.
+        if self.basis != "single_frame_vlm":
+            raise ValueError(f"basis must be 'single_frame_vlm', got {self.basis!r}")
         best_by_kind: dict[ConcernKind, WelfareConcern] = {}
         for concern in self.concerns:
             existing = best_by_kind.get(concern.kind)
