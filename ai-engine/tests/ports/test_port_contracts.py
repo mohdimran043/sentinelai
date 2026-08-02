@@ -22,9 +22,10 @@ from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.event_publisher import EventPublisher
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 from sentinel_ai.ports.model_runtime import LifecycleState, ModelRuntime
+from sentinel_ai.ports.notifier import Notifier
 from sentinel_ai.ports.tracker import Tracker
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
-from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakePublisher, FakeSource
+from tests.fakes.io import FakeClipHandle, FakeClipWriter, FakeNotifier, FakePublisher, FakeSource
 from tests.fakes.models import FakeDetector, FakeTracker, FakeVisionLLM
 
 ALL_PORTS = [
@@ -36,6 +37,7 @@ ALL_PORTS = [
     EventPublisher,
     ClipWriter,
     ClipHandle,
+    Notifier,
 ]
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
@@ -131,6 +133,7 @@ def test_lifecycle_states_cover_all_eight_from_spec_section_5() -> None:
         (FakePublisher, EventPublisher),
         (FakeClipWriter, ClipWriter),
         (FakeClipHandle, ClipHandle),
+        (FakeNotifier, Notifier),
     ],
     ids=lambda x: x.__name__,
 )
