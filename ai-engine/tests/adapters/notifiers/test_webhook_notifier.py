@@ -10,7 +10,10 @@ just be slow for no reason.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -155,22 +158,83 @@ async def test_evidence_stated_false_is_represented_in_the_payload_not_dropped(
 
 
 async def test_default_timeout_is_5_seconds(tmp_path: Path) -> None:
+    """Asserting only `notifier.timeout_seconds == 5.0` would pass even if the
+    constructor never wired the value into the `httpx.AsyncClient` at all —
+    httpx's own built-in default also happens to be 5.0. The requirement
+    under test is that the figure actually reaches the client, so the
+    assertion has to live inside the transport handler, on the request httpx
+    actually sent."""
+    seen: dict[str, object] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200)
+
     notifier = WebhookNotifier(
         "https://example.invalid/hook",
         DeadLetterSpool(tmp_path),
-        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+        transport=httpx.MockTransport(handle),
     )
     assert notifier.timeout_seconds == 5.0
 
+    await notifier.notify(a_note())
+
+    assert seen["timeout"] == {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+
 
 async def test_a_configured_timeout_overrides_the_default(tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(200)
+
     notifier = WebhookNotifier(
         "https://example.invalid/hook",
         DeadLetterSpool(tmp_path),
         timeout_seconds=1.5,
-        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+        transport=httpx.MockTransport(handle),
     )
     assert notifier.timeout_seconds == 1.5
+
+    await notifier.notify(a_note())
+
+    assert seen["timeout"] == {"connect": 1.5, "read": 1.5, "write": 1.5, "pool": 1.5}
+
+
+async def test_timeout_seconds_bounds_wall_clock_time_not_just_per_phase_gaps(
+    tmp_path: Path,
+) -> None:
+    """`httpx.Timeout` alone is per-*phase*: its `read` clock resets on every
+    byte received, so a handler that keeps producing output — however
+    slowly — never trips it. `MockTransport` makes this concrete: it enforces
+    no timeout of its own at all, so before the fix this test's handler would
+    run to completion regardless of `timeout_seconds`. Wrapping the attempt in
+    `asyncio.timeout` is what turns `timeout_seconds` into an actual
+    wall-clock bound, which is what `notify`'s docstring claims."""
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.3)  # far longer than timeout_seconds below
+        return httpx.Response(200)
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        timeout_seconds=0.02,
+        max_attempts=1,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    started = time.monotonic()
+    await notifier.notify(a_note())  # must not raise
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2  # bounded by timeout_seconds, not the handler's 0.3s sleep
+    (path,) = sorted(tmp_path.glob("*.json"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["error_type"] == "TimeoutError"
 
 
 async def test_a_timeout_does_not_raise_and_the_note_is_dead_lettered(tmp_path: Path) -> None:
@@ -305,11 +369,54 @@ async def test_a_401_is_not_retried_either(tmp_path: Path) -> None:
     assert attempts["n"] == 1
 
 
+async def test_a_3xx_response_is_not_treated_as_success(tmp_path: Path) -> None:
+    """`httpx.AsyncClient` defaults to `follow_redirects=False` (and this
+    module deliberately never turns that on — see the module docstring: a
+    redirect target could exfiltrate the token-bearing URL), so a 301/302/307/
+    308 comes back as a normal `Response`, not an exception. Treating
+    anything under 400 as success — the bug this test guards against — means
+    an ntfy host that 308s to its canonical URL, or an auth proxy that 302s
+    to a login page, silently discards every welfare alert from that moment:
+    no retry, no dead-letter, no log line. A 3xx must fail like any other
+    non-2xx response and must not be retried (it will be the same redirect
+    next attempt)."""
+    attempts = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(302, headers={"Location": "https://example.invalid/elsewhere"})
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=3,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())  # must not raise
+
+    assert attempts["n"] == 1
+    assert sleep.calls == []
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
 async def test_the_webhook_url_never_appears_in_a_log_line(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The URL may carry a per-recipient token (ntfy/Slack put it in the
-    path) — same discipline this codebase already applies to RTSP URLs."""
+    path) — same discipline this codebase already applies to RTSP URLs.
+    httpx logs its own "HTTP Request: POST <url> ..." line at INFO on the
+    process-wide `httpx` logger (see `_client.py`), independent of anything
+    this module logs itself, so redaction has to actually intercept that
+    line rather than merely avoid emitting the URL from this module's own
+    calls.
+
+    `install_httpx_log_redaction` is explicit, not a constructor side
+    effect (see its docstring for why), so this test calls it — and removes
+    it again in `finally`, so the filter does not leak onto the process-wide
+    `httpx` logger for every test after this one."""
     secret_url = "https://example.invalid/webhook/super-secret-token-xyz"
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -325,12 +432,48 @@ async def test_the_webhook_url_never_appears_in_a_log_line(
         transport=httpx.MockTransport(handle),
     )
 
-    import logging
-
-    with caplog.at_level(logging.DEBUG):
-        await notifier.notify(a_note())
+    notifier.install_httpx_log_redaction()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            await notifier.notify(a_note())
+            # Positive control: a targeted filter must leave every other
+            # httpx diagnostic alone — this is the whole reason the fix is a
+            # `Filter` and not the blanket `setLevel(WARNING)` it replaces,
+            # which would have thrown this line away along with the URL.
+            logging.getLogger("httpx").info("connection pool created")
+    finally:
+        notifier.remove_httpx_log_redaction()
 
     assert "super-secret-token-xyz" not in caplog.text
+    assert "<webhook url redacted>" in caplog.text
+    assert "connection pool created" in caplog.text
+
+
+async def test_removing_the_redaction_filter_lets_the_url_through_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Proves `remove_httpx_log_redaction` actually detaches the filter,
+    rather than merely existing as an unused method — install, log a
+    matching line, remove, log another matching line, and only the first
+    one should be redacted."""
+    secret_url = "https://example.invalid/webhook/super-secret-token-xyz"
+    notifier = WebhookNotifier(
+        secret_url,
+        DeadLetterSpool(tmp_path),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+    )
+    httpx_logger = logging.getLogger("httpx")
+
+    notifier.install_httpx_log_redaction()
+    with caplog.at_level(logging.DEBUG):
+        httpx_logger.info("first line mentions %s", secret_url)
+    notifier.remove_httpx_log_redaction()
+    with caplog.at_level(logging.DEBUG):
+        httpx_logger.info("second line mentions %s", secret_url)
+
+    records = [r.getMessage() for r in caplog.records]
+    assert any("redacted" in m and secret_url not in m for m in records)
+    assert any(secret_url in m for m in records)
 
 
 async def test_notify_never_raises_even_when_the_dead_letter_write_itself_fails() -> None:
@@ -345,6 +488,212 @@ async def test_notify_never_raises_even_when_the_dead_letter_write_itself_fails(
     )
 
     await notifier.notify(a_note())  # must not raise
+
+
+async def test_a_closed_client_dead_letters_the_note_instead_of_dropping_it(
+    tmp_path: Path,
+) -> None:
+    """`_deliver` only converts `httpx.RequestError` into a dead-letter, so
+    anything else escaping `self._client.post` used to bypass `store()`
+    entirely and vanish. Calling `notify()` after `aclose()` is not a
+    contrived case: it is exactly the ordering the composition root produces
+    on shutdown if an escalation worker still has a note queued when
+    `aclose()` runs — the same race `orchestrator.service._spill_to_dead_letter`
+    exists to close for events. httpx raises a plain `RuntimeError` (not an
+    `httpx.RequestError`) for a post-close request, so this exercises the
+    exact gap."""
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+    )
+    await notifier.aclose()
+    note = a_note()
+
+    await notifier.notify(note)  # must not raise
+
+    (path,) = sorted(tmp_path.glob("*.json"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["error_type"] == "RuntimeError"
+    assert record["event"]["camera_id"] == "cam-1"
+
+
+async def test_a_non_httpx_exception_from_the_transport_is_dead_lettered_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """A `ValueError` (or any exception that is not an `httpx.RequestError`)
+    raised out of the transport is exactly as capable of losing a note as
+    the closed-client case above — this proves the fix is general, not a
+    special case for `RuntimeError` alone."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise ValueError("simulated non-httpx transport failure")
+
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        transport=httpx.MockTransport(handle),
+    )
+    note = a_note()
+
+    await notifier.notify(note)  # must not raise
+
+    (path,) = sorted(tmp_path.glob("*.json"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["error_type"] == "ValueError"
+    assert record["event"]["camera_id"] == "cam-1"
+
+
+async def test_a_non_httpx_exception_is_dead_lettered_even_if_the_store_itself_then_fails() -> None:
+    """The nested dead-letter attempt in `notify()`'s catch-all must itself
+    never raise — mirrors `test_notify_never_raises_even_when_the_dead_letter_write_itself_fails`
+    but for the non-`RequestError` path specifically, since that path is a
+    separate `except` branch in the implementation."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise ValueError("simulated non-httpx transport failure")
+
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        _RaisingDeadLetter(),
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())  # must not raise
+
+
+async def test_429_is_retried_honouring_a_parseable_retry_after(tmp_path: Path) -> None:
+    """ntfy and Slack rate-limit with 429, and a burst of simultaneous
+    welfare alerts is exactly the moment a 429 is most likely — and the
+    moment dropping the note to the dead letter instead of retrying matters
+    most. The configured `initial_backoff_seconds` is set to an obviously
+    wrong value (5.0) so the test fails loudly if `Retry-After` is ignored
+    in favour of normal backoff."""
+    attempts = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
+        return httpx.Response(200)
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=3,
+        initial_backoff_seconds=5.0,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert attempts["n"] == 2
+    assert sleep.calls == pytest.approx([0.25])
+    assert list(tmp_path.glob("*.json")) == []
+
+
+async def test_429_without_a_parseable_retry_after_falls_back_to_normal_backoff(
+    tmp_path: Path,
+) -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)  # no Retry-After header at all
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=3,
+        initial_backoff_seconds=0.5,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert sleep.calls == pytest.approx([0.5, 1.0])  # normal doubling, unaffected
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+async def test_a_non_numeric_retry_after_also_falls_back_to_normal_backoff(
+    tmp_path: Path,
+) -> None:
+    """`Retry-After` may be an HTTP-date (`Wed, 21 Oct 2026 07:28:00 GMT`)
+    rather than a plain second count; this module only honours the numeric
+    form (see `_parse_retry_after`'s docstring), so a date string must fall
+    back exactly like a missing header."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=2,
+        initial_backoff_seconds=0.5,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert sleep.calls == pytest.approx([0.5])
+
+
+async def test_a_hostile_retry_after_is_capped_at_max_backoff_seconds(tmp_path: Path) -> None:
+    """A huge (or malicious) `Retry-After` must not be able to pin a worker
+    indefinitely — capped at the same ceiling normal backoff already
+    respects."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "999999"})
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=2,
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=3.0,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert sleep.calls == pytest.approx([3.0])
+
+
+async def test_408_is_retried_rather_than_dead_lettered_on_the_first_attempt(
+    tmp_path: Path,
+) -> None:
+    """408 (Request Timeout) is the other deliberate exception to "4xx never
+    retries": a server-side request timeout is transient in the same way a
+    connection timeout is."""
+    attempts = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            return httpx.Response(408)
+        return httpx.Response(200)
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        max_attempts=3,
+        initial_backoff_seconds=0.1,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert attempts["n"] == 2
+    assert list(tmp_path.glob("*.json")) == []
 
 
 async def test_backoff_is_capped_at_max_backoff_seconds(tmp_path: Path) -> None:

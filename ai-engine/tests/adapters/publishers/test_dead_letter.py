@@ -10,7 +10,9 @@ import pytest
 
 from sentinel_ai.adapters.publishers.dead_letter import DeadLetterSpool
 from sentinel_ai.domain.entities import EscalationReason, Event, ThreatScore
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.ports.event_publisher import FailedEventSink
+from sentinel_ai.ports.notifier import WelfareNote
 
 
 def an_event(camera_id: str = "cam-1") -> Event:
@@ -24,6 +26,26 @@ def an_event(camera_id: str = "cam-1") -> Event:
         suggested_action="Monitor.",
         labels=("person",),
         track_ids=(1,),
+    )
+
+
+def a_welfare_note(camera_id: str = "cam-1") -> WelfareNote:
+    return WelfareNote(
+        event_id=uuid4(),
+        camera_id=camera_id,
+        label="Front Door",
+        zone="entrance",
+        occurred_at=12.5,
+        severity="high",
+        description="A person is lying motionless on the floor.",
+        concerns=(
+            WelfareConcern(
+                kind=ConcernKind.COLLAPSE,
+                confidence=Confidence.LIKELY,
+                evidence="Person is prone and not moving.",
+            ),
+        ),
+        clip_uri=None,
     )
 
 
@@ -56,6 +78,33 @@ async def test_it_does_not_use_encode_event(tmp_path: Path) -> None:
 
     (path,) = sorted(tmp_path.glob("*.json"))
     assert json.loads(path.read_text(encoding="utf-8"))["event"]["camera_id"] == ""
+
+
+async def test_the_record_carries_a_type_discriminator_for_events(tmp_path: Path) -> None:
+    """The spool now holds two record shapes (`Event`, from the publisher
+    path, and `WelfareNote`, from Task 6's webhook notifier), distinguished
+    only by which fields happen to be present. This module's own docstring
+    calls the output "for an operator (or a repair script)" — a repair
+    script written against the `Event` shape would `KeyError` on `reason`
+    for a welfare note it did not know to expect. `record_type` makes the
+    shape explicit instead of inferred."""
+    sink = DeadLetterSpool(tmp_path)
+
+    await sink.store(an_event(), ValueError("one"))
+
+    (path,) = sorted(tmp_path.glob("*.json"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["record_type"] == "Event"
+
+
+async def test_the_record_carries_a_type_discriminator_for_welfare_notes(tmp_path: Path) -> None:
+    sink = DeadLetterSpool(tmp_path)
+
+    await sink.store(a_welfare_note(), RuntimeError("webhook responded with HTTP 503"))
+
+    (path,) = sorted(tmp_path.glob("*.json"))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["record_type"] == "WelfareNote"
 
 
 async def test_two_failures_in_the_same_nanosecond_do_not_overwrite_each_other(

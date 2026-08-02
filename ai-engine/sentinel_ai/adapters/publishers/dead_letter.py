@@ -30,6 +30,13 @@ and `Notifier`/`WelfareNote` are deliberately not folded into `EventPublisher`
 for a second purpose — see `ports/notifier.py`'s module docstring); widening
 only the concrete override is a contravariant, LSP-legal change that every
 caller going through the narrower port interface never observes.
+
+Because the spool now holds two record shapes with nothing else forcing a
+reader to tell them apart, `store` writes a `record_type` field (`"Event"` or
+`"WelfareNote"`, from `type(event).__name__`) into every record: this file's
+own docstring calls the output "for an operator (or a repair script)," and a
+repair script written against one shape would `KeyError` on a field the
+other does not have.
 """
 
 from __future__ import annotations
@@ -63,6 +70,15 @@ class DeadLetterSpool(FailedEventSink):
         base = f"{time.time_ns():020d}-{self._seq:08d}-{event.event_id.hex}"
         record = {
             "recorded_at_ns": time.time_ns(),
+            # The spool holds two record shapes now — `Event` from the
+            # publisher path, `WelfareNote` from Task 6's webhook notifier —
+            # distinguished only by which fields happen to be present
+            # otherwise. This module's own docstring calls the output "for
+            # an operator (or a repair script)"; a repair script written
+            # against the `Event` shape would `KeyError` on `reason` for a
+            # welfare note it did not know to expect. `record_type` makes
+            # the shape explicit instead of something a reader has to infer.
+            "record_type": type(event).__name__,
             "error_type": type(error).__name__,
             "error": str(error),
             "event": _best_effort(event),

@@ -136,7 +136,7 @@ in the delivered clip — **always more context, never less**.
 | `SENTINEL_RABBITMQ_EXCHANGE` | `sentinel.events` | Topic exchange. **No queue is bound by default** — to see events you must bind a consumer to `anomaly.#` before the engine publishes. |
 | `SENTINEL_EVENT_SPOOL_DIR` | `./var/spool/events` | Disk buffer for validated events waiting on a broker that is merely down. Replayed automatically. |
 | `SENTINEL_BROKER_REPLAY_INTERVAL_SECONDS` | `30.0` | How often `main.BrokerLink` re-drains the spool while the broker is up. A disk buffer is only half a guarantee without something replaying it; this is that something's period. |
-| `SENTINEL_DEAD_LETTER_DIR` | `./var/spool/dead-letter` | Last resort for events that failed for a reason replay cannot fix — a schema violation, an unwritable spool, a transport bug. **Deliberately separate** from the spool: mixing them would put a permanently-unacceptable payload at the front of the replay queue. |
+| `SENTINEL_DEAD_LETTER_DIR` | `./var/spool/dead-letter` | Last resort for events that failed for a reason replay cannot fix — a schema violation, an unwritable spool, a transport bug — **and** welfare notes the webhook notifier could not deliver (a non-2xx/3xx response, a connection failure or timeout after retries were exhausted). Each record carries `record_type` (`"Event"` or `"WelfareNote"`) so a repair script can tell the two shapes apart. **Deliberately separate** from the spool: mixing them would put a permanently-unacceptable payload at the front of the replay queue. |
 
 ## Object storage
 
