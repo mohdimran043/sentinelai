@@ -21,15 +21,66 @@ def test_the_document_covers_the_endpoints_phase_1c_consumes() -> None:
     assert set(paths) == {
         "/health",
         "/cameras",
+        "/cameras/{camera_id}",
         "/cameras/{camera_id}/telemetry",
         "/cameras/{camera_id}/events",
         "/cameras/{camera_id}/describe",
         "/events/stream",
     }
+    assert set(paths["/cameras/{camera_id}"]) == {"patch"}
     assert set(paths["/cameras/{camera_id}/describe"]) == {"post"}
     assert set(paths["/cameras/{camera_id}/telemetry"]) == {"get"}
     assert set(paths["/cameras/{camera_id}/events"]) == {"get"}
     assert set(paths["/events/stream"]) == {"get"}
+
+
+class TestTheWriteEndpointIsDocumentedAsUnauthenticated:
+    """The one write endpoint in the engine, in a build with no authentication.
+
+    Everything asserted here is prose in the generated contract rather than
+    behaviour, and that is the point: the person most likely to expose this port
+    to a network is reading the contract, not this repository. A Phase 1C client
+    author who cannot see from the document alone that the endpoint is
+    unauthenticated, off by default, and persistent has not been warned.
+    """
+
+    def test_the_operation_says_it_is_unauthenticated_and_off_by_default(self) -> None:
+        operation = openapi_document()["paths"]["/cameras/{camera_id}"]["patch"]
+        text = f"{operation['summary']} {operation['description']}".lower()
+        assert "no authentication" in text or "not authenticated" in text
+        assert "sentinel_enable_camera_writes" in text
+        assert "403" in str(operation["responses"]) or "403" in operation["responses"]
+
+    def test_the_operation_names_what_it_will_not_change_and_why(self) -> None:
+        """A field the endpoint refuses is only honest if the refusal is in the
+        contract. Otherwise a client author builds a URL editor, discovers the 422
+        in production, and reasonably concludes the engine is broken."""
+        operation = openapi_document()["paths"]["/cameras/{camera_id}"]["patch"]
+        text = operation["description"].lower()
+        assert "url" in text
+        assert "profile" in text
+        assert "restart" in text
+
+    def test_the_operation_says_the_edit_is_persisted(self) -> None:
+        """ "Applied" and "written down" are different promises, and an operator who
+        assumes the second when only the first is true loses the change at the next
+        restart with nothing to tell them it happened."""
+        operation = openapi_document()["paths"]["/cameras/{camera_id}"]["patch"]
+        assert "cameras.json" in operation["description"]
+
+    def test_the_camera_list_publishes_whether_writes_are_possible(self) -> None:
+        """A console must be able to render the record read-only rather than
+        offering a control that 403s."""
+        schema = openapi_document()["components"]["schemas"]["CamerasResponse"]
+        assert "config_writable" in schema["properties"]
+        assert "config_writable" in schema["required"]
+
+    def test_the_edit_request_admits_only_the_two_editable_fields(self) -> None:
+        """`additionalProperties: false` is what makes a generated client's `url`
+        field a compile-time impossibility rather than a runtime surprise."""
+        schema = openapi_document()["components"]["schemas"]["CameraEditRequest"]
+        assert set(schema["properties"]) == {"label", "zone"}
+        assert schema["additionalProperties"] is False
 
 
 def test_the_stream_is_declared_as_an_event_stream_not_as_json() -> None:

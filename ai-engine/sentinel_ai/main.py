@@ -51,6 +51,15 @@ nested profile: flattening a list of those into `SENTINEL_*` names is a worse
 interface than one small document that can be diffed, reviewed and mounted into a
 container. Everything that is genuinely a process-wide scalar stays in `Settings`.
 
+The reader, the writer and the record itself now live in
+`sentinel_ai.adapters.config.camera_file`; they are re-exported here because this
+module composed them first and because `load_cameras` is still called from exactly
+one place, `create_default_app` below. `PATCH /cameras/{id}` edits `label` and
+`zone` through `CameraFileStore` — persisted to the same file, then applied to the
+running `CameraRunner` — and `url` and `profile` stay restart-only. See that
+module's docstring for why the line is drawn there, and `Settings.enable_camera_writes`
+for why the endpoint is off unless a deployment turns it on.
+
 Composition happens at startup, not at import
 ---------------------------------------------
 `RtspSource.__init__` calls `asyncio.create_task`, so a camera cannot be constructed
@@ -65,17 +74,23 @@ a `cameras.json` present.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI
 
+from sentinel_ai.adapters.config.camera_file import (
+    CameraConfig,
+    CameraConfigError,
+    CameraEdit,
+    CameraFileStore,
+    load_cameras,
+)
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector, select_device
 from sentinel_ai.adapters.publishers.dead_letter import DeadLetterSpool
 from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
@@ -87,8 +102,6 @@ from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.app import create_app
 from sentinel_ai.config import Settings, get_settings
-from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
@@ -114,6 +127,8 @@ __all__ = [
     "BrokerLink",
     "CameraConfig",
     "CameraConfigError",
+    "CameraEdit",
+    "CameraFileStore",
     "ComposedService",
     "Composition",
     "Models",
@@ -138,32 +153,6 @@ nothing at all, whereas a camera without the VLM still detects and still publish
 
 _VLM_PRIORITY = 50
 
-_PROFILE_FIELDS = frozenset(field.name for field in fields(CameraProfile)) - {"camera_id"}
-
-
-class CameraConfigError(ValueError):
-    """The camera file is missing, unparseable, or describes something unbuildable.
-
-    Fail-loud at startup on purpose: every alternative (skip the bad camera, fall
-    back to defaults) produces a process that runs while silently watching fewer
-    cameras than the operator configured.
-    """
-
-
-@dataclass(frozen=True, slots=True)
-class CameraConfig:
-    camera_id: str
-    label: str
-    url: str
-    profile: CameraProfile
-    zone: Zone | None = None
-    """Which space this camera watches, or None when nobody has grouped it.
-
-    Optional, and its absence is *not* a configuration error: every camera file
-    written before zones existed keeps loading, and an ungrouped camera is a true
-    statement about a deployment rather than a broken one. A zone that is *present and
-    unknown* is a different thing — see `_zone_from`."""
-
 
 @dataclass(frozen=True, slots=True)
 class Models:
@@ -186,111 +175,11 @@ class Composition:
     registry: ModelRegistry
     publisher: RabbitMQPublisher
     broker: BrokerLink
-
-
-# -- camera configuration -----------------------------------------------------------
-
-
-def _profile_from(camera_id: str, raw: Mapping[str, Any]) -> CameraProfile:
-    unknown = sorted(set(raw) - _PROFILE_FIELDS)
-    if unknown:
-        raise CameraConfigError(
-            f"camera {camera_id!r}: unknown profile field(s) {unknown}; "
-            f"valid fields are {sorted(_PROFILE_FIELDS)}"
-        )
-    overrides = dict(raw)
-    if "salient_classes" in overrides:
-        overrides["salient_classes"] = frozenset(overrides["salient_classes"])
-    try:
-        return CameraProfile(camera_id=camera_id, **overrides)
-    except (TypeError, ValueError) as exc:
-        # CameraProfile.__post_init__ enforces its own invariants; surfacing them as
-        # a CameraConfigError keeps every startup configuration failure one type.
-        raise CameraConfigError(f"camera {camera_id!r}: invalid profile: {exc}") from exc
-
-
-def _zone_from(camera_id: str, raw: Any) -> Zone | None:
-    """Absent means ungrouped; present-but-unknown means the file is wrong.
-
-    Keeping those two apart is the whole contract of this field. Silently downgrading
-    `"hallway"` to ungrouped would produce a console that looks right and quietly
-    leaves a camera out of the group the operator put it in — the same class of
-    failure `_profile_from`'s unknown-field check exists to prevent — while treating
-    the absent case as an error would make every pre-zone camera file unloadable for
-    no gain.
-    """
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise CameraConfigError(
-            f"camera {camera_id!r}: 'zone' must be a string or absent, got {type(raw).__name__}"
-        )
-    try:
-        return Zone(raw)
-    except ValueError:
-        raise CameraConfigError(
-            f"camera {camera_id!r}: unknown zone {raw!r}; "
-            f"valid zones are {[zone.value for zone in Zone]}, or omit the field to "
-            f"leave the camera ungrouped"
-        ) from None
-
-
-def load_cameras(path: Path) -> tuple[CameraConfig, ...]:
-    """Read and validate the camera list. See this module's docstring for the shape."""
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise CameraConfigError(
-            f"no camera configuration at {path} — copy cameras.example.json, or point "
-            f"SENTINEL_CAMERAS_FILE somewhere else"
-        ) from None
-    except json.JSONDecodeError as exc:
-        raise CameraConfigError(f"{path} is not valid JSON: {exc}") from exc
-
-    if not isinstance(document, dict) or not isinstance(document.get("cameras"), list):
-        raise CameraConfigError(f"{path} must be an object with a 'cameras' array")
-
-    entries: list[Any] = document["cameras"]
-    if not entries:
-        # An engine with no cameras starts, serves /health, and watches nothing. That
-        # is never what an operator meant.
-        raise CameraConfigError(f"{path} configures no cameras")
-
-    configs: list[CameraConfig] = []
-    seen: set[str] = set()
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise CameraConfigError(f"{path}: cameras[{index}] must be an object")
-        camera_id = entry.get("id")
-        url = entry.get("url")
-        if not isinstance(camera_id, str) or not camera_id:
-            raise CameraConfigError(f"{path}: cameras[{index}] needs a non-empty string 'id'")
-        if not isinstance(url, str) or not url:
-            raise CameraConfigError(f"{path}: camera {camera_id!r} needs a non-empty string 'url'")
-        if camera_id in seen:
-            # Duplicates are silently survivable — `EngineService` keys cameras by id,
-            # so the second would simply replace the first and one camera would never
-            # be watched.
-            raise CameraConfigError(f"{path}: duplicate camera id {camera_id!r}")
-        seen.add(camera_id)
-
-        label = entry.get("label", camera_id)
-        if not isinstance(label, str) or not label:
-            raise CameraConfigError(f"{path}: camera {camera_id!r} 'label' must be a non-empty str")
-        raw_profile = entry.get("profile", {})
-        if not isinstance(raw_profile, dict):
-            raise CameraConfigError(f"{path}: camera {camera_id!r} 'profile' must be an object")
-
-        configs.append(
-            CameraConfig(
-                camera_id=camera_id,
-                label=label,
-                url=url,
-                profile=_profile_from(camera_id, raw_profile),
-                zone=_zone_from(camera_id, entry.get("zone")),
-            )
-        )
-    return tuple(configs)
+    camera_store: CameraFileStore
+    """The writer behind `PATCH /cameras/{id}`, over the same file `load_cameras`
+    read. Held here rather than inside `EngineService` because the engine owns
+    running cameras and this owns the record of configured ones; `ComposedService`
+    is the only thing that needs both, and it is the only thing that has both."""
 
 
 # -- adapter construction -----------------------------------------------------------
@@ -564,7 +453,15 @@ def compose(
         replay_interval_seconds=settings.broker_replay_interval_seconds,
     )
     return Composition(
-        service=service, registry=models.registry, publisher=publisher, broker=broker
+        service=service,
+        registry=models.registry,
+        publisher=publisher,
+        broker=broker,
+        # The same path `load_cameras` was handed above. Deliberately re-read on
+        # every edit rather than caching the document composition already parsed:
+        # the operator who mounted this file can still edit it by hand, and the
+        # console must not silently overwrite what they wrote.
+        camera_store=CameraFileStore(Path(settings.cameras_file)),
     )
 
 
@@ -678,6 +575,44 @@ class ComposedService:
             raise UnknownCameraError(camera_id)
         return await self._composition.service.describe_now(camera_id)
 
+    async def update_camera(self, camera_id: str, edit: CameraEdit) -> CameraConfig:
+        """Persist an edit to `cameras.json`, then apply it to the running camera.
+
+        Composition-root work by nature: it needs the file (which `EngineService`
+        knows nothing about) and the runner (which `CameraFileStore` knows nothing
+        about), and this is the one object holding both.
+
+        The order below is the whole safety property, and each step exists because
+        the alternative ordering is silently wrong:
+
+          1. **unknown camera first**, via `telemetry()`, so an id the engine never
+             heard of is a 404 that never opened the file. Writing first would let
+             a typo'd id rewrite a document — and, because `edited_document` also
+             refuses an unknown id, would turn a plain 404 into a confusing 409;
+          2. **persist second.** If the write fails, nothing has been applied: the
+             running camera still matches the file, and the operator gets an error
+             instead of a change that vanishes at the next restart;
+          3. **apply third, from the record the store read back**, not from the
+             request. Applying the request would let memory and disk disagree
+             wherever the file's normalisation differs from what was asked for.
+
+        A failure in (2) therefore leaves the system exactly as it was, and a
+        success in (2) is always followed by (3) — the apply is two attribute
+        writes on an object already proven to exist, with no await between them, so
+        there is no window where the file has moved and the camera has not.
+        """
+        if self._composition is None:
+            raise UnknownCameraError(camera_id)
+        self._composition.service.telemetry(camera_id)
+        record = await self._composition.camera_store.apply(camera_id, edit)
+        self._composition.service.update_camera_metadata(
+            camera_id, label=record.label, zone=record.zone
+        )
+        logger.info(
+            "camera %s reconfigured: label=%r zone=%s", camera_id, record.label, record.zone
+        )
+        return record
+
 
 def create_default_app() -> FastAPI:
     """The app `uvicorn sentinel_ai.main:app` serves."""
@@ -695,7 +630,13 @@ def create_default_app() -> FastAPI:
             build_dead_letter(settings),
         )
 
-    return create_app(ComposedService(build))
+    if settings.enable_camera_writes:
+        logger.warning(
+            "camera writes are ENABLED and this engine has no authentication: anyone "
+            "who can reach this port can relabel and re-zone cameras. Bind it to "
+            "localhost or put an authenticating proxy in front of it."
+        )
+    return create_app(ComposedService(build), camera_writes_enabled=settings.enable_camera_writes)
 
 
 app = create_default_app()

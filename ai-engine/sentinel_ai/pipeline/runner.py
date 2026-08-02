@@ -131,6 +131,16 @@ class CameraTelemetry:
     discontinuities: int
     last_frame_at: float | None
     last_escalation_at: float | None
+    label: str
+    """The camera's display name — `cameras.json`'s `label`, defaulting to the id.
+
+    Here for the same reason `zone` is, and now for a second one: it is editable at
+    runtime (`PATCH /cameras/{id}`), and a console that can change a label has to be
+    able to read back the label the engine is actually using. Required rather than
+    defaulted precisely because of that — a telemetry record whose label silently
+    fell back to `""` would render as a nameless camera and look like a save that
+    half-worked.
+    """
     zone: Zone | None = None
     """Which zone this camera watches, or None when nobody has grouped it (T1).
 
@@ -297,9 +307,30 @@ class CameraRunner:
             now=now,
         )
 
+    def apply_metadata(self, *, label: str, zone: Zone | None) -> None:
+        """Change what this camera is *called* and where it is *grouped*, live.
+
+        Safe to do to a running camera precisely because neither field is policy:
+        the loop never branches on either (see `_zone`'s note in `__init__`), so no
+        decision already taken can be invalidated by changing them. They are read
+        at two points — `telemetry()` and `_escalate`'s request assembly — and both
+        are synchronous reads with no await between the read and its use, so an
+        edit lands wholly before or wholly after an escalation and can never split
+        one.
+
+        Whole-record rather than per-field on purpose: the caller has just read the
+        persisted record, and passing both keeps "apply what the file now says" a
+        single statement instead of two conditionals that could apply one and skip
+        the other. `url` and `profile` have no equivalent here and must not grow
+        one — see `adapters/config/camera_file.py`.
+        """
+        self._camera_label = label
+        self._zone = zone
+
     def telemetry(self) -> CameraTelemetry:
         return CameraTelemetry(
             camera_id=self._camera_id,
+            label=self._camera_label,
             frames_seen=self._frames_seen,
             frames_dropped=self._slot.dropped if self._slot is not None else 0,
             detections_run=self._detections_run,

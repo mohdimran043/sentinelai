@@ -26,7 +26,8 @@ RTSP / file ─┬─► decode ──► detect ──► track ──► motio
 | Area | State |
 |---|---|
 | AI engine pipeline — decode, detect, track, motion, gate, VLM, clip, publish | **Working**, verified end to end on a real GPU box |
-| FastAPI control surface | **Working** — `/health`, `/cameras`, `/cameras/{id}/telemetry`, `POST /cameras/{id}/describe`. A fifth, `GET /cameras/{id}/events`, is landing as this is written |
+| FastAPI control surface | **Working** — `/health`, `/cameras`, `/cameras/{id}/telemetry`, `/cameras/{id}/events`, `/events/stream`, `POST /cameras/{id}/describe`, and `PATCH /cameras/{id}` to edit a camera's label and zone |
+| Editing cameras from the console | **Working**, and **off by default.** The engine has no authentication, so the one write endpoint ships disabled behind `SENTINEL_ENABLE_CAMERA_WRITES`. `label` and `zone` are editable live and persisted to `cameras.json`; `url` and `profile` require a restart and are rejected rather than ignored. See [docs/operations.md](docs/operations.md#editing-cameras-from-the-console) |
 | RabbitMQ publishing with disk spool + replay + dead-letter | **Working** |
 | MinIO evidence clips (remux, 3 s pre-roll + 5 s post-roll) | **Working** |
 | VRAM residency planner, LRU + priority eviction, 600 s VLM idle unload | **Working** |

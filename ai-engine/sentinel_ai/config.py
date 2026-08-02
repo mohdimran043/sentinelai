@@ -28,6 +28,26 @@ class Settings(BaseSettings):
     a list of those into `SENTINEL_*` names is a worse interface than one small
     JSON document that can be diffed, reviewed and mounted into a container."""
 
+    enable_camera_writes: bool = False
+    """Whether `PATCH /cameras/{id}` may change anything. **Off by default.**
+
+    This engine has no authentication — the console's login screen is a shell and
+    JWT is Phase 1C — so every endpoint is open to whatever can reach the port. For
+    the read endpoints that is a disclosure question; for a write endpoint it is a
+    control question, and the two are not the same size. A camera's label and zone
+    are what an operator navigates by and what a console groups by, so an anonymous
+    caller who can rewrite them can make a camera look like a different camera, and
+    the change persists to `cameras.json` and survives the restart that would
+    otherwise undo it.
+
+    Default-off means a deployment that has not thought about this is not writable
+    by anyone who finds it, and the operator who turns it on is the one who decided
+    the port is reachable only by people who should be able to do this. The route
+    still exists in the OpenAPI document either way — a contract that changes shape
+    with a runtime flag is worse than a documented 403 — and answers 403 while this
+    is false. See `docs/operations.md`.
+    """
+
     device: str | None = None
     """Torch device for both models. `None` auto-detects via
     `yolo11.select_device()` (cuda when visible, else cpu). Set it explicitly to

@@ -26,6 +26,7 @@ spelling.
 | Setting | Default | Effect |
 |---|---|---|
 | `SENTINEL_CAMERAS_FILE` | `./cameras.json` | Path to the camera list. See [below](#camerasjson). |
+| `SENTINEL_ENABLE_CAMERA_WRITES` | `false` | Whether `PATCH /cameras/{id}` may edit a camera's `label` and `zone` and write the change back to this file. **Off by default: the engine has no authentication**, so an enabled write endpoint is reconfigurable by anything that can reach the port. Read [Operations → Editing cameras from the console](operations.md#editing-cameras-from-the-console) before turning it on. |
 | `SENTINEL_DEVICE` | *(unset)* | Torch device for **both** models. Unset auto-detects via `yolo11.select_device()` — CUDA when visible, else CPU. Set it to pin a device, or to force CPU on a box that has a GPU. |
 
 ## VRAM budget
@@ -180,6 +181,25 @@ credentials in them.
 - `profile` overrides any `CameraProfile` field. It is validated against that
   dataclass's own field names, so a typo **fails at startup** rather than
   silently doing nothing.
+- `zone` is optional, and constrained to `room` | `corridor` | `dayroom`. Omit
+  it and the camera is ungrouped, which is a legitimate deployment. Give it a
+  value the engine does not know and **startup fails**: a typo'd zone is a
+  camera the operator meant to group and silently did not.
+
+### This file is written as well as read
+
+With `SENTINEL_ENABLE_CAMERA_WRITES=true`, `PATCH /cameras/{id}` edits `label`
+and `zone` **in this file** — write-then-rename, with the whole document
+re-validated before anything is written. Consequences worth knowing:
+
+- Comment keys (`_comment`, `_note`), profiles, URLs, other cameras and any
+  field a later version adds are all preserved; the file is edited, not
+  regenerated. Formatting is normalised to 2-space JSON, so expect a reflow on
+  the first write.
+- `url` and `profile` are **never** written by the console and are rejected with
+  a 422 if a request names them. Both require editing this file and restarting.
+- If the console and a hand-edit race, the console loses: an edit naming a
+  camera this file no longer holds is a 409 and nothing is written.
 
 ### Per-camera profile fields
 

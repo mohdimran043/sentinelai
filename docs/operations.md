@@ -58,8 +58,9 @@ nor a `cameras.json` present.
 | Endpoint | Returns |
 |---|---|
 | `GET /health` | Per-model `state`, `detail`, `vram_mib` |
-| `GET /cameras` | `CameraStatus` for every camera |
-| `GET /cameras/{id}/telemetry` | One camera's counters. 404 if unknown |
+| `GET /cameras` | `CameraStatus` for every camera, plus `config_writable` — whether the PATCH below will do anything on this deployment |
+| `GET /cameras/{id}/telemetry` | One camera's counters, its `label` and its `zone`. 404 if unknown |
+| `PATCH /cameras/{id}` | **Write.** Edits `label` and `zone`, persisted to `cameras.json`. **Off by default** — 403 unless `SENTINEL_ENABLE_CAMERA_WRITES=true`. See [Editing cameras from the console](#editing-cameras-from-the-console) |
 | `POST /cameras/{id}/describe` | Forces a `user_requested` escalation, returns `event_id` |
 | `GET /cameras/{id}/events` | A bounded ring of that camera's recent events, capped at 200, plus `latest` and `latest_description_state` (`none`/`available`/`unavailable`). Volatile — this is the console's view, not the event store. RabbitMQ plus the Go consumer is the durable record. 404 if unknown |
 | `GET /events/stream` | `text/event-stream`. Opens with `event: backlog` carrying a JSON array, then streams live events. A sequence watermark makes the backlog-to-live handover gapless and duplicate-free; the same `event_id` at a higher sequence is a legitimate new version, not a repeat — that is how a clip URI back-fills onto an event a client already displayed. The ring is bounded, so a long disconnect genuinely loses history |
@@ -75,6 +76,55 @@ Two things to know when reading `/health`:
 - The VLM sitting at `UNLOADED` is usually **correct** — it is the 600 s idle
   unload having fired, not a fault. A camera watching an empty corridor is
   supposed to look like that.
+
+### Editing cameras from the console
+
+`PATCH /cameras/{id}` is the engine's only endpoint that changes anything
+durable. It is **disabled by default** and answers 403 until a deployment sets:
+
+```bash
+SENTINEL_ENABLE_CAMERA_WRITES=true
+```
+
+> **Read this before you set it.** The engine has **no authentication** — see
+> [Known deployment gaps §3](#3-no-authentication). Every other endpoint is a
+> read, so an exposed port has so far cost you information. This one is a write,
+> and a persisted one: anything that can open a TCP connection to `:8000` can
+> rename a camera to another camera's name and move it into another wing, and
+> the change is written to `cameras.json` and survives the restart that would
+> otherwise undo it. In a custodial setting that is the console's account of
+> *where an incident happened*, altered anonymously and permanently.
+>
+> Enable it only where you have already decided that everything which can reach
+> the port is permitted to reconfigure cameras — which in practice means binding
+> uvicorn to `127.0.0.1`, or putting an authenticating reverse proxy in front of
+> it. The engine logs a warning at startup when the flag is on. Revisit this in
+> Phase 1C, when JWT arrives and the flag can default to on behind real auth.
+
+What the endpoint will and will not change:
+
+| Field | Editable at runtime? | Why |
+|---|---|---|
+| `label` | **Yes** — applied live, written to `cameras.json` | Metadata. Nothing in the pipeline branches on it |
+| `zone` | **Yes** — same. `null` ungroups; omitting the field leaves the grouping alone | Metadata. Changes how a console groups a camera, not how the engine watches one |
+| `url` | **No — restart required** | Changing the source means tearing down the running `CameraRunner`, its pre-roll buffer and any clip mid-recording, and building a new source. Separately, an RTSP URL routinely carries credentials, so an unauthenticated API neither accepts nor returns it |
+| `profile` | **No — restart required** | It is the escalation policy the gate is part-way through applying (cooldowns, a token bucket with live state) |
+
+A body carrying `url` or `profile` is a **422 naming the field**, never a 200
+that quietly dropped it. Edit `cameras.json` and restart for those two.
+
+The write is atomic and never half-applied. The edited document is re-parsed in
+full before anything is written, so a request that would produce a file the
+engine could not load at its next startup is refused outright; the new document
+is then written to a `.tmp` sibling, `fsync`ed, and renamed into place. Comment
+keys, other cameras, profiles and any field this version has no model of are
+preserved — the file is edited, not regenerated. The in-memory camera is updated
+only *after* the file is on disk, and from what the file now says, so the two
+cannot disagree about an edit that succeeded.
+
+If `cameras.json` has been edited by hand since the engine started and no longer
+holds the camera being edited, the answer is **409** and nothing is written.
+Reconcile the file and restart rather than letting the console overwrite it.
 
 ## Running the console
 
@@ -220,6 +270,16 @@ between "works on a laptop" and "deployed".
 and is explicitly **not** an authentication boundary; `RequireSession.tsx` is a
 routing convenience, not a security guard. JWT is Phase 1C's Go backend. The
 engine's API has no auth of any kind.
+
+This is why `PATCH /cameras/{id}` — the engine's only write endpoint — ships
+**disabled**, rather than being treated as one more route. Reaching an
+unauthenticated read endpoint costs disclosure; reaching an unauthenticated
+*write* endpoint costs control, and the two are not the same size. Gating it
+behind `SENTINEL_ENABLE_CAMERA_WRITES` does not make the port safe — nothing
+short of authentication does — but it does mean a deployment that has not
+thought about this is not silently reconfigurable by whoever finds it, and that
+turning it on is a decision someone made rather than a default they inherited.
+See [Editing cameras from the console](#editing-cameras-from-the-console).
 
 ### 4. The dead-letter spool has no operator story
 

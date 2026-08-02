@@ -28,6 +28,7 @@ const getCameraEvents = vi.mocked(engineClient.getCameraEvents)
 
 const telemetry: CameraStatus = {
   camera_id: 'avenue_01',
+  label: 'avenue_01',
   frames_seen: 5000,
   frames_dropped: 10,
   detections_run: 4800,

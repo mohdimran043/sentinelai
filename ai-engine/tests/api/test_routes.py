@@ -7,9 +7,17 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
+from sentinel_ai.adapters.config.camera_file import (
+    UNSET,
+    CameraConfig,
+    CameraConfigError,
+    CameraEdit,
+)
 from sentinel_ai.api.app import create_app
+from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Severity
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.event_history import (
@@ -32,12 +40,15 @@ class _FakeEngineService:
         describe_result: UUID | None = None,
         events: tuple[RecentEvent, ...] = (),
         capacity: int = 200,
+        update_error: Exception | None = None,
     ) -> None:
         self._cameras = {t.camera_id: t for t in cameras}
         self._health = health or {}
         self._describe_result = describe_result or uuid4()
         self._events = events
         self._capacity = capacity
+        self._update_error = update_error
+        self.edits: list[tuple[str, CameraEdit]] = []
         self.started = False
         self.stopped = False
         # A real log, so the two stream methods below are not a second implementation
@@ -82,10 +93,35 @@ class _FakeEngineService:
             raise UnknownCameraError(camera_id)
         return self._describe_result
 
+    async def update_camera(self, camera_id: str, edit: CameraEdit) -> CameraConfig:
+        """Records the edit and answers with the record it implies.
 
-def _telemetry(camera_id: str = "cam-1", *, zone: Zone | None = None) -> CameraTelemetry:
+        Deliberately shallow: what the store does with an edit is
+        `tests/adapters/test_camera_file.py`'s subject and the composed path's is
+        `tests/test_main.py`'s. What these tests own is the translation between HTTP
+        and `CameraEdit` — which is exactly what `self.edits` captures.
+        """
+        if camera_id not in self._cameras:
+            raise UnknownCameraError(camera_id)
+        if self._update_error is not None:
+            raise self._update_error
+        self.edits.append((camera_id, edit))
+        current = self._cameras[camera_id]
+        return CameraConfig(
+            camera_id=camera_id,
+            label=current.label if edit.label is UNSET else edit.label,
+            url="rtsp://host/stream",
+            profile=CameraProfile(camera_id=camera_id),
+            zone=current.zone if edit.zone is UNSET else edit.zone,
+        )
+
+
+def _telemetry(
+    camera_id: str = "cam-1", *, zone: Zone | None = None, label: str | None = None
+) -> CameraTelemetry:
     return CameraTelemetry(
         camera_id=camera_id,
+        label=label if label is not None else camera_id,
         frames_seen=100,
         frames_dropped=2,
         detections_run=98,
@@ -121,6 +157,18 @@ def test_list_cameras_returns_configured_cameras() -> None:
     assert ids == ["cam-1", "cam-2"]
 
 
+def test_the_camera_list_carries_the_label_apart_from_the_id() -> None:
+    """The console navigates by label and writes back by id, so the two must be
+    separately readable. A `label` quietly serialised from `camera_id` would look
+    right on every camera whose label was never changed — including every camera in
+    the shipped example — and would make an edit look like it never landed."""
+    service = _FakeEngineService(cameras=(_telemetry("cam-1", label="Front door"),))
+    with TestClient(create_app(service)) as client:
+        (camera,) = client.get("/cameras").json()["cameras"]
+
+    assert (camera["camera_id"], camera["label"]) == ("cam-1", "Front door")
+
+
 def test_camera_telemetry_returns_the_expected_shape() -> None:
     service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
     with TestClient(create_app(service)) as client:
@@ -129,6 +177,7 @@ def test_camera_telemetry_returns_the_expected_shape() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "camera_id": "cam-1",
+        "label": "cam-1",
         "frames_seen": 100,
         "frames_dropped": 2,
         "detections_run": 98,
@@ -380,6 +429,212 @@ class TestCameraEvents:
         assert "volatile" in text
         assert "restart" in text
         assert "oldest" in text or "evict" in text or "discard" in text
+
+
+class TestCameraWritesAreOffByDefault:
+    """The gate, and the reason it exists.
+
+    This build ships no authentication of any kind, so a write endpoint is
+    reachable by anything that can open a socket to the port. The endpoint is
+    therefore opt-in per deployment, and the default posture is the one a
+    deployment gets when nobody has thought about it.
+    """
+
+    def test_the_default_app_refuses_to_write(self) -> None:
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        with TestClient(create_app(service)) as client:
+            response = client.patch("/cameras/cam-1", json={"label": "Renamed"})
+
+        assert response.status_code == 403
+        assert service.edits == [], "the service must not be reached at all"
+
+    def test_the_refusal_names_the_setting_and_the_reason(self) -> None:
+        """A 403 with no explanation sends an operator hunting for a login page
+        that does not exist."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        with TestClient(create_app(service)) as client:
+            detail = client.patch("/cameras/cam-1", json={"label": "R"}).json()["detail"]
+
+        assert "SENTINEL_ENABLE_CAMERA_WRITES" in detail
+        assert "no authentication" in detail
+        assert "cameras.json" in detail
+
+    def test_the_gate_is_checked_before_the_camera_exists(self) -> None:
+        """A disabled deployment must not answer 404 for one id and 403 for another:
+        that is an enumeration oracle for the camera list, handed out for free to
+        exactly the caller the gate is there to keep out."""
+        service = _FakeEngineService()
+        with TestClient(create_app(service)) as client:
+            response = client.patch("/cameras/does-not-exist", json={"label": "R"})
+
+        assert response.status_code == 403
+
+    def test_the_camera_list_reports_the_posture(self) -> None:
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        with TestClient(create_app(service)) as closed:
+            assert closed.get("/cameras").json()["config_writable"] is False
+        with TestClient(create_app(service, camera_writes_enabled=True)) as open_:
+            assert open_.get("/cameras").json()["config_writable"] is True
+
+    def test_the_route_exists_in_the_contract_either_way(self) -> None:
+        """A contract that changes shape with a runtime flag is worse than a
+        documented 403: a client generated against a writable engine would not
+        compile against a read-only one, and the same binary serves both."""
+        closed = create_app(_FakeEngineService()).openapi()["paths"]
+        open_ = create_app(_FakeEngineService(), camera_writes_enabled=True).openapi()["paths"]
+
+        assert "/cameras/{camera_id}" in closed
+        assert closed == open_
+
+
+class TestCameraEdit:
+    def app(self) -> tuple[_FakeEngineService, TestClient]:
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1", label="Front door", zone=Zone.CORRIDOR),)
+        )
+        return service, TestClient(create_app(service, camera_writes_enabled=True))
+
+    def test_a_label_edit_returns_the_stored_record(self) -> None:
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"label": "Back door"})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "camera_id": "cam-1",
+            "label": "Back door",
+            "zone": "corridor",
+            "zone_kind": "common_area",
+            "persisted": True,
+            "restart_required_fields": ["url", "profile"],
+        }
+        assert service.edits == [("cam-1", CameraEdit(label="Back door", zone=UNSET))]
+
+    def test_a_zone_edit_does_not_touch_the_label(self) -> None:
+        """The partial-edit contract, on the wire. A console changing a zone sends
+        no label, and the engine must not read that as "clear the label"."""
+        service, client = self.app()
+        with client:
+            body = client.patch("/cameras/cam-1", json={"zone": "room"}).json()
+
+        assert body["label"] == "Front door"
+        assert service.edits == [("cam-1", CameraEdit(label=UNSET, zone=Zone.ROOM))]
+
+    def test_an_explicit_null_zone_ungroups_and_an_omitted_one_does_not(self) -> None:
+        """The single most important translation this layer performs: pydantic gives
+        both cases the same attribute value, and only `model_fields_set` tells them
+        apart. Getting it wrong silently ungroups every camera anyone renames."""
+        service, client = self.app()
+        with client:
+            ungrouped = client.patch("/cameras/cam-1", json={"zone": None}).json()
+            client.patch("/cameras/cam-1", json={"label": "Renamed"})
+
+        assert ungrouped["zone"] is None
+        assert ungrouped["zone_kind"] is None
+        assert service.edits == [
+            ("cam-1", CameraEdit(label=UNSET, zone=None)),
+            ("cam-1", CameraEdit(label="Renamed", zone=UNSET)),
+        ]
+
+    def test_a_label_is_trimmed_before_it_is_stored(self) -> None:
+        service, client = self.app()
+        with client:
+            client.patch("/cameras/cam-1", json={"label": "  Back door  "})
+
+        assert service.edits == [("cam-1", CameraEdit(label="Back door", zone=UNSET))]
+
+    @pytest.mark.parametrize("label", ["", "   ", None])
+    def test_a_label_that_is_not_a_label_is_rejected(self, label: object) -> None:
+        """Whitespace is the interesting one: `load_cameras` would accept `"   "` as
+        a non-empty string and the console would render a nameless camera."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"label": label})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_an_unknown_zone_is_rejected_rather_than_dropped(self) -> None:
+        """The same fail-loud `load_cameras` applies at startup: an operator who
+        typed `hallway` meant to group that camera and did not."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"zone": "hallway"})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    @pytest.mark.parametrize("field", ["url", "profile", "camera_id", "id", "zone_kind", "labe1"])
+    def test_a_field_this_endpoint_will_not_change_is_rejected_not_ignored(
+        self, field: str
+    ) -> None:
+        """The defect this endpoint must never have: an operator re-points a camera
+        at a new stream, is told it worked, and watches the old stream for a week.
+        A 422 naming the field is the only honest answer — and a typo'd `labe1`
+        accepted as a no-op is the same failure wearing a smaller hat."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={field: "anything"})
+
+        assert response.status_code == 422
+        assert field in response.text
+        assert service.edits == []
+
+    def test_a_url_edit_is_rejected_even_alongside_a_valid_label(self) -> None:
+        """Half-applying is worse than refusing: the operator would see the rename
+        land and reasonably assume the URL did too."""
+        service, client = self.app()
+        with client:
+            response = client.patch(
+                "/cameras/cam-1", json={"label": "Renamed", "url": "rtsp://elsewhere/one"}
+            )
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_an_edit_naming_nothing_is_rejected(self) -> None:
+        """A 200 here would report a successful save for a request that changed
+        nothing, and the operator would believe their edit landed."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_an_unknown_camera_is_404(self) -> None:
+        _, client = self.app()
+        with client:
+            response = client.patch("/cameras/does-not-exist", json={"label": "R"})
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "unknown camera: does-not-exist"}
+
+    def test_a_file_that_cannot_take_the_edit_is_409_not_500(self) -> None:
+        """The request was fine and the engine accepted it; the file it must be
+        written into is not in a state that admits it. A client can retry a 409
+        after reconciling, which is not true of a 500."""
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),),
+            update_error=CameraConfigError("cameras.json has no camera 'cam-1'"),
+        )
+        with TestClient(create_app(service, camera_writes_enabled=True)) as client:
+            response = client.patch("/cameras/cam-1", json={"label": "R"})
+
+        assert response.status_code == 409
+        assert "no camera" in response.json()["detail"]
+
+    def test_a_write_failure_says_nothing_was_changed(self) -> None:
+        """An operator who sees a bare 500 does not know whether to retry or to go
+        and check the file."""
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),), update_error=OSError("no space left on device")
+        )
+        with TestClient(create_app(service, camera_writes_enabled=True)) as client:
+            response = client.patch("/cameras/cam-1", json={"label": "R"})
+
+        assert response.status_code == 500
+        assert "nothing was changed" in response.json()["detail"]
 
 
 def test_lifespan_starts_and_stops_the_service() -> None:

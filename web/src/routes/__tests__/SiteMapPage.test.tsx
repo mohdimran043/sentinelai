@@ -20,6 +20,7 @@ const listCameras = vi.mocked(engineClient.listCameras)
 function makeCameraStatus(overrides: Partial<CameraStatus> = {}): CameraStatus {
   return {
     camera_id: 'room_4b',
+    label: 'room_4b',
     frames_seen: 0,
     frames_dropped: 0,
     detections_run: 0,
@@ -107,6 +108,7 @@ describe('SiteMapPage', () => {
         makeCameraStatus({ camera_id: 'room_4b', zone: 'room' }),
         makeCameraStatus({ camera_id: 'corridor_1', zone: 'corridor' }),
       ],
+      config_writable: false,
     })
 
     renderWithProviders(<SiteMapPage />)
@@ -119,7 +121,7 @@ describe('SiteMapPage', () => {
 
   it('invites the operator to act on a genuinely empty camera list, rather than an empty map', async () => {
     registerEmptyEventStream()
-    listCameras.mockResolvedValue({ cameras: [] })
+    listCameras.mockResolvedValue({ cameras: [], config_writable: false })
 
     renderWithProviders(<SiteMapPage />)
 
@@ -137,7 +139,10 @@ describe('SiteMapPage', () => {
 
   it('states the placements are saved in this browser only, not shared between operators', async () => {
     registerEmptyEventStream()
-    listCameras.mockResolvedValue({ cameras: [makeCameraStatus({ zone: 'room' })] } as CamerasResponse)
+    listCameras.mockResolvedValue({
+      cameras: [makeCameraStatus({ zone: 'room' })],
+      config_writable: false,
+    } as CamerasResponse)
 
     renderWithProviders(<SiteMapPage />)
 
@@ -148,6 +153,7 @@ describe('SiteMapPage', () => {
     const stream = registerEventStream()
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
 
     renderWithProviders(<SiteMapPage />)
@@ -166,6 +172,7 @@ describe('SiteMapPage', () => {
     const stream = registerEventStream()
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
 
     renderWithProviders(<SiteMapPage />)
@@ -191,6 +198,7 @@ describe('SiteMapPage', () => {
     const stream = registerEventStream()
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
 
     renderWithProviders(<SiteMapPage />)
@@ -213,6 +221,7 @@ describe('SiteMapPage', () => {
     registerEmptyEventStream()
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
     const user = userEvent.setup()
 
@@ -232,6 +241,7 @@ describe('SiteMapPage', () => {
     registerEmptyEventStream()
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
 
     renderWithProviders(<SiteMapPage />)

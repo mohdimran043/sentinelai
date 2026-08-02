@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry
 from sentinel_ai.orchestrator.resident_set import ResidentSet
@@ -295,6 +296,20 @@ class EngineService:
 
     def telemetry(self, camera_id: str) -> CameraTelemetry:
         return self._get_runner(camera_id).telemetry()
+
+    def update_camera_metadata(self, camera_id: str, *, label: str, zone: Zone | None) -> None:
+        """Apply an already-persisted label/zone change to a running camera.
+
+        Deliberately knows nothing about `cameras.json`: this service owns running
+        cameras, not the record of configured ones, and the caller that owns both
+        (`main.ComposedService.update_camera`) is the one that orders the write
+        before this call. Keeping the file out of here is what stops a future
+        change from making an in-memory edit that never reaches disk.
+
+        Synchronous and total — `CameraRunner.apply_metadata` cannot fail — so
+        there is no partial-application case for a caller to unwind.
+        """
+        self._get_runner(camera_id).apply_metadata(label=label, zone=zone)
 
     def event_history(self, camera_id: str) -> CameraEventHistory:
         """The console's bounded, volatile view of what this camera recently produced.

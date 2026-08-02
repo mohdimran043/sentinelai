@@ -38,6 +38,7 @@ from sentinel_ai.main import (
     BrokerLink,
     CameraConfig,
     CameraConfigError,
+    CameraEdit,
     ComposedService,
     Composition,
     Models,
@@ -735,6 +736,173 @@ class TestComposedService:
             "/cameras/{camera_id}/events",
             "/cameras/{camera_id}/describe",
         } <= paths
+
+
+class TestTheComposedEditPath:
+    """`ComposedService.update_camera`: the file and the running camera, together.
+
+    This is the seam the unit tests on either side cannot see. `CameraFileStore`
+    knows nothing about runners and `EngineService` knows nothing about the file;
+    the whole class of defect left over is "the write happened and the camera did
+    not" (or the reverse), and only a test holding both can catch it. That is the
+    exact shape of the three wiring-level Criticals this module exists to prevent.
+    """
+
+    @staticmethod
+    def _service(tmp_path: Path, *entries: object) -> tuple[ComposedService, Path, Composition]:
+        # The default entry mirrors what `composed()` puts in memory, label included:
+        # a fixture whose file and runners already disagree could not tell an edit
+        # that failed to land from one that was never needed.
+        camera_file = tmp_path / "cameras.json"
+        camera_file.write_text(
+            json.dumps(
+                {
+                    "cameras": list(entries)
+                    or [{"id": "cam-1", "label": "Camera One", "url": str(ASSET)}]
+                }
+            ),
+            encoding="utf-8",
+        )
+        composition, _ = composed(tmp_path, cameras_file=str(camera_file))
+        return ComposedService(lambda: composition), camera_file, composition
+
+    async def test_an_edit_reaches_both_the_file_and_the_running_camera(
+        self, tmp_path: Path
+    ) -> None:
+        """Both halves in one assertion, deliberately. An implementation that only
+        writes the file passes every `CameraFileStore` test and leaves the console
+        showing the old label until a restart; one that only mutates the runner
+        passes every `EngineService` test and loses the change at that restart."""
+        service, camera_file, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            record = await service.update_camera(
+                "cam-1", CameraEdit(label="Wing B corridor", zone=Zone.CORRIDOR)
+            )
+
+            assert (record.label, record.zone) == ("Wing B corridor", Zone.CORRIDOR)
+            live = service.telemetry("cam-1")
+            assert (live.label, live.zone) == ("Wing B corridor", Zone.CORRIDOR)
+            (stored,) = load_cameras(camera_file)
+            assert (stored.label, stored.zone) == ("Wing B corridor", Zone.CORRIDOR)
+        finally:
+            await service.stop()
+
+    async def test_the_edit_survives_a_reload_of_the_file(self, tmp_path: Path) -> None:
+        """ "Persisted" means the next process reads it, which is the only definition
+        an operator cares about. `load_cameras` here is the same call
+        `create_default_app` makes at startup."""
+        service, camera_file, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            await service.update_camera("cam-1", CameraEdit(label="Renamed"))
+        finally:
+            await service.stop()
+
+        assert [camera.label for camera in load_cameras(camera_file)] == ["Renamed"]
+
+    async def test_the_new_label_reaches_the_next_event(self, tmp_path: Path) -> None:
+        """The label is not decoration: `CameraRunner` puts it on every escalation it
+        assembles, so an edit that stops at `telemetry()` would rename the camera in
+        the console and leave every subsequent event carrying the old name."""
+        service, _, composition = self._service(tmp_path)
+        await service.start()
+        try:
+            await service.update_camera("cam-1", CameraEdit(label="Wing B corridor"))
+            async with asyncio.timeout(20.0):
+                while not composition.service.event_history("cam-1").events:
+                    await asyncio.sleep(0.01)
+            runner = composition.service._cameras["cam-1"]
+            assert runner._camera_label == "Wing B corridor"
+        finally:
+            await service.stop()
+
+    async def test_an_unknown_camera_is_rejected_before_the_file_is_touched(
+        self, tmp_path: Path
+    ) -> None:
+        """Order matters here for two reasons: a typo'd id must not be able to
+        rewrite the document, and the caller must get a plain 404 rather than the
+        confusing 409 `edited_document`'s own unknown-id guard would produce."""
+        service, camera_file, _ = self._service(tmp_path)
+        before = camera_file.read_text(encoding="utf-8")
+        await service.start()
+        try:
+            with pytest.raises(UnknownCameraError):
+                await service.update_camera("cam-9", CameraEdit(label="New"))
+        finally:
+            await service.stop()
+
+        assert camera_file.read_text(encoding="utf-8") == before
+
+    async def test_a_refused_write_leaves_the_running_camera_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """The reason the write comes before the apply. If the file cannot take the
+        edit, the operator must be looking at a console that still agrees with disk
+        — not at a change that will silently vanish at the next restart."""
+        service, camera_file, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            camera_file.write_text("{ not json", encoding="utf-8")
+            with pytest.raises(CameraConfigError):
+                await service.update_camera("cam-1", CameraEdit(label="Renamed"))
+
+            assert service.telemetry("cam-1").label == "Camera One"
+        finally:
+            await service.stop()
+
+    async def test_a_camera_removed_from_the_file_by_hand_is_a_conflict_not_an_append(
+        self, tmp_path: Path
+    ) -> None:
+        """The file is mounted, and an operator can still edit it. The engine's
+        in-memory camera list is from startup, so the two genuinely can disagree —
+        and inventing an entry from memory would overwrite whoever changed it."""
+        service, camera_file, _ = self._service(
+            tmp_path,
+            {"id": "cam-1", "url": str(ASSET)},
+        )
+        await service.start()
+        try:
+            camera_file.write_text(
+                json.dumps({"cameras": [{"id": "cam-other", "url": str(ASSET)}]}),
+                encoding="utf-8",
+            )
+            with pytest.raises(CameraConfigError, match="no camera 'cam-1'"):
+                await service.update_camera("cam-1", CameraEdit(label="Renamed"))
+
+            assert [c["id"] for c in json.loads(camera_file.read_text())["cameras"]] == [
+                "cam-other"
+            ]
+        finally:
+            await service.stop()
+
+    async def test_an_uncomposed_engine_answers_unknown_camera(self) -> None:
+        """Same honesty as every other per-camera method before `start()`: there are
+        no cameras yet, so every id is unknown — and, crucially, no file is written
+        for one."""
+        service = ComposedService(lambda: pytest.fail("must not build before start()"))
+        with pytest.raises(UnknownCameraError):
+            await service.update_camera("cam-1", CameraEdit(label="Renamed"))
+
+    def test_composition_holds_a_store_over_the_configured_camera_file(
+        self, tmp_path: Path
+    ) -> None:
+        """The store must read the same path `load_cameras` did, or an edit would be
+        written to a file nothing loads."""
+        camera_file = tmp_path / "elsewhere.json"
+        composition, settings = composed(tmp_path, cameras_file=str(camera_file))
+        assert composition.camera_store.path == Path(settings.cameras_file) == camera_file
+
+
+class TestWritesAreDisabledUnlessTurnedOn:
+    def test_the_setting_defaults_to_off(self) -> None:
+        """The posture a deployment gets when nobody has thought about it. This
+        engine has no authentication, so an on-by-default write endpoint hands
+        camera reconfiguration to anything that can reach the port."""
+        assert Settings().enable_camera_writes is False
+
+    def test_the_default_app_is_built_read_only(self) -> None:
+        assert main.app.state.camera_writes_enabled is False
 
 
 class WarmupMeasuringRuntime(FakeModelRuntime):

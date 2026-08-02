@@ -9,6 +9,7 @@ import type { NormalizedPoint } from '@/sitemap/placement'
 function makeCamera(overrides: Partial<CameraStatus> = {}): CameraStatus {
   return {
     camera_id: 'cam',
+    label: 'cam',
     frames_seen: 0,
     frames_dropped: 0,
     detections_run: 0,

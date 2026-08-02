@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from sentinel_ai.adapters.config.camera_file import CameraConfig, CameraEdit
 from sentinel_ai.api.app import create_app
 from sentinel_ai.api.sse import (
     SSE_MEDIA_TYPE,
@@ -433,6 +434,11 @@ class _StreamingFakeService:
         return {}
 
     async def describe_now(self, camera_id: str) -> UUID:
+        raise UnknownCameraError(camera_id)
+
+    async def update_camera(self, camera_id: str, edit: CameraEdit) -> CameraConfig:
+        # This fake has no cameras at all, so every id is unknown — the same answer
+        # `telemetry` above gives.
         raise UnknownCameraError(camera_id)
 
 

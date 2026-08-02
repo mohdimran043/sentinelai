@@ -25,6 +25,7 @@ const listCameras = vi.mocked(engineClient.listCameras)
 function makeCameraStatus(overrides: Partial<CameraStatus> = {}): CameraStatus {
   return {
     camera_id: 'avenue_01',
+    label: 'avenue_01',
     frames_seen: 1000,
     frames_dropped: 2,
     detections_run: 900,
@@ -67,6 +68,7 @@ const sampleHealth: HealthResponse = {
 
 const sampleCameras: CamerasResponse = {
   cameras: [makeCameraStatus()],
+  config_writable: false,
 }
 
 /** Default: an empty backlog and otherwise silent, for tests that do not care about the live event stream. */
@@ -141,6 +143,7 @@ describe('DashboardPage', () => {
     getHealth.mockResolvedValue(sampleHealth)
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
 
     renderWithProviders(<DashboardPage />)
@@ -160,6 +163,7 @@ describe('DashboardPage', () => {
         makeCameraStatus({ camera_id: 'corridor_1', zone: 'corridor' }),
         makeCameraStatus({ camera_id: 'loose_cam', zone: null }),
       ],
+      config_writable: false,
     })
 
     renderWithProviders(<DashboardPage />)
@@ -190,6 +194,7 @@ describe('DashboardPage', () => {
     getHealth.mockResolvedValue(sampleHealth)
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'avenue_01' })],
+      config_writable: false,
     })
 
     renderWithProviders(<DashboardPage />)
@@ -230,7 +235,7 @@ describe('DashboardPage', () => {
   it('invites the operator to act on a genuinely empty camera list', async () => {
     registerEmptyEventStream()
     getHealth.mockResolvedValue({ status: 'ok', models: [] })
-    listCameras.mockResolvedValue({ cameras: [] })
+    listCameras.mockResolvedValue({ cameras: [], config_writable: false })
 
     renderWithProviders(<DashboardPage />)
 
@@ -245,6 +250,7 @@ describe('DashboardPage', () => {
         makeCameraStatus({ camera_id: 'room_4b', zone: 'room' }),
         makeCameraStatus({ camera_id: 'corridor_1', zone: 'corridor' }),
       ],
+      config_writable: false,
     })
     const user = userEvent.setup()
 
@@ -263,6 +269,7 @@ describe('DashboardPage', () => {
     getHealth.mockResolvedValue(sampleHealth)
     listCameras.mockResolvedValue({
       cameras: [makeCameraStatus({ camera_id: 'room_4b', zone: 'room' })],
+      config_writable: false,
     })
     const user = userEvent.setup()
 

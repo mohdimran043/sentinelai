@@ -21,6 +21,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cameras/{camera_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Edit a camera's label and zone — UNAUTHENTICATED, and off by default
+         * @description Change what a camera is called and which zone it is grouped into.
+         *
+         *     ### This endpoint is not authenticated
+         *
+         *     **Phase 1B ships no authentication of any kind.** The console's login screen
+         *     is a shell, JWT arrives in Phase 1C, and until then anything that can open a
+         *     TCP connection to this port can call this. Every other endpoint is a read, so
+         *     reaching the port has so far cost an attacker information; this one is a
+         *     write, and a persisted one. An anonymous caller can rename a camera to another
+         *     camera's name and re-zone it into another wing — which is to say, make the
+         *     console's account of *where an incident happened* wrong, in a custodial
+         *     setting, permanently, because the change is written to `cameras.json` and
+         *     survives the restart that would otherwise undo it.
+         *
+         *     That is why it is **off unless a deployment turns it on**
+         *     (`SENTINEL_ENABLE_CAMERA_WRITES=true`) and answers 403 otherwise, and why a
+         *     deployment that turns it on should also bind the engine to localhost or put an
+         *     authenticating reverse proxy in front of it. `GET /cameras` reports the current
+         *     posture as `config_writable`. See `docs/operations.md`.
+         *
+         *     ### What can be edited, and what cannot
+         *
+         *     Editable at runtime, applied to the running camera and written to
+         *     `cameras.json` before this returns:
+         *
+         *     * `label` — the display name. Trimmed, non-empty, at most 120 characters.
+         *     * `zone` — `room`, `corridor`, `dayroom`, or `null` to ungroup. Omitting the
+         *       field and sending `null` are different instructions.
+         *
+         *     **Not editable, and rejected with 422 rather than ignored** — the response's
+         *     `restart_required_fields` names them:
+         *
+         *     * `url` — changing the source means tearing down the running `CameraRunner`,
+         *       its buffered pre-roll and any clip mid-recording, and building a new source
+         *       in their place. It is a camera restart, not an edit. Separately, an RTSP URL
+         *       routinely carries credentials, so an unauthenticated API neither accepts nor
+         *       returns it.
+         *     * `profile` — the escalation policy, which the gate is part-way through
+         *       applying (cooldowns, a token bucket with state). Swapping it mid-flight has
+         *       no defensible semantics.
+         *
+         *     Both are edited by changing `cameras.json` and restarting the engine.
+         *
+         *     ### Atomicity
+         *
+         *     The edit is validated against the whole document, written to a temporary file,
+         *     `fsync`ed, and renamed into place. It is never half-applied: a request that
+         *     would produce a file the engine could not load at its next startup is refused
+         *     outright, and everything the file holds that this engine has no model of —
+         *     comment keys, other cameras, fields added later — is preserved byte-for-byte
+         *     in meaning. The in-memory camera is only updated *after* the file is on disk,
+         *     and from what the file now says, so the two cannot disagree.
+         */
+        patch: operations["update_camera_cameras__camera_id__patch"];
+        trace?: never;
+    };
     "/cameras/{camera_id}/describe": {
         parameters: {
             query?: never;
@@ -170,6 +241,59 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * CameraEditRequest
+         * @description A partial edit to one camera's record: `label`, `zone`, or both.
+         *
+         *     Partial on purpose — a console changing a label must not have to restate a zone
+         *     it is not touching, because restating it is how one operator's window silently
+         *     reverts another's change.
+         *
+         *     **Only the runtime-editable fields are accepted, and the rest are rejected
+         *     rather than ignored.** `extra="forbid"` means a body carrying `url` or
+         *     `profile` is a 422 naming the field, not a 200 that quietly dropped it. That
+         *     is the whole reason the model is strict: the failure this endpoint must never
+         *     have is an operator re-pointing a camera at a new stream, being told it
+         *     worked, and watching the old stream for a week.
+         */
+        CameraEditRequest: {
+            /**
+             * Label
+             * @description The camera's new display name. Trimmed; must be non-empty after trimming. Omit the field to leave the label alone — `null` is not a label and is rejected.
+             */
+            label?: string | null;
+            /** @description The camera's new zone, or `null` to ungroup it. Unlike `label`, `null` here is a real instruction, so **omitting the field and sending null mean different things**: omit to leave the grouping alone, send null to remove it. A value outside the enum is a 422 — the same fail-loud `load_cameras` applies at startup, because a typo'd zone is a camera the operator meant to group and silently did not. */
+            zone?: components["schemas"]["Zone"] | null;
+        };
+        /**
+         * CameraEditResponse
+         * @description The camera's record as `cameras.json` now holds it, after a successful edit.
+         *
+         *     The whole record rather than an acknowledgement: a console that has just
+         *     written should render what was stored, not what it hoped was stored.
+         */
+        CameraEditResponse: {
+            /** Camera Id */
+            camera_id: string;
+            /** Label */
+            label: string;
+            /**
+             * Persisted
+             * @description Always true, and present so it cannot be overlooked: this edit was written to the engine's `cameras.json` before this response was sent, and survives a restart. An edit that could not be written is an error response, never a 200 with this set to false.
+             * @default true
+             * @constant
+             */
+            persisted: true;
+            /**
+             * Restart Required Fields
+             * @description Fields of the camera record that this endpoint will not change at all: they are stored in `cameras.json`, honoured at startup, and require editing that file and restarting the engine. `url` because changing it means tearing down the running camera and building a new source (and because an RTSP URL routinely carries credentials, which an unauthenticated API must not move in either direction); `profile` because it is the escalation policy the gate is part-way through applying. Sending either one is a 422, not a silent drop — a console should show them as read-only and say why, not offer a control that does nothing.
+             */
+            restart_required_fields?: string[];
+            /** @description The stored zone, or null when the camera is ungrouped. */
+            zone: components["schemas"]["Zone"] | null;
+            /** @description Derived from `zone`, exactly as on `CameraStatus`. Null when `zone` is. */
+            zone_kind: components["schemas"]["ZoneKind"] | null;
+        };
+        /**
          * CameraEventsResponse
          * @description A **volatile, bounded, in-memory view for the operator console. Not the event
          *     store, and not an audit trail.**
@@ -232,6 +356,11 @@ export interface components {
             frames_dropped: number;
             /** Frames Seen */
             frames_seen: number;
+            /**
+             * Label
+             * @description The camera's display name, from `cameras.json`; defaults to `camera_id` when the file gives none. Editable at runtime via `PATCH /cameras/{camera_id}` — read it back from here after a write to see what the engine is actually using.
+             */
+            label: string;
             /** Last Escalation At */
             last_escalation_at: number | null;
             /** Last Frame At */
@@ -245,6 +374,11 @@ export interface components {
         CamerasResponse: {
             /** Cameras */
             cameras: components["schemas"]["CameraStatus"][];
+            /**
+             * Config Writable
+             * @description Whether `PATCH /cameras/{camera_id}` will do anything on this deployment. False — the default — means the write endpoint answers 403 and the camera record can only be changed by editing `cameras.json` and restarting. This engine has **no authentication**, so writes are opt-in per deployment (`SENTINEL_ENABLE_CAMERA_WRITES`); see the PATCH operation's description. Published here so a console can render the record read-only rather than offering controls that will 403.
+             */
+            config_writable: boolean;
         };
         /** DescribeResponse */
         DescribeResponse: {
@@ -409,6 +543,69 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["CamerasResponse"];
                 };
+            };
+        };
+    };
+    update_camera_cameras__camera_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                camera_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CameraEditRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CameraEditResponse"];
+                };
+            };
+            /** @description Camera writes are disabled on this deployment, which is the default. Set `SENTINEL_ENABLE_CAMERA_WRITES=true` on the engine to enable them, having read the warning in this operation's description first. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No camera with this id is configured in the running engine. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `cameras.json` cannot be edited as it currently stands — most often because the file has been changed by hand since the engine started and no longer contains this camera. Nothing was written. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The camera file could not be written. Nothing was changed. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
