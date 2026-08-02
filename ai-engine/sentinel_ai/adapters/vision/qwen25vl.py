@@ -60,6 +60,42 @@ prose in `description`, weighting in `threat_score`/`severity`. Nothing was
 added to `contracts/events/anomaly_event.schema.json` for it, precisely because
 a dedicated structured field (`fall_detected: true`) would read to the Phase 1C
 consumer as a detector output with a detector's reliability.
+
+T3 extends this same prompt to ask about two more things by name — apparent
+self-harm and apparent medication or unlabelled-container ingestion — and
+parses an optional structured `welfare` array out of the same JSON reply into
+a `WelfareAssessment` (`domain/welfare.py`, `ports/vision_llm.py`'s
+`SceneDescription.welfare`). Everything above still applies unchanged: this is
+still one still frame, still no pose or action recognition, still fallible in
+both directions, and `WelfareConcern.confidence` is still `possible`/`likely`
+because a single frame can never honestly be `CERTAIN` — see `domain/welfare.py`
+for why that tier does not exist.
+
+The medication check is deliberately narrower than every other check here.
+The prompt does not ask the model to name a substance, estimate a dose, or
+judge whether medication was prescribed — a single-frame VLM has no clinical
+basis for any of those, and a system in a custodial welfare setting that
+records one invites a reader to act on it as if it were a clinical finding.
+It asks only whether an apparent ingestion was seen, and for a description of
+what was visible: the container, the action, nothing more.
+
+`_parse_welfare` treats the `welfare` array exactly the way `_parse_response`
+already treats the rest of the reply: untrusted text, never trusted structure.
+An unrecognised `kind` becomes `ConcernKind.OTHER`, an unrecognised
+`confidence` becomes `Confidence.POSSIBLE` — the weaker tier, always rounded
+down, never up into a routing decision that wakes someone at 3am or, just as
+bad, suppresses a real concern under a false `LIKELY`. A concern with blank
+`evidence` is dropped rather than raised through `WelfareConcern.__post_init__`,
+and a missing or malformed `welfare` key yields `WelfareAssessment.none()`
+without ever failing the surrounding description. `WelfareAssessment` is built
+field by field from validated values, never `WelfareAssessment(**payload)`:
+`basis` always comes from the type's own constant, never the payload, or a
+garbled or adversarial reply could set its own provenance marker and defeat
+the entire point of the field. The malformed-response fallback path
+(`_FALLBACK_DESCRIPTION`) degrades welfare to `none()` too, for the same
+reason F1 fixed the description on that path — an assessment that silently
+vanished into "found nothing" would be indistinguishable from one that
+genuinely found nothing.
 """
 
 from __future__ import annotations
@@ -72,6 +108,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sentinel_ai.domain.entities import SceneState
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment, WelfareConcern
 from sentinel_ai.ports.frame_source import FrameData
 from sentinel_ai.ports.model_runtime import (
     Capabilities,
@@ -111,10 +148,16 @@ not the published event, so that is not a spec §3.3 concern.
 HARM_CHECKS: tuple[str, ...] = (
     "a person who is collapsed, fallen, lying on the ground, or appears unresponsive",
     "a physical altercation between people — fighting, striking, grappling, pushing",
+    "apparent self-harm — a person cutting, striking, or otherwise deliberately "
+    "injuring themselves",
+    "a person appearing to swallow pills, liquid, or the contents of an unlabelled "
+    "container — an apparent medication or unlabelled-container ingestion; state "
+    "only that this was seen and describe what was visible, never what the "
+    "substance is",
     "any other apparent distress or harm to a person — someone being restrained or "
     "dragged, someone clutching an injury, someone fleeing, a weapon held or raised",
 )
-"""The three things the prompt makes the model look for by name.
+"""The five things the prompt makes the model look for by name.
 
 Named and enumerated rather than buried in one long paragraph so the set is
 reviewable, testable, and extendable without rewriting the prompt around it.
@@ -124,8 +167,23 @@ asked for would be invisible otherwise, and this is the whole of T3's behaviour.
 
 These are *questions put to a vision-language model about one frame*, not
 detector outputs. See the module docstring for exactly what that does and does
-not buy.
+not buy, and for why the medication check is worded the way it is: no
+substance name, no dose, no judgement about whether it was prescribed.
 """
+
+_WELFARE_KIND_GUIDE = (
+    f'"{ConcernKind.COLLAPSE.value}" for the collapsed/fallen/unresponsive check, '
+    f'"{ConcernKind.ALTERCATION.value}" for the physical-altercation check, '
+    f'"{ConcernKind.SELF_HARM.value}" for apparent self-harm, '
+    f'"{ConcernKind.MEDICATION.value}" for an apparent medication or '
+    "unlabelled-container ingestion, "
+    f'"{ConcernKind.DISTRESS.value}" for any other apparent distress or harm, and '
+    f'"{ConcernKind.OTHER.value}" only if none of those fit'
+)
+"""Built from `ConcernKind`'s own values, not hand-typed strings, so the prompt's
+vocabulary can never drift from `domain/welfare.py`'s enum — a hand-typed "self_harm"
+here that the enum later renamed would silently stop round-tripping through
+`_parse_welfare`, which maps anything it does not recognise to `OTHER`."""
 
 _HARM_THREAT_FLOOR = 0.7
 _HARM_THREAT_FLOOR_SEVERE = 0.85
@@ -178,7 +236,15 @@ _RESPONSE_INSTRUCTIONS = (
     "Respond with ONLY a JSON object of this exact shape, no other text:\n"
     '{"description": "<one or two plain sentences describing what is visible>", '
     '"threat_value": <float between 0.0 and 1.0>, '
-    '"suggested_action": "<one short, concrete sentence for a human reviewer>"}'
+    '"suggested_action": "<one short, concrete sentence for a human reviewer>", '
+    '"welfare": [{"kind": "<concern kind>", "confidence": "<possible|likely>", '
+    '"evidence": "<what you actually saw>"}]}\n'
+    "Include one welfare entry for each concern from the checks above that you "
+    "actually observed in this frame; use an empty array when none apply. For "
+    f"kind use {_WELFARE_KIND_GUIDE}. For confidence use "
+    f'"{Confidence.POSSIBLE.value}" when you are not sure, and '
+    f'"{Confidence.LIKELY.value}" only when you are. For the medication kind, '
+    "evidence must describe only what was visible — never a substance name."
 )
 
 _CUDA_CONTEXT_OVERHEAD_MIB = 300
@@ -292,6 +358,75 @@ def _extract_json_block(text: str) -> str | None:
     return None
 
 
+def _parse_concern_kind(raw: object) -> ConcernKind:
+    """Unknown or malformed `kind` maps to `ConcernKind.OTHER`, never raises.
+
+    Model output is untrusted text: `ConcernKind(raw)` raises `ValueError` on
+    anything it does not recognise, so that has to be caught here rather than
+    left to propagate — an unrecognised kind is not evidence of nothing, it is
+    evidence of *something* the model could not name from the fixed vocabulary,
+    which is exactly what `OTHER` is for.
+    """
+    if isinstance(raw, str):
+        try:
+            return ConcernKind(raw.strip().lower())
+        except ValueError:
+            pass
+    return ConcernKind.OTHER
+
+
+def _parse_confidence(raw: object) -> Confidence:
+    """Unknown or malformed `confidence` maps to `Confidence.POSSIBLE` — the
+    weaker tier — and never to `LIKELY`.
+
+    This is the one direction that matters: rounding a garbled reply *up* into
+    `LIKELY` would let a formatting slip manufacture the confidence a routing
+    decision treats as more actionable (waking someone at 3am), while rounding
+    down at worst under-states a real concern that a human still sees in the
+    description text and `threat_value`. `POSSIBLE` is always the safe default.
+    """
+    if isinstance(raw, str):
+        try:
+            return Confidence(raw.strip().lower())
+        except ValueError:
+            pass
+    return Confidence.POSSIBLE
+
+
+def _parse_welfare(raw: object) -> WelfareAssessment:
+    """Defensively parse the optional `welfare` array into a `WelfareAssessment`.
+
+    Untrusted model output end to end: anything other than a list yields
+    `WelfareAssessment.none()` rather than raising, and each item is read field
+    by field — `kind` through `_parse_concern_kind`, `confidence` through
+    `_parse_confidence`, `evidence` required to be a non-blank string or the
+    item is dropped (`WelfareConcern.__post_init__` would otherwise raise on
+    exactly the blank-evidence case a formatting slip is likely to produce).
+
+    Deliberately never `WelfareAssessment(**item)` or `WelfareConcern(**item)`:
+    spreading the payload into the constructor would let it set fields it must
+    never control, `basis` above all — this function never reads a `basis` key
+    from anywhere, `WelfareAssessment`'s own default is the only source of it.
+    """
+    if not isinstance(raw, list):
+        return WelfareAssessment.none()
+    concerns: list[WelfareConcern] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, str) or not evidence.strip():
+            continue
+        concerns.append(
+            WelfareConcern(
+                kind=_parse_concern_kind(item.get("kind")),
+                confidence=_parse_confidence(item.get("confidence")),
+                evidence=evidence.strip(),
+            )
+        )
+    return WelfareAssessment(concerns=tuple(concerns))
+
+
 def _parse_response(raw_text: str) -> SceneDescription:
     """Parse the model's reply, tolerating one that ignores the JSON
     instruction — a formatting slip must never crash the pipeline (spec §9).
@@ -331,6 +466,7 @@ def _parse_response(raw_text: str) -> SceneDescription:
                     description=description.strip(),
                     threat_value=_clamp01(float(threat_value)),
                     suggested_action=suggested_action.strip(),
+                    welfare=_parse_welfare(payload.get("welfare")),
                 )
     logger.warning(
         "vision model reply did not match the expected JSON schema; falling back to a "
@@ -338,7 +474,13 @@ def _parse_response(raw_text: str) -> SceneDescription:
     )
     logger.debug("raw vision model reply that failed to parse: %r", candidate)
     return SceneDescription(
-        description=_FALLBACK_DESCRIPTION, threat_value=0.5, suggested_action=_FALLBACK_ACTION
+        description=_FALLBACK_DESCRIPTION,
+        threat_value=0.5,
+        suggested_action=_FALLBACK_ACTION,
+        # Explicit, not just `SceneDescription`'s own default: a malformed reply has
+        # no welfare opinion to carry, and this must never look like "assessed,
+        # found nothing" via some other, unaudited route.
+        welfare=WelfareAssessment.none(),
     )
 
 

@@ -23,6 +23,7 @@ from sentinel_ai.adapters.vision.qwen25vl import (
     _parse_response,
 )
 from sentinel_ai.domain.entities import BBox, SceneState, Track
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment, WelfareConcern
 from sentinel_ai.ports.frame_source import FrameData
 from sentinel_ai.ports.model_runtime import ModelRuntime
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
@@ -105,6 +106,9 @@ class TestTheHarmAssessment:
             ("unresponsive", "a person unresponsive"),
             ("altercation", "a physical altercation"),
             ("fighting", "a physical altercation"),
+            ("self-harm", "apparent self-harm"),
+            ("medication", "apparent medication ingestion"),
+            ("unlabelled container", "an unlabelled-container ingestion"),
             ("distress", "other apparent distress or harm"),
         ],
     )
@@ -112,6 +116,32 @@ class TestTheHarmAssessment:
         assert phrase in _build_text_prompt(_request()).lower(), (
             f"the prompt no longer asks the model to check for {what}"
         )
+
+    _BANNED_MEDICATION_WORDS = (
+        "dose",
+        "dosage",
+        "overdose",
+        "milligram",
+        "prescribed",
+        "prescription",
+        "ibuprofen",
+        "acetaminophen",
+        "paracetamol",
+        "aspirin",
+        "opioid",
+        "narcotic",
+    )
+
+    @pytest.mark.parametrize("word", _BANNED_MEDICATION_WORDS)
+    def test_the_medication_check_never_asks_to_name_a_substance_or_judge_a_dose(
+        self, word: str
+    ) -> None:
+        """Binding constraint: this is a custodial welfare system, and a single-frame
+        VLM has no basis for naming a substance, estimating a dose, or judging
+        whether medication was prescribed. The prompt must ask only whether an
+        apparent ingestion was seen and for a description of what was visible — never
+        for a clinical assessment a still frame cannot honestly support."""
+        assert word not in _build_text_prompt(_request()).lower()
 
     def test_every_declared_harm_check_actually_reaches_the_prompt(self) -> None:
         """`HARM_CHECKS` is the reviewable list of what is asked; a check that was
@@ -178,6 +208,99 @@ class TestTheHarmAssessment:
         result = _parse_response("I see two people fighting near the gate. Very concerning!")
         assert result.description == _FALLBACK_DESCRIPTION
         assert 0.0 <= result.threat_value <= 1.0
+
+
+class TestWelfareParsing:
+    """T3: `_parse_response` also reads an optional `welfare` array out of the same
+    JSON reply and turns it into a `WelfareAssessment` (`domain/welfare.py`) — a
+    vision-language model's opinion, not a detection. Every test here treats the
+    array as untrusted model output: nothing here may raise, and nothing may let the
+    payload set its own provenance (`basis`).
+    """
+
+    def test_a_well_formed_welfare_array_parses(self) -> None:
+        raw = (
+            '{"description": "A person is lying motionless.", "threat_value": 0.9, '
+            '"suggested_action": "Send a responder now.", '
+            '"welfare": [{"kind": "collapse", "confidence": "likely", '
+            '"evidence": "lying motionless on the floor, not moving"}]}'
+        )
+        result = _parse_response(raw)
+        assert result.welfare == WelfareAssessment(
+            concerns=(
+                WelfareConcern(
+                    kind=ConcernKind.COLLAPSE,
+                    confidence=Confidence.LIKELY,
+                    evidence="lying motionless on the floor, not moving",
+                ),
+            )
+        )
+
+    def test_an_unknown_kind_maps_to_other_rather_than_raising(self) -> None:
+        raw = (
+            '{"description": "X", "threat_value": 0.5, "suggested_action": "Y", '
+            '"welfare": [{"kind": "sasquatch", "confidence": "possible", "evidence": "unclear"}]}'
+        )
+        result = _parse_response(raw)
+        assert result.welfare.concerns[0].kind == ConcernKind.OTHER
+
+    def test_an_unknown_confidence_rounds_down_to_possible_never_up(self) -> None:
+        """Binding constraint: a garbled confidence must never round up into
+        `LIKELY` — that is the tier a routing decision would treat as more
+        actionable, and a formatting slip must not be able to manufacture one."""
+        raw = (
+            '{"description": "X", "threat_value": 0.5, "suggested_action": "Y", '
+            '"welfare": [{"kind": "distress", "confidence": "extremely certain", '
+            '"evidence": "shouting"}]}'
+        )
+        result = _parse_response(raw)
+        assert result.welfare.concerns[0].confidence == Confidence.POSSIBLE
+
+    def test_an_absent_welfare_key_yields_none(self) -> None:
+        raw = '{"description": "X", "threat_value": 0.1, "suggested_action": "Y"}'
+        assert _parse_response(raw).welfare == WelfareAssessment.none()
+
+    def test_a_non_list_welfare_value_yields_none_rather_than_raising(self) -> None:
+        raw = (
+            '{"description": "X", "threat_value": 0.1, "suggested_action": "Y", '
+            '"welfare": "collapse"}'
+        )
+        assert _parse_response(raw).welfare == WelfareAssessment.none()
+
+    def test_a_concern_with_blank_evidence_is_skipped_not_raised(self) -> None:
+        """`WelfareConcern.__post_init__` rejects empty evidence; unvalidated model
+        output reaching the constructor directly would raise straight through
+        `_parse_response` rather than degrading safely."""
+        raw = (
+            '{"description": "X", "threat_value": 0.1, "suggested_action": "Y", '
+            '"welfare": [{"kind": "collapse", "confidence": "likely", "evidence": "   "}, '
+            '{"kind": "distress", "confidence": "possible", '
+            '"evidence": "shouting near the gate"}]}'
+        )
+        result = _parse_response(raw)
+        assert len(result.welfare.concerns) == 1
+        assert result.welfare.concerns[0].kind == ConcernKind.DISTRESS
+
+    def test_malformed_json_falls_back_to_none_and_the_fixed_description(self) -> None:
+        """The existing malformed-response fallback path (`_FALLBACK_DESCRIPTION`)
+        must degrade welfare to `none()` too, never leave it looking like "assessed,
+        found nothing" by some other, unaudited route."""
+        result = _parse_response("I see someone on the floor, maybe collapsed!")
+        assert result.description == _FALLBACK_DESCRIPTION
+        assert result.welfare == WelfareAssessment.none()
+
+    def test_the_payload_cannot_set_its_own_basis(self) -> None:
+        """Binding constraint: `basis` always comes from the `WelfareAssessment`
+        constant, never the payload — building the type by spreading parsed JSON
+        (`WelfareAssessment(**payload)`) would let a payload claim its own
+        provenance marker, defeating the entire point of the field."""
+        raw = (
+            '{"description": "X", "threat_value": 0.5, "suggested_action": "Y", '
+            '"welfare": [{"kind": "collapse", "confidence": "likely", '
+            '"evidence": "on the floor", "basis": "hand_verified"}]}'
+        )
+        result = _parse_response(raw)
+        assert result.welfare.basis == "single_frame_vlm"
 
 
 def test_parse_response_reads_well_formed_json() -> None:

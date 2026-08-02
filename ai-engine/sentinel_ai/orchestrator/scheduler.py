@@ -85,6 +85,7 @@ from uuid import UUID
 
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, ThreatScore
+from sentinel_ai.domain.welfare import WelfareAssessment
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import (
     RECENT_EVENTS_PER_CAMERA,
@@ -542,12 +543,21 @@ class VlmScheduler:
         description: str,
         suggested_action: str,
         description_unavailable: bool,
+        welfare: WelfareAssessment,
     ) -> Event:
         """The one place in the system that constructs an `Event` (S14).
 
         Every path — a good describe, a failed one, and a shutdown that abandoned the
         escalation before it was ever described — comes through here, precisely so no
         error path can produce a differently-shaped event, or none at all.
+
+        `welfare` is keyword-only with no default, on purpose (T3 review): a default
+        of `WelfareAssessment.none()` here would silently reproduce the exact bug this
+        parameter exists to fix — `_describe`'s success path forgetting to carry
+        `SceneDescription.welfare` across would still type-check, still pass every
+        existing test, and `Event.welfare` would stay empty in production no matter
+        how loudly the model reported a concern. Every caller must say explicitly
+        which welfare opinion (or the deliberate absence of one) this event carries.
 
         Which is also why the console's recent-event ring is *first* written here:
         hanging it off the publish path instead would omit exactly the events an
@@ -573,19 +583,23 @@ class VlmScheduler:
             labels=labels,
             track_ids=track_ids,
             description_unavailable=description_unavailable,
+            welfare=welfare,
         )
         self._recent.record(event)
         return event
 
     def _unavailable_event(self, request: EscalationRequest) -> Event:
         """Spec §9's degraded event: everything the metadata already knows, and an
-        honest flag saying the VLM never spoke."""
+        honest flag saying the VLM never spoke. There is no VLM opinion to carry on
+        this path, so `welfare` is explicitly `WelfareAssessment.none()` rather than
+        anything derived from a description that was never produced."""
         return self._assemble(
             request,
             threat=ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE),
             description=_metadata_description(request),
             suggested_action=_UNAVAILABLE_ACTION,
             description_unavailable=True,
+            welfare=WelfareAssessment.none(),
         )
 
     async def _describe(self, request: EscalationRequest) -> Event:
@@ -620,6 +634,10 @@ class VlmScheduler:
             description=description.description,
             suggested_action=description.suggested_action,
             description_unavailable=False,
+            # T3: the VLM's own opinion, carried across rather than dropped — see
+            # `_assemble`'s docstring for why `welfare` has no default that would let
+            # this be forgotten silently.
+            welfare=description.welfare,
         )
 
     async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:

@@ -21,6 +21,7 @@ from sentinel_ai.domain.entities import (
     SceneState,
     Track,
 )
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment, WelfareConcern
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import RECENT_EVENTS_PER_CAMERA
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
@@ -245,6 +246,52 @@ async def test_a_submitted_escalation_is_described_and_published() -> None:
     assert event.description_unavailable is False
     assert event.source_timestamp == pytest.approx(12.5), "the scene's timestamp, not the clock's"
     assert vlm.call_count == 1
+    assert event.welfare == WelfareAssessment.none(), (
+        "a describe that reports nothing of concern must publish nothing of concern"
+    )
+
+
+async def test_a_welfare_assessment_from_the_vlm_reaches_the_published_event() -> None:
+    """T3: `_assemble` did not copy `SceneDescription.welfare` onto the `Event` it
+    built — found missing during Task 2's review. Without this wire, `Event.welfare`
+    stays `WelfareAssessment.none()` in production no matter how loudly the model
+    reports a collapse, and a later task's notification logic would read that as
+    "nothing wrong", silently, with a green suite."""
+    concern = WelfareConcern(
+        kind=ConcernKind.COLLAPSE,
+        confidence=Confidence.LIKELY,
+        evidence="lying motionless near the wall, not moving",
+    )
+    welfare = WelfareAssessment(concerns=(concern,))
+    vlm = FakeVisionLLM(
+        response=SceneDescription(
+            description="A person is lying motionless on the floor.",
+            threat_value=0.9,
+            suggested_action="Dispatch a responder now.",
+            welfare=welfare,
+        )
+    )
+    publisher = FakePublisher()
+    async with Worker(new_scheduler(vlm=vlm, publisher=publisher)) as scheduler:
+        assert scheduler.submit(a_request()) is True
+        await scheduler.drain()
+
+    assert len(publisher.events) == 1
+    assert publisher.events[0].welfare == welfare
+
+
+async def test_a_degraded_event_the_vlm_never_described_carries_no_welfare_opinion() -> None:
+    """A metadata-only fallback (spec §9) has no VLM opinion to carry — it must
+    publish `WelfareAssessment.none()` rather than stay silent about the fact that
+    nothing was ever assessed."""
+    vlm = FakeVisionLLM(error=RuntimeError("boom"))
+    publisher = FakePublisher()
+    async with Worker(new_scheduler(vlm=vlm, publisher=publisher)) as scheduler:
+        scheduler.submit(a_request())
+        await scheduler.drain()
+
+    assert publisher.events[0].description_unavailable is True
+    assert publisher.events[0].welfare == WelfareAssessment.none()
 
 
 async def test_the_vlm_receives_the_keyframe_history_and_reason_detail() -> None:
