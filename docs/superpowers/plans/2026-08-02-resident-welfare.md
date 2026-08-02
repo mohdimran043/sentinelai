@@ -182,7 +182,9 @@ The per-camera values override the globals when set. `summary_interval_seconds` 
 
 ### Task 10: Dispatch notifications, off the critical path
 
-**Files:** Modify `ai-engine/sentinel_ai/orchestrator/service.py` (or wherever the event is published after assembly — find the publish call), `ai-engine/sentinel_ai/main.py` (compose the notifier), `ai-engine/sentinel_ai/config.py` (settings: notifier kind, webhook URL, timeout); Tests: the orchestrator's existing tests.
+**Files:** Modify `ai-engine/sentinel_ai/orchestrator/service.py` (or wherever the event is published after assembly — find the publish call), `ai-engine/sentinel_ai/main.py` (compose the notifier), `ai-engine/sentinel_ai/config.py` (settings: notifier kind, webhook URL, timeout), `contracts/events/anomaly_event.schema.json` and the event codec; Tests: the orchestrator's existing tests plus the codec's.
+
+**Carry `evidence_stated` across the wire first.** Task 3 added `WelfareConcern.evidence_stated: bool` so routing can tell "the model named a concern but described nothing" from a real evidenced one — but it was scoped to the adapter and domain, so the codec does not encode it. In-process dispatch reads the `Event` directly and would work without this; a Phase 1C consumer reading a round-tripped event would silently see every concern as evidenced. Extend the schema and codec as part of this task, and test that the flag survives a round trip in both states.
 
 Order, from the spec: process → describe → clip finalised → publish → notify. Notification is dispatched **after** publishing, with its own timeout, and a failure is logged and never propagated.
 
