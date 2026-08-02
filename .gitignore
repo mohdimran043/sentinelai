@@ -31,5 +31,10 @@ ai-engine/var/
 # The operator's real camera list (URLs, credentials in the URL, site names).
 # `ai-engine/cameras.example.json` is the committed template.
 ai-engine/cameras.json
+# `CameraFileStore._write`'s write-then-rename temp file (also covers a camera
+# file at a `SENTINEL_CAMERAS_FILE` override path other than the default above).
+# It briefly holds a full copy of the document above, credentials included, and a
+# rename that fails partway can leave it behind — it needs the same protection.
+*.json.tmp
 __pycache__/
 .pytest_cache/

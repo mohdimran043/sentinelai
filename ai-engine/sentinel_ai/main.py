@@ -603,13 +603,24 @@ class ComposedService:
         """
         if self._composition is None:
             raise UnknownCameraError(camera_id)
-        self._composition.service.telemetry(camera_id)
+        before = self._composition.service.telemetry(camera_id)
         record = await self._composition.camera_store.apply(camera_id, edit)
         self._composition.service.update_camera_metadata(
             camera_id, label=record.label, zone=record.zone
         )
+        # Old value logged alongside the new one: this endpoint is unauthenticated
+        # (see the module docstring), so the log line is the only record of what a
+        # camera used to be called or where it used to be grouped once the write
+        # above overwrites both in the file. Without it, an anonymous caller could
+        # rename a camera to something misleading and nobody could reconstruct what
+        # the console said about that location a minute earlier.
         logger.info(
-            "camera %s reconfigured: label=%r zone=%s", camera_id, record.label, record.zone
+            "camera %s reconfigured: label=%r->%r zone=%s->%s",
+            camera_id,
+            before.label,
+            record.label,
+            before.zone,
+            record.zone,
         )
         return record
 

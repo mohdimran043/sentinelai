@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -280,6 +281,26 @@ class TestTheWriteIsAtomic:
             await CameraFileStore(path).apply("cam-1", CameraEdit(label="Renamed"))
 
         assert path.read_text(encoding="utf-8") == before
+        # The stated invariant of the test above ("the temporary file is gone
+        # afterwards") has to hold here too, on the one path where the temp file
+        # actually holds a document nobody else will ever clean up: it carries the
+        # full camera record, RTSP credentials included, and a stray `.tmp` next to
+        # `cameras.json` is exactly the kind of file a careless `git add -A` picks up.
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["cameras.json"]
+
+    async def test_the_files_permissions_are_preserved_across_a_write(self, tmp_path: Path) -> None:
+        """`cameras.json` holds RTSP credentials, so its mode is part of what
+        protects them. `Path.open("w")` on a *new* file — which the write-then-rename
+        temp file always is — gets `0o666 & ~umask`, and the rename carries that mode
+        onto `cameras.json` in place of whatever an operator had set. An edit made
+        through the console must not be the thing that quietly widens a `0600` file
+        to group- or world-readable."""
+        path = a_file(tmp_path, CAM)
+        path.chmod(0o600)
+
+        await CameraFileStore(path).apply("cam-1", CameraEdit(label="Renamed"))
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
     async def test_concurrent_edits_to_different_fields_do_not_lose_one(
         self, tmp_path: Path

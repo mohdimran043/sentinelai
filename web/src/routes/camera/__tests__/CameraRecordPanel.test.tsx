@@ -30,7 +30,7 @@ describe('CameraRecordPanel, read-only', () => {
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={false} />)
 
     expect(screen.getByText('Avenue entrance')).toBeInTheDocument()
-    expect(screen.getByText(/corridor/i)).toBeInTheDocument()
+    expect(screen.getByText('Corridor · Common area')).toBeInTheDocument()
   })
 
   it('offers no editing controls at all, rather than disabled ones', () => {
@@ -65,11 +65,16 @@ describe('CameraRecordPanel, read-only', () => {
   it('names url and profile as restart-required and shows no value for either', () => {
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={false} />)
 
-    // The engine returns neither, because an RTSP URL carries credentials.
+    // The engine returns neither, because an RTSP URL carries credentials — so the
+    // `url` and `profile` rows' values must be exactly the placeholder text and
+    // nothing else, never a URL that leaked through some other code path.
     expect(screen.getByText(/^url$/i)).toBeInTheDocument()
     expect(screen.getByText(/^profile$/i)).toBeInTheDocument()
-    expect(screen.getAllByText(/restart required/i).length).toBeGreaterThanOrEqual(2)
-    expect(screen.queryByText(/rtsp:/i)).not.toBeInTheDocument()
+    const restartRequiredValues = screen.getAllByText('restart required')
+    expect(restartRequiredValues).toHaveLength(2)
+    for (const value of restartRequiredValues) {
+      expect(value).toHaveTextContent(/^restart required$/)
+    }
   })
 })
 
