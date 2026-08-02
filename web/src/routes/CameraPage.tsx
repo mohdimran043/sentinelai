@@ -151,11 +151,16 @@ export function CameraPage() {
         </Link>
       </p>
       <div className="mb-1 flex flex-wrap items-center gap-2.5">
-        <h1 className="mb-0">{cameraId}</h1>
+        <h1 className="mb-0">{telemetryQuery.data?.label ?? cameraId}</h1>
         <Pill tone={tone}>
           {liveness === 'live' ? 'Live' : liveness === 'stale' ? 'Stale' : 'No data yet'}
         </Pill>
       </div>
+      {/* The id stays on the page even once the label is the heading: it is what
+          an operator quotes in a bug report and what every log line uses. */}
+      <p className="muted mb-2" data-testid="camera-id-subtitle">
+        <code>{cameraId}</code>
+      </p>
       <p className="lede">
         Telemetry, the scene description, the chart and notifications below are all live from
         the AI engine.

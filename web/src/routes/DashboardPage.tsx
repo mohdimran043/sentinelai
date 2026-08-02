@@ -57,7 +57,7 @@ function CameraTile({
     <Link to={`/cameras/${encodeURIComponent(camera.camera_id)}`} className="block">
       <Tile tone={tone} className="cursor-pointer transition-colors hover:bg-panel-2">
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <h3>{camera.camera_id}</h3>
+          <h3>{camera.label}</h3>
           <Pill tone={livenessTone}>{livenessLabel}</Pill>
         </div>
         <div className="mb-2.5 flex flex-wrap items-center gap-2">

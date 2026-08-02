@@ -126,6 +126,12 @@ If `cameras.json` has been edited by hand since the engine started and no longer
 holds the camera being edited, the answer is **409** and nothing is written.
 Reconcile the file and restart rather than letting the console overwrite it.
 
+In the console, this is the **Camera record** panel on a camera's own page. When
+`config_writable` is false the panel still shows the stored record, read-only,
+and names the environment variable — hiding it would leave a camera's label and
+zone with nowhere in the console they can be read. `url` and `profile` are listed
+as restart-required with no value, because no endpoint returns one.
+
 ## Running the console
 
 ```bash

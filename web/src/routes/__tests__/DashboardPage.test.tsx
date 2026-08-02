@@ -23,9 +23,14 @@ const getHealth = vi.mocked(engineClient.getHealth)
 const listCameras = vi.mocked(engineClient.listCameras)
 
 function makeCameraStatus(overrides: Partial<CameraStatus> = {}): CameraStatus {
+  const camera_id = overrides.camera_id ?? 'avenue_01'
   return {
-    camera_id: 'avenue_01',
-    label: 'avenue_01',
+    camera_id,
+    // Defaults to the id, like the real engine does when `cameras.json` gives
+    // no label — so tests that only override `camera_id` still find their
+    // camera by the same text a tile renders. Pass `label` explicitly to test
+    // the label/id divergence itself.
+    label: camera_id,
     frames_seen: 1000,
     frames_dropped: 2,
     detections_run: 900,
@@ -240,6 +245,19 @@ describe('DashboardPage', () => {
     renderWithProviders(<DashboardPage />)
 
     expect(await screen.findByText(/no cameras configured/i)).toBeInTheDocument()
+  })
+
+  it('names a tile by its label rather than its id', async () => {
+    registerEmptyEventStream()
+    getHealth.mockResolvedValue(sampleHealth)
+    listCameras.mockResolvedValue({
+      cameras: [makeCameraStatus({ camera_id: 'room_4b', label: 'Room 4B, window side' })],
+      config_writable: false,
+    })
+
+    renderWithProviders(<DashboardPage />)
+
+    expect(await screen.findByText('Room 4B, window side')).toBeInTheDocument()
   })
 
   it("clicking a camera tile navigates to that camera's own page", async () => {

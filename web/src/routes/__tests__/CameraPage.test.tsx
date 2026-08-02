@@ -355,6 +355,18 @@ describe('CameraPage', () => {
     expect(await screen.findByText(/chart unavailable/i)).toBeInTheDocument()
     expect(await screen.findByText(/notifications unavailable/i)).toBeInTheDocument()
   })
+
+  it('shows the camera label as the heading, keeping the id visible for a bug report', async () => {
+    getCameraTelemetry.mockResolvedValue({ ...telemetry, label: 'East corridor, door end' })
+    getCameraEvents.mockResolvedValue(makeEventsResponse())
+
+    renderCameraPage()
+
+    expect(
+      await screen.findByRole('heading', { name: 'East corridor, door end', level: 1 }),
+    ).toBeInTheDocument()
+    expect(screen.getByTestId('camera-id-subtitle')).toHaveTextContent('avenue_01')
+  })
 })
 
 describe('CameraPage camera record', () => {
@@ -391,5 +403,26 @@ describe('CameraPage camera record', () => {
 
     await screen.findByText('Frames seen')
     expect(screen.queryByTestId('camera-record-panel')).not.toBeInTheDocument()
+  })
+
+  it('sources the record panel from the camera list, not the telemetry poll', async () => {
+    // Telemetry (the heading's source) carries one label/zone; the camera list
+    // (the record panel's source, per its own doc comment) carries another.
+    // If the panel's `record` prop were ever wired to `telemetryQuery.data`
+    // instead of the camera list, this would render the telemetry values here
+    // and the assertions below would fail.
+    getCameraTelemetry.mockResolvedValue({ ...telemetry, label: 'Telemetry label', zone: null })
+    getCameraEvents.mockResolvedValue(makeEventsResponse())
+    listCameras.mockResolvedValue({
+      cameras: [{ ...telemetry, label: 'List label', zone: 'corridor' }],
+      config_writable: false,
+    })
+
+    renderCameraPage()
+
+    const panel = await screen.findByTestId('camera-record-panel')
+    expect(within(panel).getByText('List label')).toBeInTheDocument()
+    expect(within(panel).getByText('Corridor')).toBeInTheDocument()
+    expect(within(panel).queryByText('Telemetry label')).not.toBeInTheDocument()
   })
 })
