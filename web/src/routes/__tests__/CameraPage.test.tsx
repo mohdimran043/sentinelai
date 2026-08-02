@@ -19,12 +19,14 @@ vi.mock('@/api/engineClient', async (importOriginal) => {
     getCameraTelemetry: vi.fn(),
     describeCameraNow: vi.fn(),
     getCameraEvents: vi.fn(),
+    listCameras: vi.fn(),
   }
 })
 
 const getCameraTelemetry = vi.mocked(engineClient.getCameraTelemetry)
 const describeCameraNow = vi.mocked(engineClient.describeCameraNow)
 const getCameraEvents = vi.mocked(engineClient.getCameraEvents)
+const listCameras = vi.mocked(engineClient.listCameras)
 
 const telemetry: CameraStatus = {
   camera_id: 'avenue_01',
@@ -72,6 +74,13 @@ function makeEventsResponse(overrides: Partial<CameraEventsResponse> = {}): Came
   }
 }
 
+function camerasResponse(config_writable: boolean, label = 'avenue_01') {
+  return {
+    cameras: [{ ...telemetry, label }],
+    config_writable,
+  }
+}
+
 function renderCameraPage() {
   return renderWithProviders(
     <Routes>
@@ -86,6 +95,8 @@ describe('CameraPage', () => {
     getCameraTelemetry.mockReset()
     describeCameraNow.mockReset()
     getCameraEvents.mockReset()
+    listCameras.mockReset()
+    listCameras.mockResolvedValue(camerasResponse(false))
   })
 
   it('shows live telemetry', async () => {
@@ -343,5 +354,42 @@ describe('CameraPage', () => {
     ).toBeInTheDocument()
     expect(await screen.findByText(/chart unavailable/i)).toBeInTheDocument()
     expect(await screen.findByText(/notifications unavailable/i)).toBeInTheDocument()
+  })
+})
+
+describe('CameraPage camera record', () => {
+  it('shows the record read-only when the engine has writes disabled', async () => {
+    getCameraTelemetry.mockResolvedValue(telemetry)
+    getCameraEvents.mockResolvedValue(makeEventsResponse())
+    listCameras.mockResolvedValue(camerasResponse(false))
+
+    renderCameraPage()
+
+    const panel = await screen.findByTestId('camera-record-panel')
+    expect(within(panel).queryByRole('button', { name: /save/i })).not.toBeInTheDocument()
+    expect(within(panel).getByText(/SENTINEL_ENABLE_CAMERA_WRITES/)).toBeInTheDocument()
+  })
+
+  it('offers the form when the engine reports writes are enabled', async () => {
+    getCameraTelemetry.mockResolvedValue(telemetry)
+    getCameraEvents.mockResolvedValue(makeEventsResponse())
+    listCameras.mockResolvedValue(camerasResponse(true))
+
+    renderCameraPage()
+
+    const panel = await screen.findByTestId('camera-record-panel')
+    expect(within(panel).getByLabelText(/label/i)).toBeInTheDocument()
+    expect(within(panel).getByRole('button', { name: /save/i })).toBeInTheDocument()
+  })
+
+  it('shows no record panel for a camera the list does not have', async () => {
+    getCameraTelemetry.mockResolvedValue(telemetry)
+    getCameraEvents.mockResolvedValue(makeEventsResponse())
+    listCameras.mockResolvedValue({ cameras: [], config_writable: true })
+
+    renderCameraPage()
+
+    await screen.findByText('Frames seen')
+    expect(screen.queryByTestId('camera-record-panel')).not.toBeInTheDocument()
   })
 })

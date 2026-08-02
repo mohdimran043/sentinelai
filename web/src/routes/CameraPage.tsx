@@ -1,7 +1,8 @@
 import { Link, useParams } from 'react-router-dom'
-import { useCameraEvents, useCameraTelemetry, useDescribeCameraNow } from '@/api/queries'
+import { useCameraEvents, useCameraTelemetry, useCameras, useDescribeCameraNow } from '@/api/queries'
 import type { RecentEventEntry } from '@/api/engineClient'
 import { HlsPlayer } from '@/live/HlsPlayer'
+import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
 import { Panel } from '@/components/ui/Panel'
 import { Reading } from '@/components/ui/Reading'
 import { Pill } from '@/components/ui/Pill'
@@ -128,6 +129,15 @@ export function CameraPage() {
   const telemetryQuery = useCameraTelemetry(cameraId)
   const eventsQuery = useCameraEvents(cameraId)
   const describeMutation = useDescribeCameraNow(cameraId)
+
+  /**
+   * The record and its writability come from the *same* snapshot on purpose.
+   * `label` and `zone` are on the telemetry poll too, but `config_writable` is
+   * not, and taking them from two sources would let the panel render a record
+   * it is simultaneously wrong about the editability of.
+   */
+  const camerasQuery = useCameras()
+  const cameraRecord = camerasQuery.data?.cameras.find((c) => c.camera_id === cameraId)
 
   const liveness =
     telemetryQuery.status === 'success' ? cameraLiveness(telemetryQuery.data.last_frame_at) : 'no-data'
@@ -285,7 +295,7 @@ export function CameraPage() {
         )}
       </div>
 
-      <Panel data-testid="notifications-panel">
+      <Panel className="mb-4" data-testid="notifications-panel">
         <h2>Notifications</h2>
         <p className="lede">Recent events for this camera, newest first.</p>
         {eventsQuery.isPending ? (
@@ -302,6 +312,18 @@ export function CameraPage() {
           </ul>
         )}
       </Panel>
+
+      {cameraRecord ? (
+        <CameraRecordPanel
+          cameraId={cameraId}
+          record={{
+            label: cameraRecord.label,
+            zone: cameraRecord.zone ?? null,
+            zone_kind: cameraRecord.zone_kind ?? null,
+          }}
+          writable={camerasQuery.data?.config_writable ?? false}
+        />
+      ) : null}
     </div>
   )
 }
