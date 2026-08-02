@@ -1161,39 +1161,13 @@ function saveFailureText(error: Error): string {
 }
 ```
 
-Track the baseline. Inside the component, after the `draft` state:
+**The `baseline` ref already exists** — it was introduced by the Task 5 fix, which found that
+diffing a live `stored` against a partly-frozen `draft` let an untouched field be resubmitted
+and silently revert another operator's change. `buildCameraEdit` is already called against
+`baseline`, not `stored`. Do not re-add the ref, and do not change what the edit body is diffed
+against.
 
-```tsx
-  /**
-   * The record as it stood when this edit began. Compared against the live
-   * record to notice another operator's change landing underneath — which is
-   * worth saying out loud, and never worth silently applying over what someone
-   * is in the middle of typing.
-   */
-  const baseline = useRef<CameraRecordDraft | null>(null)
-```
-
-Change `editDraft` to capture it on the first touch:
-
-```tsx
-  function editDraft(patch: Partial<CameraRecordDraft>) {
-    setDraft((current) => {
-      if (current === null) {
-        baseline.current = stored
-      }
-      return { ...(current ?? stored), ...patch }
-    })
-  }
-```
-
-Clear it on success — change the `onSuccess` in `handleSubmit` to:
-
-```tsx
-      onSuccess: () => {
-        setDraft(null)
-        baseline.current = null
-      },
-```
+What remains for this task is to *read* that baseline for the staleness warning.
 
 Compute the warning, after `canSave`:
 
@@ -1215,7 +1189,8 @@ Render both, inside the form, immediately before the submit `<div className="mt-
           <Notice tone="caution" className="mt-3" data-testid="camera-record-stale">
             This camera's {changedElsewhere.join(' and ')} changed elsewhere since you started
             editing — another console, or an edit to <code>cameras.json</code>. Your text has been
-            left alone. Saving will overwrite the newer value.
+            left alone. Saving sends only the fields you actually changed, so anything you did not
+            touch keeps the newer value; a field you did edit will overwrite it.
           </Notice>
         ) : null}
 
