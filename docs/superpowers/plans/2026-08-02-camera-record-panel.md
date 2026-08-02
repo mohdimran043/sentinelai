@@ -1376,13 +1376,18 @@ Without this the write endpoint is unobservable: a rename would take visible eff
 **Files:**
 - Modify: `web/src/routes/CameraPage.tsx`
 - Modify: `web/src/routes/DashboardPage.tsx:59`
-- Modify: `web/src/sitemap/CameraMarker.tsx`
-- Modify: `web/src/sitemap/FloorplanStage.tsx:82`
-- Modify: `web/src/routes/__tests__/CameraPage.test.tsx`, `web/src/routes/__tests__/DashboardPage.test.tsx`, `web/src/routes/__tests__/SiteMapPage.test.tsx`
+- Modify: `web/src/routes/__tests__/CameraPage.test.tsx`, `web/src/routes/__tests__/DashboardPage.test.tsx`
 
 **Interfaces:**
 - Consumes: `CameraStatus.label` from the contract.
-- Produces: `CameraMarkerProps.displayName: string`.
+- Produces: nothing new.
+
+**Scope note — the site map is deliberately excluded.** An earlier draft of this
+task also threaded a `displayName` prop through `web/src/sitemap/CameraMarker.tsx`
+and `FloorplanStage.tsx`. The site map has been **cut** by user decision
+(2026-08-01) and its removal is queued, so that work would be thrown away.
+**Do not touch anything under `web/src/sitemap/`.** Markers continuing to show
+the camera id is expected and correct for the remaining life of that screen.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1419,26 +1424,10 @@ In `web/src/routes/__tests__/DashboardPage.test.tsx`:
   })
 ```
 
-In `web/src/routes/__tests__/SiteMapPage.test.tsx`:
-
-```tsx
-  it('names a marker by its label, including in its accessible name', async () => {
-    registerEmptyEventStream()
-    listCameras.mockResolvedValue({
-      cameras: [makeCameraStatus({ camera_id: 'room_4b', label: 'Room 4B', zone: 'room' })],
-      config_writable: false,
-    })
-
-    renderWithProviders(<SiteMapPage />)
-
-    expect(await screen.findByRole('link', { name: /Room 4B/ })).toBeInTheDocument()
-  })
-```
-
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npx vitest run src/routes/__tests__/CameraPage.test.tsx src/routes/__tests__/DashboardPage.test.tsx src/routes/__tests__/SiteMapPage.test.tsx`
-Expected: FAIL — all three render the camera id where a label is expected.
+Run: `npx vitest run src/routes/__tests__/CameraPage.test.tsx src/routes/__tests__/DashboardPage.test.tsx`
+Expected: FAIL — both render the camera id where a label is expected.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1464,37 +1453,7 @@ Expected: FAIL — all three render the camera id where a label is expected.
           <h3>{camera.label}</h3>
 ```
 
-**`CameraMarker.tsx`** — add to `CameraMarkerProps`, directly under `cameraId`:
-
-```tsx
-  /**
-   * What to call this camera on screen — its `label`, not its id. Named
-   * `displayName` rather than `label` because this component already computes a
-   * `label` for its accessible name, and two different meanings of the word in
-   * one file is how the wrong string reaches a screen reader.
-   */
-  displayName: string
-```
-
-Add `displayName` to the destructured props, then rename the local and use the new prop:
-
-```tsx
-  const zoneWords = zone ? humanizeEnum(zone) : 'ungrouped'
-  const ariaLabel = `${displayName}, ${zoneWords}, ${toneLabel[tone]}${
-    isDefaultPosition ? ', not yet placed' : ''
-  }`
-```
-
-Replace every remaining use in the file: `aria-label={`${label}. Use arrow keys…`}` becomes `aria-label={`${ariaLabel}. Use arrow keys to move, hold shift to move further.`}`; `aria-label={label}` becomes `aria-label={ariaLabel}`; and both `<span className={labelClass}>{cameraId}</span>` become `<span className={labelClass}>{displayName}</span>`. Leave `labelClass` alone — it is a CSS class name, not a caption.
-
-**`FloorplanStage.tsx:82`** — add the prop beside `cameraId`:
-
-```tsx
-            cameraId={camera.camera_id}
-            displayName={camera.label}
-```
-
-**`FloorplanStage.test.tsx`** — its `makeCamera` already supplies `label: 'cam'`, so no change is needed.
+**Nothing under `web/src/sitemap/`** — see the scope note above. That screen is cut and its removal is queued; leave it showing camera ids.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
