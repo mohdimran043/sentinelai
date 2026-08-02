@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import type { Zone, ZoneKind } from '@/api/engineClient'
 import { useUpdateCamera } from '@/api/queries'
 import { Panel } from '@/components/ui/Panel'
@@ -69,15 +69,30 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
    */
   const [draft, setDraft] = useState<CameraRecordDraft | null>(null)
 
+  /**
+   * The record as it stood the moment editing began — captured once, when
+   * `draft` first goes from `null` to non-null, and held fixed until save
+   * succeeds (or the draft is otherwise cleared). The submitted edit diffs
+   * against THIS, not the live `stored`, so a poll landing mid-edit can
+   * change `stored` without that change leaking into the diff: a field the
+   * operator never touched still equals its baseline, so `buildCameraEdit`
+   * leaves it out of the request rather than "reverting" someone else's
+   * concurrent change.
+   */
+  const baseline = useRef<CameraRecordDraft | null>(null)
+
   const stored: CameraRecordDraft = { label: record.label, zone: record.zone }
   const shown = draft ?? stored
 
   function editDraft(patch: Partial<CameraRecordDraft>) {
+    if (draft === null) {
+      baseline.current = stored
+    }
     setDraft((current) => ({ ...(current ?? stored), ...patch }))
   }
 
   const invalidLabel = labelError(shown.label)
-  const edit = buildCameraEdit(stored, shown)
+  const edit = buildCameraEdit(baseline.current ?? stored, shown)
   const nothingToSave = isEmptyEdit(edit)
   const canSave = draft !== null && !nothingToSave && invalidLabel === null && !mutation.isPending
 
@@ -88,7 +103,10 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
       // Clear the draft only once the write is on disk, so the panel goes back
       // to tracking the server and renders what was stored rather than what was
       // typed. On failure the draft stays, so nothing the operator wrote is lost.
-      onSuccess: () => setDraft(null),
+      onSuccess: () => {
+        setDraft(null)
+        baseline.current = null
+      },
     })
   }
 

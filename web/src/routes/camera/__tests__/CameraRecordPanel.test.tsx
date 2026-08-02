@@ -167,6 +167,35 @@ describe('CameraRecordPanel, editing', () => {
     expect(screen.getByLabelText(/label/i)).toHaveValue('Half-typed name')
   })
 
+  it('does not revert a field changed elsewhere while the operator edits a different one', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, zone: 'room' as const })
+    const user = userEvent.setup()
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    // Operator touches only the zone.
+    await user.selectOptions(screen.getByLabelText(/zone/i), 'room')
+
+    // A 5s poll lands mid-edit: someone else renamed the camera. The operator
+    // never touched the label, so this should not end up in the save request.
+    rerender(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, label: 'East door' }}
+        writable={true}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { zone: 'room' })
+    expect(updateCamera).not.toHaveBeenCalledWith(
+      'avenue_01',
+      expect.objectContaining({ label: expect.anything() }),
+    )
+  })
+
   it('does track the record while the form is untouched', () => {
     const { rerender } = renderWithProviders(
       <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
