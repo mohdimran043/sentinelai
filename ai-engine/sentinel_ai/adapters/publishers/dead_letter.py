@@ -17,6 +17,19 @@ fixed.
 
 Write-then-rename, same as the spool: a `.json` file is either absent or
 complete.
+
+`store`'s parameter is typed `Event | WelfareNote`, wider than the
+`FailedEventSink` port it implements (`event: Event`). Task 6's webhook
+notifier needs exactly this disk-backed, write-then-rename spool for a
+`WelfareNote` that a webhook endpoint would not take, and the brief for that
+task is explicit: reuse this writer rather than build a second one — the
+mechanics below (`_best_effort`'s generic `asdict`, the timestamped filename
+keyed off `event_id`) already have nothing `Event`-specific about them. The
+port itself stays `Event`-only on purpose (it is `VlmScheduler`'s contract,
+and `Notifier`/`WelfareNote` are deliberately not folded into `EventPublisher`
+for a second purpose — see `ports/notifier.py`'s module docstring); widening
+only the concrete override is a contravariant, LSP-legal change that every
+caller going through the narrower port interface never observes.
 """
 
 from __future__ import annotations
@@ -32,6 +45,7 @@ from uuid import UUID
 
 from sentinel_ai.domain.entities import Event
 from sentinel_ai.ports.event_publisher import FailedEventSink
+from sentinel_ai.ports.notifier import WelfareNote
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +58,7 @@ class DeadLetterSpool(FailedEventSink):
         self._directory.mkdir(parents=True, exist_ok=True)
         self._seq = 0
 
-    async def store(self, event: Event, error: BaseException) -> None:
+    async def store(self, event: Event | WelfareNote, error: BaseException) -> None:
         self._seq += 1
         base = f"{time.time_ns():020d}-{self._seq:08d}-{event.event_id.hex}"
         record = {
@@ -93,12 +107,12 @@ def _fallback(obj: object) -> str:
     return repr(obj)
 
 
-def _best_effort(event: Event) -> dict[str, Any]:
+def _best_effort(event: Event | WelfareNote) -> dict[str, Any]:
     """`asdict` with a guaranteed fallback.
 
-    `Event` is a plain frozen dataclass today, but this is the failure path: if a
-    future field ever makes `asdict` raise, losing the record to that would repeat
-    the very defect this module exists to close.
+    `Event` and `WelfareNote` are both plain frozen dataclasses, but this is the
+    failure path: if a future field ever makes `asdict` raise, losing the record to
+    that would repeat the very defect this module exists to close.
     """
     try:
         return asdict(event)
