@@ -1,4 +1,4 @@
-"""I/O fakes: frame sources, publishers, clip writers."""
+"""I/O fakes: frame sources, publishers, clip writers, notifiers."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sentinel_ai.domain.entities import Event
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
+from sentinel_ai.ports.notifier import Notifier, WelfareNote
 
 
 class FakeSource(FrameSource):
@@ -106,6 +107,23 @@ class FakePublisher(EventPublisher):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeNotifier(Notifier):
+    """Records notes in order; `error`, when set, makes every `notify` raise
+    instead of recording — matching `FakePublisher`'s failure-injection shape
+    so routing tests (Task 6's webhook adapter, Task 10's dispatch) can prove
+    a failing notifier does not take down the pipeline.
+    """
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.notes: list[WelfareNote] = []
+        self._error = error
+
+    async def notify(self, note: WelfareNote) -> None:
+        if self._error is not None:
+            raise self._error
+        self.notes.append(note)
 
 
 class FakeFailedEventSink(FailedEventSink):
