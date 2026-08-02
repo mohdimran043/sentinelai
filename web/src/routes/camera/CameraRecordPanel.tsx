@@ -1,8 +1,24 @@
+import { useState, type FormEvent } from 'react'
 import type { Zone, ZoneKind } from '@/api/engineClient'
+import { useUpdateCamera } from '@/api/queries'
 import { Panel } from '@/components/ui/Panel'
 import { Notice } from '@/components/ui/Notice'
 import { KvList, type KvRow } from '@/components/ui/Kv'
+import { Input } from '@/components/ui/Input'
+import { Select } from '@/components/ui/Select'
+import { Button } from '@/components/ui/Button'
+import { Label } from '@/components/ui/Label'
 import { humanizeEnum } from '@/lib/format'
+import {
+  ZONES,
+  buildCameraEdit,
+  isEmptyEdit,
+  labelError,
+  type CameraRecordDraft,
+} from '@/lib/cameraEdit'
+
+/** The `<option>` value standing for "no zone". `null` is not a DOM value. */
+const UNGROUPED_OPTION = ''
 
 /**
  * Fields of a camera record the engine will not change at runtime. Used until a
@@ -43,31 +59,123 @@ function restartRequiredRows(fields: readonly string[]): KvRow[] {
   }))
 }
 
-// `writable` is declared on the props interface but deliberately not destructured
-// here: this task builds only the read-only rendering, and Task 5 adds the branch
-// that reads the flag. An unused destructured name would fail lint; an unused
-// interface field is fine.
-export function CameraRecordPanel({ cameraId, record }: CameraRecordPanelProps) {
+export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPanelProps) {
+  const mutation = useUpdateCamera(cameraId)
+
+  /**
+   * `null` means pristine — the form is showing the server's record and every
+   * refresh flows straight through. It becomes a draft the moment the operator
+   * touches a field, and from then on refreshes no longer overwrite it.
+   */
+  const [draft, setDraft] = useState<CameraRecordDraft | null>(null)
+
+  const stored: CameraRecordDraft = { label: record.label, zone: record.zone }
+  const shown = draft ?? stored
+
+  function editDraft(patch: Partial<CameraRecordDraft>) {
+    setDraft((current) => ({ ...(current ?? stored), ...patch }))
+  }
+
+  const invalidLabel = labelError(shown.label)
+  const edit = buildCameraEdit(stored, shown)
+  const nothingToSave = isEmptyEdit(edit)
+  const canSave = draft !== null && !nothingToSave && invalidLabel === null && !mutation.isPending
+
+  function handleSubmit(event: FormEvent) {
+    event.preventDefault()
+    if (!canSave) return
+    mutation.mutate(edit, {
+      // Clear the draft only once the write is on disk, so the panel goes back
+      // to tracking the server and renders what was stored rather than what was
+      // typed. On failure the draft stays, so nothing the operator wrote is lost.
+      onSuccess: () => setDraft(null),
+    })
+  }
+
+  const restartFields = mutation.data?.restart_required_fields ?? DEFAULT_RESTART_REQUIRED_FIELDS
+
+  if (!writable) {
+    return (
+      <Panel data-testid="camera-record-panel">
+        <h2 className="mb-2">Camera record</h2>
+        <p className="lede">
+          What <code>cameras.json</code> holds for this camera, and what the engine is using now.
+        </p>
+        <Notice tone="inert" className="mb-3">
+          This engine is read-only for camera configuration. Camera writes are disabled
+          (<code>SENTINEL_ENABLE_CAMERA_WRITES</code> is not set), so this record can only be
+          changed by editing <code>cameras.json</code> and restarting the engine.
+        </Notice>
+        <KvList
+          rows={[
+            { key: 'label', label: 'Label', value: record.label },
+            { key: 'zone', label: 'Zone', value: describeZone(record.zone, record.zone_kind) },
+            ...restartRequiredRows(restartFields),
+          ]}
+        />
+        <p className="muted mt-2">
+          Camera id <code>{cameraId}</code>.
+        </p>
+      </Panel>
+    )
+  }
+
   return (
     <Panel data-testid="camera-record-panel">
       <h2 className="mb-2">Camera record</h2>
       <p className="lede">
-        What <code>cameras.json</code> holds for this camera, and what the engine is using now.
+        Applied to the running camera and written to <code>cameras.json</code>, so an edit
+        survives a restart.
       </p>
 
-      <Notice tone="inert" className="mb-3">
-        This engine is read-only for camera configuration. Camera writes are disabled
-        (<code>SENTINEL_ENABLE_CAMERA_WRITES</code> is not set), so this record can only be
-        changed by editing <code>cameras.json</code> and restarting the engine.
-      </Notice>
+      <form onSubmit={handleSubmit}>
+        <Label htmlFor="camera-record-label">Label</Label>
+        <Input
+          id="camera-record-label"
+          value={shown.label}
+          maxLength={200}
+          onChange={(event) => editDraft({ label: event.target.value })}
+        />
+        {invalidLabel !== null ? (
+          <p className="err mt-1" role="alert">
+            {invalidLabel}
+          </p>
+        ) : null}
 
-      <KvList
-        rows={[
-          { key: 'label', label: 'Label', value: record.label },
-          { key: 'zone', label: 'Zone', value: describeZone(record.zone, record.zone_kind) },
-          ...restartRequiredRows(DEFAULT_RESTART_REQUIRED_FIELDS),
-        ]}
-      />
+        <Label htmlFor="camera-record-zone">Zone</Label>
+        <Select
+          id="camera-record-zone"
+          value={shown.zone ?? UNGROUPED_OPTION}
+          onChange={(event) =>
+            editDraft({
+              zone: event.target.value === UNGROUPED_OPTION ? null : (event.target.value as Zone),
+            })
+          }
+        >
+          <option value={UNGROUPED_OPTION}>Ungrouped</option>
+          {ZONES.map((zone) => (
+            <option key={zone} value={zone}>
+              {humanizeEnum(zone)}
+            </option>
+          ))}
+        </Select>
+
+        <div className="mt-3 flex items-center gap-3">
+          <Button type="submit" variant="act" size="small" disabled={!canSave}>
+            {mutation.isPending ? 'Saving…' : 'Save changes'}
+          </Button>
+          {mutation.isSuccess && draft === null ? (
+            <span className="ok-text" data-testid="camera-record-feedback">
+              Saved to <code>cameras.json</code> — this survives a restart.
+            </span>
+          ) : null}
+        </div>
+      </form>
+
+      <div className="mt-4">
+        <p className="muted mb-1">Not editable here — edit <code>cameras.json</code> and restart:</p>
+        <KvList rows={restartRequiredRows(restartFields)} />
+      </div>
       <p className="muted mt-2">
         Camera id <code>{cameraId}</code>.
       </p>

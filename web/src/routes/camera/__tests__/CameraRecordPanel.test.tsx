@@ -1,7 +1,26 @@
 import { describe, expect, it } from 'vitest'
+import { beforeEach, vi } from 'vitest'
 import { screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
 import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
+import * as engineClient from '@/api/engineClient'
+
+vi.mock('@/api/engineClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/engineClient')>()
+  return { ...actual, updateCamera: vi.fn() }
+})
+
+const updateCamera = vi.mocked(engineClient.updateCamera)
+
+const storedResponse = {
+  camera_id: 'avenue_01',
+  label: 'East door',
+  zone: 'corridor' as const,
+  zone_kind: 'common_area' as const,
+  persisted: true as const,
+  restart_required_fields: ['url', 'profile'],
+}
 
 const record = { label: 'Avenue entrance', zone: 'corridor' as const, zone_kind: 'common_area' as const }
 
@@ -50,5 +69,117 @@ describe('CameraRecordPanel, read-only', () => {
     expect(screen.getByText(/^profile$/i)).toBeInTheDocument()
     expect(screen.getAllByText(/restart required/i).length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText(/rtsp:/i)).not.toBeInTheDocument()
+  })
+})
+
+describe('CameraRecordPanel, editing', () => {
+  beforeEach(() => {
+    updateCamera.mockReset()
+  })
+
+  it('offers a label input and a zone select when writes are enabled', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    expect(screen.getByLabelText(/label/i)).toHaveValue('Avenue entrance')
+    expect(screen.getByLabelText(/zone/i)).toHaveValue('corridor')
+    expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument()
+  })
+
+  it('disables save until something actually changes, since an empty edit is a 422', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
+
+    await user.type(screen.getByLabelText(/label/i), '!')
+
+    expect(screen.getByRole('button', { name: /save/i })).toBeEnabled()
+  })
+
+  it('sends only the changed field', async () => {
+    updateCamera.mockResolvedValue(storedResponse)
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    const input = screen.getByLabelText(/label/i)
+    await user.clear(input)
+    await user.type(input, 'East door')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { label: 'East door' })
+  })
+
+  it('sends an explicit null zone when ungrouping', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, label: 'Avenue entrance', zone: null, zone_kind: null })
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.selectOptions(screen.getByLabelText(/zone/i), '')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { zone: null })
+  })
+
+  it('refuses an empty label without calling the engine', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.clear(screen.getByLabelText(/label/i))
+
+    expect(screen.getByText(/cannot be empty/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
+    expect(updateCamera).not.toHaveBeenCalled()
+  })
+
+  it('confirms the save by reporting what was stored and that it survives a restart', async () => {
+    updateCamera.mockResolvedValue(storedResponse)
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    const input = screen.getByLabelText(/label/i)
+    await user.clear(input)
+    await user.type(input, 'East door')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(await screen.findByTestId('camera-record-feedback')).toHaveTextContent(/saved/i)
+    expect(screen.getByTestId('camera-record-feedback')).toHaveTextContent(/cameras\.json/)
+  })
+
+  it('does not clobber a field the operator is editing when the record refreshes', async () => {
+    const user = userEvent.setup()
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    const input = screen.getByLabelText(/label/i)
+    await user.clear(input)
+    await user.type(input, 'Half-typed name')
+
+    // A 5s poll lands mid-edit carrying a change someone else made.
+    rerender(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, label: 'Renamed by someone else' }}
+        writable={true}
+      />,
+    )
+
+    expect(screen.getByLabelText(/label/i)).toHaveValue('Half-typed name')
+  })
+
+  it('does track the record while the form is untouched', () => {
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    rerender(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, label: 'Renamed by someone else' }}
+        writable={true}
+      />,
+    )
+
+    expect(screen.getByLabelText(/label/i)).toHaveValue('Renamed by someone else')
   })
 })
