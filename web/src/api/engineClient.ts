@@ -8,6 +8,10 @@ export type DescribeResponse = components['schemas']['DescribeResponse']
 export type CameraEventsResponse = components['schemas']['CameraEventsResponse']
 export type RecentEventEntry = components['schemas']['RecentEventEntry']
 export type LatestDescriptionState = CameraEventsResponse['latest_description_state']
+export type CameraEditRequest = components['schemas']['CameraEditRequest']
+export type CameraEditResponse = components['schemas']['CameraEditResponse']
+export type Zone = components['schemas']['Zone']
+export type ZoneKind = components['schemas']['ZoneKind']
 
 /** The engine did not answer at all — network failure, DNS, connection refused. */
 export class EngineUnreachableError extends Error {
@@ -21,10 +25,18 @@ export class EngineUnreachableError extends Error {
 /** The engine answered with a non-2xx status. */
 export class EngineHttpError extends Error {
   readonly status: number
+  /**
+   * The engine's own `detail` string, unprefixed. `message` is for a log line;
+   * this is for showing an operator, because the engine's write endpoints
+   * explain themselves at length and re-wording that in the console would only
+   * make the two disagree.
+   */
+  readonly detail: string
   constructor(status: number, detail: string) {
     super(`AI engine returned ${status}: ${detail}`)
     this.name = 'EngineHttpError'
     this.status = status
+    this.detail = detail
   }
 }
 
@@ -82,4 +94,27 @@ export function describeCameraNow(cameraId: string): Promise<DescribeResponse> {
  */
 export function getCameraEvents(cameraId: string): Promise<CameraEventsResponse> {
   return request<CameraEventsResponse>(`/cameras/${encodeURIComponent(cameraId)}/events`)
+}
+
+/**
+ * Edit a camera's `label` and/or `zone`, persisted to the engine's
+ * `cameras.json` before the response is sent.
+ *
+ * Sends `edit` verbatim, because *which keys are present* is the instruction:
+ * an omitted `zone` leaves the grouping alone and an explicit `zone: null`
+ * ungroups the camera. Build the body with `buildCameraEdit` rather than
+ * assembling it at the call site.
+ */
+export function updateCamera(
+  cameraId: string,
+  edit: CameraEditRequest,
+): Promise<CameraEditResponse> {
+  return request<CameraEditResponse>(`/cameras/${encodeURIComponent(cameraId)}`, {
+    method: 'PATCH',
+    // `request` sets only `Accept`. Every other call is a GET or a bodyless
+    // POST, so nothing has needed this before; a PATCH carrying JSON without
+    // it is a 422 from FastAPI.
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(edit),
+  })
 }
