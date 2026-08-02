@@ -6,8 +6,12 @@ import {
   REAL_ALERTS,
   REAL_CAMERAS,
   REAL_CAPABILITIES,
+  REAL_JOURNAL_DAY_SEALED,
+  REAL_JOURNAL_DAY_HISTORY,
+  REAL_JOURNAL_ROOM_4B,
   REAL_MODELS,
   REAL_NOTIFICATIONS,
+  REAL_REPORT,
   REAL_SETTINGS,
   REAL_STATUS,
   REAL_STORAGE,
@@ -16,6 +20,9 @@ import type {
   RecorderAlertsResponse,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderCoverageReport,
+  RecorderJournalDayResponse,
+  RecorderJournalResponse,
   RecorderModelsResponse,
   RecorderNotificationsResponse,
   RecorderSettingsResponse,
@@ -55,6 +62,29 @@ export const recorderStatusHandler = (body: RecorderStatusResponse) =>
 
 export const recorderNotificationsHandler = (body: RecorderNotificationsResponse) =>
   http.get(`${RECORDER_BASE_URL}/notifications`, () => HttpResponse.json(body))
+
+/** `GET /api/journal/:cameraId` — succeeds for any camera id by default. */
+export const recorderJournalHandler = (body: RecorderJournalResponse) =>
+  http.get(`${RECORDER_BASE_URL}/journal/:cameraId`, () => HttpResponse.json(body))
+
+/**
+ * `GET /api/journal/:cameraId/:date`, optionally `?history=1`.
+ *
+ * `historyBody` defaults to `body` so a test that never cares about the
+ * history toggle does not have to supply it twice.
+ */
+export const recorderJournalDayHandler = (
+  body: RecorderJournalDayResponse,
+  historyBody: RecorderJournalDayResponse = body,
+) =>
+  http.get(`${RECORDER_BASE_URL}/journal/:cameraId/:date`, ({ request }) => {
+    const wantsHistory = new URL(request.url).searchParams.get('history') === '1'
+    return HttpResponse.json(wantsHistory ? historyBody : body)
+  })
+
+/** `GET /api/report` — ignores the `camera`/`date` query the way every other match does; override per test. */
+export const recorderReportHandler = (body: RecorderCoverageReport) =>
+  http.get(`${RECORDER_BASE_URL}/report`, () => HttpResponse.json(body))
 
 /**
  * A tiny valid JPEG (a 1x1 black pixel), so `CamerasPage` tests never touch
@@ -125,6 +155,9 @@ export const recorderHandlers = [
   recorderStatusHandler(REAL_STATUS),
   recorderNotificationsHandler(REAL_NOTIFICATIONS),
   recorderSnapshotHandler(),
+  recorderJournalHandler(REAL_JOURNAL_ROOM_4B),
+  recorderJournalDayHandler(REAL_JOURNAL_DAY_SEALED, REAL_JOURNAL_DAY_HISTORY),
+  recorderReportHandler(REAL_REPORT),
   ...maskHandlers,
   ...alertStreamHandlers,
 ]

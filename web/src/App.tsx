@@ -13,6 +13,8 @@ import { StoragePage } from '@/routes/recorder/StoragePage'
 import { CapabilitiesPage } from '@/routes/recorder/CapabilitiesPage'
 import { CamerasPage } from '@/routes/recorder/CamerasPage'
 import { NotificationsPage } from '@/routes/recorder/NotificationsPage'
+import { FootagePage } from '@/routes/recorder/FootagePage'
+import { DayReportPage } from '@/routes/recorder/DayReportPage'
 import { MasksPage } from '@/routes/recorder/MasksPage'
 
 /**
@@ -47,6 +49,8 @@ export function App() {
           <Route path="/recorder/capabilities" element={<CapabilitiesPage />} />
           <Route path="/recorder/cameras" element={<CamerasPage />} />
           <Route path="/recorder/notifications" element={<NotificationsPage />} />
+          <Route path="/recorder/footage" element={<FootagePage />} />
+          <Route path="/recorder/report" element={<DayReportPage />} />
           <Route path="/recorder/masks" element={<MasksPage />} />
           {/* Sections with a built screen get their own route above this one.
               Everything else falls through to a page that says so out loud. */}

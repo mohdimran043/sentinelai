@@ -3,9 +3,6 @@
  * them (read off its shipped bundle: Dashboard, Cameras, Day report, Alerts,
  * Configure, Footage, Notifications, Models, Storage, Capabilities).
  *
- * "Day report" is not on this console's parity checklist and so is not listed
- * here; nothing else is dropped.
- *
  * `built: false` means the route exists and the rail shows the section, but the
  * screen behind it is a stated placeholder rather than a working page. It is
  * marked in the rail as well as on the page: a nav item that silently leads
@@ -33,6 +30,14 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
       'The full camera record the recorder holds: mode, space type, source, resolution, mask file, pre-roll, capacity, and the audio and face-recognition flags — several of which the recorder itself says are stored but read by nothing.',
   },
   {
+    path: 'report',
+    label: 'Day report',
+    built: true,
+    endpoints: ['GET /api/report?camera=&date='],
+    summary:
+      'What the recorder can account for on one camera on one day: recorded coverage against expected, the integrity state behind every gap, blind spots the mask hides from all of it, and retrieval holes where the underlying footage is already gone.',
+  },
+  {
     path: 'alerts',
     label: 'Alerts',
     built: true,
@@ -50,10 +55,14 @@ export const RECORDER_SECTIONS: readonly RecorderSection[] = [
   {
     path: 'footage',
     label: 'Footage',
-    built: false,
-    endpoints: ['(segment endpoint not yet located)'],
+    built: true,
+    endpoints: [
+      'GET /api/snapshot/{camera_id}',
+      'GET /api/journal/{camera_id}',
+      'GET /api/journal/{camera_id}/{date}',
+    ],
     summary:
-      'Recorded video and segment coverage. The recorder answers 404 on /api/segments, so the endpoint has to be found before anything can be built here.',
+      'There is no segment or clip index — /api/segments and /api/cameras/{id}/clips both 404. This assembles the most recent frame the recorder can produce with the sealed daily journal and its full revision history.',
   },
   {
     path: 'notifications',

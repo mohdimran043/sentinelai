@@ -348,6 +348,7 @@ export interface RecorderMaskValidation {
   inventory?: RecorderMaskInventory
 }
 
+/* ------------------------------------------------------------------ *
  * GET /api/capabilities
  * ------------------------------------------------------------------ */
 
@@ -426,6 +427,132 @@ export interface RecorderSettingsResponse {
   }
   /** False means the setting is recorded but nothing acts on it. */
   wired: boolean
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/journal/{camera}, /api/journal/{camera}/{date}
+ * and GET /api/report?camera=&date= — VERIFIED 2026-08-01 against room_4b,
+ * corridor_1 and dayroom_1 (sealed, fully-lost, and single-revision days).
+ * ------------------------------------------------------------------ */
+
+export interface RecorderJournalDay {
+  date: string
+  /** Observed: "sealed". A day the journal has never chaptered simply never appears here. */
+  status: 'sealed' | (string & {})
+  revisions: number
+  sealed_at_ns: Nanoseconds
+}
+
+export interface RecorderJournalResponse {
+  camera_id: string
+  days: RecorderJournalDay[]
+  note: string
+}
+
+export interface RecorderCoverageGap {
+  start_ns: Nanoseconds
+  duration_ms: number
+  /** Observed: "LOST", "STREAM_LOST". Same vocabulary as `integrity_state` elsewhere. */
+  cause: string
+}
+
+export interface RecorderCoverageInterval {
+  start_ns: Nanoseconds
+  expected_seconds: number
+  recorded_seconds: number
+  integrity_state: string
+  gaps: RecorderCoverageGap[]
+}
+
+export interface RecorderRetrievalHole {
+  start_ns: Nanoseconds
+  end_ns: Nanoseconds
+  /** Observed: "expired_by_retention", "no_segment". */
+  cause: string
+}
+
+export interface RecorderBlindSpotRegion {
+  region_id: string
+  area_px: number
+  area_pct: number
+  /** `[x1, y1, x2, y2]` in frame pixels. */
+  bbox: [number, number, number, number]
+}
+
+export interface RecorderBlindSpots {
+  /** Empty string when no mask file is configured — not null. */
+  path: string
+  regions: RecorderBlindSpotRegion[]
+  total_px: number
+  total_pct: number
+  frame_px: number
+  may_overlap: boolean
+  note: string
+}
+
+/**
+ * The coverage/integrity/segments document for one camera-day. Identical shape
+ * whether it arrives as the standalone `GET /api/report` or embedded as
+ * `revision.report` inside a journal day — VERIFIED byte-for-byte key set
+ * against both live responses, so one type serves both call sites.
+ */
+export interface RecorderCoverageReport {
+  /** `null` when the camera has no mask configured (e.g. a camera whose mask_path is empty). */
+  blind_spots: RecorderBlindSpots | null
+  camera_id: string
+  coverage: {
+    expected_seconds: number
+    gap_seconds: number
+    intervals_with_records: number
+    recorded_pct: number
+    recorded_seconds: number
+    /** Can be negative — the recorder counted more coverage than it expected. Never clamp it away. */
+    unexplained_shortfall_secs: number
+  }
+  date: string
+  /** Seconds spent in each integrity state that occurred at least once. Absent keys mean zero, not unknown. */
+  integrity_time: Record<string, number>
+  /** Can run to hundreds of entries for a full day — summarise, do not render one row per interval. */
+  intervals: RecorderCoverageInterval[]
+  note: string
+  retrieval_holes: RecorderRetrievalHole[]
+  segments: {
+    count: number
+    seconds: number
+  }
+}
+
+export interface RecorderJournalRevision {
+  camera_id: string
+  date: string
+  revision: number
+  /** Observed: "sealed", "provisional". */
+  status: 'sealed' | 'provisional' | (string & {})
+  /** Present only when this revision replaced an earlier one. */
+  supersedes?: number
+  reason: string
+  created_at_ns: Nanoseconds
+  report: RecorderCoverageReport
+  report_sha256: string
+}
+
+/**
+ * `GET /api/journal/{camera}/{date}`.
+ *
+ * VERIFIED: a date with no written chapter returns `{camera_id, date, detail,
+ * sealed: false}` with NO `revision` key at all — not a 404, not an empty
+ * revision. `revision` and `detail` are therefore mutually exclusive in
+ * practice, and callers must check for `revision` before reading it.
+ */
+export interface RecorderJournalDayResponse {
+  camera_id: string
+  date: string
+  sealed: boolean
+  revision?: RecorderJournalRevision
+  /** Present only when requested with `?history=1`; oldest first, VERIFIED. */
+  history?: RecorderJournalRevision[]
+  /** Present only when no chapter has been written for this day yet. */
+  detail?: string
 }
 
 /* ------------------------------------------------------------------ *

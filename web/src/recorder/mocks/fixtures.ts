@@ -9,6 +9,9 @@ import type {
   RecorderCamera,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderCoverageReport,
+  RecorderJournalDayResponse,
+  RecorderJournalResponse,
   RecorderModelsResponse,
   RecorderNotificationsResponse,
   RecorderSettingsResponse,
@@ -311,7 +314,6 @@ export function makeAlertsResponse(
     ...overrides,
   }
 }
-
 
 /* ------------------------------------------------------------------ *
  * GET /api/settings — captured live 2026-08-01
@@ -793,4 +795,328 @@ export function makeStatus(overrides: Partial<RecorderWorkerStatus> = {}): Recor
     frames_dropped: 0,
     ...overrides,
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * GET /api/journal/{camera}, /api/journal/{camera}/{date} and
+ * GET /api/report?camera=&date= — captured live 2026-08-01 against room_4b.
+ *
+ * `intervals` and `retrieval_holes` are excerpted, not complete: the live
+ * documents carry 364-594 intervals and up to 91 retrieval holes for one
+ * camera-day. Every entry kept here is a real one, copied verbatim — trimmed
+ * to a variety-preserving sample (every `integrity_state` and gap `cause`
+ * that appeared at least once survives the trim) because the point of these
+ * fixtures is shape and value fidelity, not volume fidelity; nothing in this
+ * console renders per-interval rows anyway (see `reportSummary.ts`).
+ * ------------------------------------------------------------------ */
+
+export const REAL_JOURNAL_ROOM_4B: RecorderJournalResponse = {
+  camera_id: 'room_4b',
+  days: [
+    { date: '2026-07-31', status: 'sealed', revisions: 2, sealed_at_ns: 1785540246958127621 },
+    { date: '2026-07-30', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152908981707 },
+    { date: '2026-07-29', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152923271550 },
+    { date: '2026-07-28', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152929242398 },
+    { date: '2026-07-27', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152935529956 },
+    { date: '2026-07-26', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152941560553 },
+    { date: '2026-07-25', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152947736645 },
+    { date: '2026-07-24', status: 'sealed', revisions: 1, sealed_at_ns: 1785502152953897219 },
+  ],
+  note: 'A sealed day was computed while the footage behind it still existed and is never recomputed. Asking the live report for the same day after retention has run gives a smaller answer about the same day.',
+}
+
+/** The `report` embedded in room_4b/2026-07-31's revision 2 (sealed). */
+const REAL_REPORT_2026_07_31: RecorderCoverageReport = {
+  blind_spots: {
+    path: '/var/tmp/sentinel-wall/masks/room_4b.json',
+    regions: [
+      { region_id: 'toilet', area_px: 78200, area_pct: 8.485243055555555, bbox: [80, 90, 420, 320] },
+      {
+        region_id: 'washbasin',
+        area_px: 56000,
+        area_pct: 6.076388888888889,
+        bbox: [900, 400, 1180, 600],
+      },
+    ],
+    total_px: 134200,
+    total_pct: 14.561631944444445,
+    frame_px: 921600,
+    may_overlap: false,
+    note: 'Masked regions are never observed and never recorded. Coverage percentages elsewhere describe only the unmasked part of the frame.',
+  },
+  camera_id: 'room_4b',
+  coverage: {
+    expected_seconds: 34524.09797090699,
+    gap_seconds: 12761.046,
+    intervals_with_records: 364,
+    recorded_pct: 64.17862852273936,
+    recorded_seconds: 22157.092587574993,
+    unexplained_shortfall_secs: -394.0406166680059,
+  },
+  date: '2026-07-31',
+  integrity_time: {
+    DEGRADED_QUALITY: 425.351729525,
+    FOV_SHIFTED: 360.002298424,
+    LOST: 60.001412034,
+    OBSTRUCTED: 10439.997581901993,
+    UNDERLIT: 23238.744949022002,
+  },
+  intervals: [
+    {
+      start_ns: 1785502152907557839,
+      expected_seconds: 60.001412034,
+      recorded_seconds: 41.08136856,
+      integrity_state: 'LOST',
+      gaps: [{ start_ns: 1785502197000060702, duration_ms: 15908, cause: 'LOST' }],
+    },
+    {
+      start_ns: 1785502212908969873,
+      expected_seconds: 60.000320173,
+      recorded_seconds: 56.725630217,
+      integrity_state: 'DEGRADED_QUALITY',
+      gaps: [{ start_ns: 1785502212908969873, duration_ms: 2521, cause: 'LOST' }],
+    },
+    {
+      start_ns: 1785502272909290046,
+      expected_seconds: 5.350849348,
+      recorded_seconds: 5.010755344,
+      integrity_state: 'DEGRADED_QUALITY',
+      gaps: [],
+    },
+    {
+      start_ns: 1785502362391993458,
+      expected_seconds: 60.000032891,
+      recorded_seconds: 59.127872027,
+      integrity_state: 'FOV_SHIFTED',
+      gaps: [],
+    },
+    {
+      start_ns: 1785503022392518702,
+      expected_seconds: 59.999929933,
+      recorded_seconds: 59.702867862,
+      integrity_state: 'UNDERLIT',
+      gaps: [],
+    },
+    {
+      start_ns: 1785503382393825067,
+      expected_seconds: 59.998982814,
+      recorded_seconds: 59.506092168,
+      integrity_state: 'OBSTRUCTED',
+      gaps: [],
+    },
+  ],
+  note: 'Coverage, integrity and segments are recorded. Welfare, incidents, severity, risk and narrative are NOT available — see /api/capabilities. Absence of detection is not confirmation of wellbeing.',
+  retrieval_holes: [
+    { start_ns: 1785445200000000000, end_ns: 1785531600000000000, cause: 'expired_by_retention' },
+  ],
+  segments: { count: 0, seconds: 0 },
+}
+
+export const REAL_JOURNAL_DAY_SEALED: RecorderJournalDayResponse = {
+  camera_id: 'room_4b',
+  date: '2026-07-31',
+  sealed: true,
+  revision: {
+    camera_id: 'room_4b',
+    date: '2026-07-31',
+    revision: 2,
+    status: 'sealed',
+    supersedes: 1,
+    reason:
+      'day complete; sealed from the coverage journal and segment index while the evidence behind it still existed',
+    created_at_ns: 1785540246958127621,
+    report: REAL_REPORT_2026_07_31,
+    report_sha256: 'b326bb2ffc3de165018964e33956d4019b122c8f0208185961e532654ceefdc3',
+  },
+}
+
+/**
+ * `GET /api/journal/room_4b/2020-01-01` — VERIFIED: a date with no written
+ * chapter is 200, not 404, and carries no `revision` key at all.
+ */
+export const REAL_JOURNAL_DAY_NO_CHAPTER: RecorderJournalDayResponse = {
+  camera_id: 'room_4b',
+  date: '2020-01-01',
+  detail:
+    'No chapter has been written for this day. It is either still in progress, or predates this journal. The live report can still assemble it from whatever coverage records and segments remain.',
+  sealed: false,
+}
+
+/**
+ * `GET /api/journal/room_4b/2026-07-31?history=1` — VERIFIED: `history` sits
+ * alongside `revision` (the latest), oldest revision first. Revision 1's own
+ * `report` body is never rendered by the history view (only revision/status/
+ * reason/created_at/sha256 are), so it is not re-captured separately here.
+ */
+export const REAL_JOURNAL_DAY_HISTORY: RecorderJournalDayResponse = {
+  ...REAL_JOURNAL_DAY_SEALED,
+  history: [
+    {
+      camera_id: 'room_4b',
+      date: '2026-07-31',
+      revision: 1,
+      status: 'provisional',
+      reason: 'written on request while the day was still in progress; expect a sealed revision once the day is complete',
+      created_at_ns: 1785502572964166316,
+      report: REAL_REPORT_2026_07_31,
+      report_sha256: '5f66c041efed54c98663a5d8991aa3f64d840f65dfc1165473ebfaffdfeb4862',
+    },
+    REAL_JOURNAL_DAY_SEALED.revision!,
+  ],
+}
+
+/** `GET /api/report?camera=room_4b&date=2026-08-01` — the live, standalone report. */
+export const REAL_REPORT: RecorderCoverageReport = {
+  blind_spots: {
+    path: '/var/tmp/sentinel-wall/masks/room_4b.json',
+    regions: [
+      { region_id: 'toilet', area_px: 78200, area_pct: 8.485243055555555, bbox: [80, 90, 420, 320] },
+      {
+        region_id: 'washbasin',
+        area_px: 56000,
+        area_pct: 6.076388888888889,
+        bbox: [900, 400, 1180, 600],
+      },
+    ],
+    total_px: 134200,
+    total_pct: 14.561631944444445,
+    frame_px: 921600,
+    may_overlap: false,
+    note: 'Masked regions are never observed and never recorded. Coverage percentages elsewhere describe only the unmasked part of the frame.',
+  },
+  camera_id: 'room_4b',
+  coverage: {
+    expected_seconds: 44029.86481698496,
+    gap_seconds: 8395.891,
+    intervals_with_records: 594,
+    recorded_pct: 79.93334421500266,
+    recorded_seconds: 35194.54340156094,
+    unexplained_shortfall_secs: 439.4304154240199,
+  },
+  date: '2026-08-01',
+  integrity_time: {
+    OBSTRUCTED: 17646.30325166999,
+    UNDERLIT: 26383.561565314983,
+  },
+  intervals: [
+    {
+      start_ns: 1785536701135049626,
+      expected_seconds: 65.803826719,
+      recorded_seconds: 0,
+      integrity_state: 'OBSTRUCTED',
+      gaps: [{ start_ns: 1785536721718623657, duration_ms: 9091, cause: 'LOST' }],
+    },
+    {
+      start_ns: 1785561606937900088,
+      expected_seconds: 8443.551353708,
+      recorded_seconds: 326.935158802,
+      integrity_state: 'UNDERLIT',
+      gaps: [{ start_ns: 1785561643973639983, duration_ms: 8386800, cause: 'LOST' }],
+    },
+    {
+      start_ns: 1785536766938876345,
+      expected_seconds: 59.999101954,
+      recorded_seconds: 0,
+      integrity_state: 'OBSTRUCTED',
+      gaps: [],
+    },
+    {
+      start_ns: 1785536826937978299,
+      expected_seconds: 60.00067125,
+      recorded_seconds: 0,
+      integrity_state: 'OBSTRUCTED',
+      gaps: [],
+    },
+    {
+      start_ns: 1785537066938672451,
+      expected_seconds: 60.000074814,
+      recorded_seconds: 5.432388217,
+      integrity_state: 'UNDERLIT',
+      gaps: [],
+    },
+    {
+      start_ns: 1785537126938747265,
+      expected_seconds: 60.00009093,
+      recorded_seconds: 60.485240129,
+      integrity_state: 'UNDERLIT',
+      gaps: [],
+    },
+  ],
+  note: 'Coverage, integrity and segments are recorded. Welfare, incidents, severity, risk and narrative are NOT available — see /api/capabilities. Absence of detection is not confirmation of wellbeing.',
+  retrieval_holes: [
+    { start_ns: 1785531600000000000, end_ns: 1785580460225729122, cause: 'expired_by_retention' },
+    { start_ns: 1785580466178913777, end_ns: 1785580466181788122, cause: 'no_segment' },
+    { start_ns: 1785580467170793984, end_ns: 1785580467173806122, cause: 'no_segment' },
+  ],
+  segments: { count: 328, seconds: 325.52253916199976 },
+}
+
+/** `GET /api/report?camera=nope&date=2026-08-01` — an unknown camera: 200, all-zero, one retrieval hole. */
+export const REAL_REPORT_UNKNOWN_CAMERA: RecorderCoverageReport = {
+  blind_spots: null,
+  camera_id: 'nope',
+  coverage: {
+    expected_seconds: 0,
+    gap_seconds: 0,
+    intervals_with_records: 0,
+    recorded_pct: 0,
+    recorded_seconds: 0,
+    unexplained_shortfall_secs: 0,
+  },
+  date: '2026-08-01',
+  integrity_time: {},
+  intervals: [],
+  note: 'Coverage, integrity and segments are recorded. Welfare, incidents, severity, risk and narrative are NOT available — see /api/capabilities. Absence of detection is not confirmation of wellbeing.',
+  retrieval_holes: [
+    { start_ns: 1785531600000000000, end_ns: 1785618000000000000, cause: 'no_segment' },
+  ],
+  segments: { count: 0, seconds: 0 },
+}
+
+/**
+ * `GET /api/report?camera=corridor_1&date=2026-08-01` — a camera whose source
+ * never connects: coverage was fully expected but 0% recorded. Distinct from
+ * `REAL_REPORT_UNKNOWN_CAMERA` — expected_seconds is real here — and the page
+ * must not render the two the same way. `intervals` excerpted as elsewhere.
+ */
+export const REAL_REPORT_FULLY_LOST: RecorderCoverageReport = {
+  blind_spots: {
+    path: '',
+    regions: [],
+    total_px: 0,
+    total_pct: 0,
+    frame_px: 921600,
+    may_overlap: false,
+    note: 'Masked regions are never observed and never recorded. Coverage percentages elsewhere describe only the unmasked part of the frame.',
+  },
+  camera_id: 'corridor_1',
+  coverage: {
+    expected_seconds: 44089.86468379996,
+    gap_seconds: 44089.572,
+    intervals_with_records: 595,
+    recorded_pct: 0,
+    recorded_seconds: 0,
+    unexplained_shortfall_secs: 0.2926837999621057,
+  },
+  date: '2026-08-01',
+  integrity_time: { LOST: 44089.86468379996 },
+  intervals: [
+    {
+      start_ns: 1785536701135049626,
+      expected_seconds: 65.803826719,
+      recorded_seconds: 0,
+      integrity_state: 'LOST',
+      gaps: [{ start_ns: 1785536701135049626, duration_ms: 65803, cause: 'STREAM_LOST' }],
+    },
+    {
+      start_ns: 1785536766938876345,
+      expected_seconds: 59.999101954,
+      recorded_seconds: 0,
+      integrity_state: 'LOST',
+      gaps: [{ start_ns: 1785536766938876345, duration_ms: 59999, cause: 'STREAM_LOST' }],
+    },
+  ],
+  note: 'Coverage, integrity and segments are recorded. Welfare, incidents, severity, risk and narrative are NOT available — see /api/capabilities. Absence of detection is not confirmation of wellbeing.',
+  retrieval_holes: [],
+  segments: { count: 0, seconds: 0 },
 }

@@ -8,9 +8,12 @@ import {
 import {
   getRecorderAlerts,
   getRecorderCapabilities,
+  getRecorderJournal,
+  getRecorderJournalDay,
   getRecorderMask,
   getRecorderModels,
   getRecorderNotifications,
+  getRecorderReport,
   getRecorderSettings,
   getRecorderStatus,
   getRecorderUntrackedStorage,
@@ -22,6 +25,9 @@ import type {
   RecorderAlertsResponse,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderCoverageReport,
+  RecorderJournalDayResponse,
+  RecorderJournalResponse,
   RecorderMaskResponse,
   RecorderModelsResponse,
   RecorderNotificationsResponse,
@@ -119,6 +125,51 @@ export function useRecorderUntrackedStorage(): UseQueryResult<RecorderUntrackedR
   return useQuery({
     queryKey: ['recorder', 'storage', 'untracked'],
     queryFn: getRecorderUntrackedStorage,
+    retry: 1,
+  })
+}
+
+/** The seal/revision index for one camera. Undefined `cameraId` means "nothing picked yet". */
+export function useRecorderJournal(
+  cameraId: string | undefined,
+): UseQueryResult<RecorderJournalResponse, Error> {
+  return useQuery({
+    queryKey: ['recorder', 'journal', cameraId],
+    queryFn: () => getRecorderJournal(cameraId as string),
+    enabled: cameraId !== undefined,
+    retry: 1,
+  })
+}
+
+/**
+ * One journal day, optionally with its full revision history. `history` is
+ * part of the query key on purpose: toggling it is a different request (a
+ * ~2x larger one on the live instance), and this lets the page keep both
+ * responses cached independently instead of re-fetching every toggle.
+ */
+export function useRecorderJournalDay(
+  cameraId: string | undefined,
+  date: string | undefined,
+  options: { history?: boolean } = {},
+): UseQueryResult<RecorderJournalDayResponse, Error> {
+  const history = options.history ?? false
+  return useQuery({
+    queryKey: ['recorder', 'journal', cameraId, date, history],
+    queryFn: () => getRecorderJournalDay(cameraId as string, date as string, { history }),
+    enabled: cameraId !== undefined && date !== undefined,
+    retry: 1,
+  })
+}
+
+/** The live coverage/integrity/segments report for one camera-day. */
+export function useRecorderReport(
+  cameraId: string | undefined,
+  date: string | undefined,
+): UseQueryResult<RecorderCoverageReport, Error> {
+  return useQuery({
+    queryKey: ['recorder', 'report', cameraId, date],
+    queryFn: () => getRecorderReport(cameraId as string, date as string),
+    enabled: cameraId !== undefined && date !== undefined,
     retry: 1,
   })
 }

@@ -3,6 +3,9 @@ import type {
   RecorderAlertsResponse,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
+  RecorderCoverageReport,
+  RecorderJournalDayResponse,
+  RecorderJournalResponse,
   RecorderMaskRegion,
   RecorderMaskResponse,
   RecorderMaskValidation,
@@ -122,6 +125,42 @@ export function getRecorderSettings(): Promise<RecorderSettingsResponse> {
 
 export function getRecorderUntrackedStorage(): Promise<RecorderUntrackedResponse> {
   return request<RecorderUntrackedResponse>('/storage/untracked')
+}
+
+/** `GET /api/journal/{camera}` — the day-by-day seal/revision index for one camera. */
+export function getRecorderJournal(cameraId: string): Promise<RecorderJournalResponse> {
+  return request<RecorderJournalResponse>(`/journal/${encodeURIComponent(cameraId)}`)
+}
+
+/**
+ * `GET /api/journal/{camera}/{date}`, optionally `?history=1`.
+ *
+ * VERIFIED 2026-08-01: a date with no written chapter answers 200 with
+ * `{camera_id, date, detail, sealed: false}` and no `revision` key — never a
+ * 404. See `RecorderJournalDayResponse`.
+ */
+export function getRecorderJournalDay(
+  cameraId: string,
+  date: string,
+  options: { history?: boolean } = {},
+): Promise<RecorderJournalDayResponse> {
+  const query = options.history ? '?history=1' : ''
+  return request<RecorderJournalDayResponse>(
+    `/journal/${encodeURIComponent(cameraId)}/${encodeURIComponent(date)}${query}`,
+  )
+}
+
+/**
+ * `GET /api/report?camera=&date=` — the live coverage/integrity/segments
+ * document for one camera-day. VERIFIED: never 404s for a well-formed camera
+ * id and date, even an unknown camera or a date with nothing recorded — it
+ * answers 200 with zeroed coverage instead. Missing `camera` or `date`
+ * answers 400. See `RecorderCoverageReport` for why this shares a type with
+ * the journal's embedded `revision.report`.
+ */
+export function getRecorderReport(cameraId: string, date: string): Promise<RecorderCoverageReport> {
+  const params = new URLSearchParams({ camera: cameraId, date })
+  return request<RecorderCoverageReport>(`/report?${params.toString()}`)
 }
 
 /**
