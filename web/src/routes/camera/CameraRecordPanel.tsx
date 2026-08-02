@@ -1,5 +1,5 @@
 import { useRef, useState, type FormEvent } from 'react'
-import type { Zone, ZoneKind } from '@/api/engineClient'
+import { EngineHttpError, type Zone, type ZoneKind } from '@/api/engineClient'
 import { useUpdateCamera } from '@/api/queries'
 import { Panel } from '@/components/ui/Panel'
 import { Notice } from '@/components/ui/Notice'
@@ -59,6 +59,31 @@ function restartRequiredRows(fields: readonly string[]): KvRow[] {
   }))
 }
 
+/**
+ * What to tell an operator about a failed save.
+ *
+ * Every branch ends in the engine's own `detail`. The engine's write endpoint
+ * explains itself at length and in the operator's terms; re-wording it here
+ * would only let the console and the engine disagree about what happened.
+ */
+function saveFailureText(error: Error): string {
+  if (!(error instanceof EngineHttpError)) {
+    return `${error.message} Nothing was written.`
+  }
+  switch (error.status) {
+    case 403:
+      return `Camera writes are disabled on this engine, so nothing was written. ${error.detail}`
+    case 404:
+      return `This camera is not configured in the running engine. ${error.detail}`
+    case 409:
+      return `cameras.json cannot take this edit as it currently stands, and nothing was written — reconcile the file and restart rather than overwriting it. ${error.detail}`
+    case 422:
+      return `The engine rejected this edit as malformed, which means the console and the engine disagree about the contract. ${error.detail}`
+    default:
+      return `${error.detail} Nothing was written.`
+  }
+}
+
 export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPanelProps) {
   const mutation = useUpdateCamera(cameraId)
 
@@ -95,6 +120,15 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
   const edit = buildCameraEdit(baseline.current ?? stored, shown)
   const nothingToSave = isEmptyEdit(edit)
   const canSave = draft !== null && !nothingToSave && invalidLabel === null && !mutation.isPending
+
+  const base = baseline.current
+  const changedElsewhere =
+    draft !== null && base !== null
+      ? [
+          base.label !== record.label ? 'label' : null,
+          base.zone !== record.zone ? 'zone' : null,
+        ].filter((field): field is string => field !== null)
+      : []
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault()
@@ -177,6 +211,21 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
             </option>
           ))}
         </Select>
+
+        {changedElsewhere.length > 0 ? (
+          <Notice tone="caution" className="mt-3" data-testid="camera-record-stale">
+            This camera's {changedElsewhere.join(' and ')} changed elsewhere since you started
+            editing — another console, or an edit to <code>cameras.json</code>. Your text has been
+            left alone. Saving sends only the fields you actually changed, so anything you did not
+            touch keeps the newer value; a field you did edit will overwrite it.
+          </Notice>
+        ) : null}
+
+        {mutation.isError ? (
+          <Notice tone="breach" className="mt-3" data-testid="camera-record-error">
+            {saveFailureText(mutation.error)}
+          </Notice>
+        ) : null}
 
         <div className="mt-3 flex items-center gap-3">
           <Button type="submit" variant="act" size="small" disabled={!canSave}>

@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
 import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
 import * as engineClient from '@/api/engineClient'
+import { EngineHttpError } from '@/api/engineClient'
 
 vi.mock('@/api/engineClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/engineClient')>()
@@ -210,5 +211,100 @@ describe('CameraRecordPanel, editing', () => {
     )
 
     expect(screen.getByLabelText(/label/i)).toHaveValue('Renamed by someone else')
+  })
+})
+
+describe('CameraRecordPanel, failures', () => {
+  beforeEach(() => {
+    updateCamera.mockReset()
+  })
+
+  async function editAndSave() {
+    const user = userEvent.setup()
+    const input = screen.getByLabelText(/label/i)
+    await user.clear(input)
+    await user.type(input, 'East door')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+  }
+
+  it('shows the engine\'s own words on a 409 and does not retry', async () => {
+    updateCamera.mockRejectedValue(
+      new EngineHttpError(409, 'cameras.json no longer contains avenue_01'),
+    )
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await editAndSave()
+
+    const alert = await screen.findByTestId('camera-record-error')
+    expect(alert).toHaveTextContent('cameras.json no longer contains avenue_01')
+    expect(alert).toHaveTextContent(/nothing was written/i)
+    expect(updateCamera).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the operator\'s text after a failure', async () => {
+    updateCamera.mockRejectedValue(new EngineHttpError(409, 'conflict'))
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await editAndSave()
+
+    await screen.findByTestId('camera-record-error')
+    expect(screen.getByLabelText(/label/i)).toHaveValue('East door')
+  })
+
+  it('explains a 403 as writes having been turned off', async () => {
+    updateCamera.mockRejectedValue(new EngineHttpError(403, 'camera writes are disabled'))
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await editAndSave()
+
+    expect(await screen.findByTestId('camera-record-error')).toHaveTextContent(
+      /disabled on this engine/i,
+    )
+  })
+
+  it('surfaces a 422 rather than swallowing it, since it means a contract drift', async () => {
+    updateCamera.mockRejectedValue(new EngineHttpError(422, 'url is not an editable field'))
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await editAndSave()
+
+    expect(await screen.findByTestId('camera-record-error')).toHaveTextContent(
+      'url is not an editable field',
+    )
+  })
+
+  it('warns when the record changed elsewhere while an edit was in progress', async () => {
+    const user = userEvent.setup()
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    await user.type(screen.getByLabelText(/label/i), '!')
+
+    rerender(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, label: 'Renamed by someone else' }}
+        writable={true}
+      />,
+    )
+
+    const warning = await screen.findByTestId('camera-record-stale')
+    expect(warning).toHaveTextContent(/changed elsewhere/i)
+    expect(warning).toHaveTextContent(/label/i)
+    // The operator's text is informed against, never replaced.
+    expect(screen.getByLabelText(/label/i)).toHaveValue('Avenue entrance!')
+  })
+
+  it('does not warn when nothing changed underneath', async () => {
+    const user = userEvent.setup()
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    await user.type(screen.getByLabelText(/label/i), '!')
+    rerender(<CameraRecordPanel cameraId="avenue_01" record={{ ...record }} writable={true} />)
+
+    expect(screen.queryByTestId('camera-record-stale')).not.toBeInTheDocument()
   })
 })
