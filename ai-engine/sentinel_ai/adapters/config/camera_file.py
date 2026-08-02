@@ -405,28 +405,55 @@ class CameraFileStore:
         of the camera record, so the cost of a rename that lands ahead of the data
         is an engine that will not start.
 
-        Two things this does that a plain write-then-rename would not:
+        Three things this does that a plain write-then-rename would not:
 
+        * **the temp file is created owner-only, and only ever widened after it
+          already holds nothing readable.** `Path.open("w")` on a *new* file gets
+          `0o666 & ~umask` — group- or world-readable by default on an ordinary
+          host — and the file holds the *complete* document, RTSP credentials
+          included, from the first byte written until the trailing `fsync` below
+          returns, which is the slowest step in this whole function. Creating the
+          file with that default and narrowing it with `chmod` afterwards — the
+          previous shape of this code — leaves exactly that window open: a fixed,
+          predictable filename, readable by anyone in the file's group or (with a
+          permissive umask) anyone on the host, for as long as the write and fsync
+          take. So the inode is created with `os.open(tmp_path, ..., 0o600)`
+          instead: `os.open`'s mode argument is itself masked by umask same as
+          `open(2)`'s always is, but umask can only *clear* bits, never add them, so
+          asking for `0o600` guarantees the file is owner-only from the instant it
+          exists no matter what the host's umask happens to be — there is no
+          window to catch it in, because it is never open. Only once the body is
+          written and fsynced is the mode changed — to the previous file's mode if
+          one existed (this is the read-modify-write path, so almost always), or
+          left at `0o600` on the very first write, which is the correct resting
+          mode for a file nothing has told to be more open than that and strictly
+          narrower than the historical `0o666 & ~umask` default.
         * **the mode (and, where possible, the owner) of the old file survive the
-          rename.** `tmp_path.open("w")` creates a brand-new inode, and a new inode
-          gets `0o666 & ~umask` — group- or world-readable by default, regardless of
-          what `cameras.json` was set to. Because the rename replaces the old file
-          with the new inode, that default would otherwise become the file's mode
-          permanently and silently, and the file holds RTSP credentials
-          (`rtsp://user:pass@host/stream`). So the old file's mode is read *before*
+          rename.** Because the rename replaces the old file with the new inode,
+          whatever mode the temp file has when it lands becomes `cameras.json`'s
+          mode permanently and silently. So the old file's mode is read *before*
           anything is written and stamped onto the temp file *before* the rename,
           the same way `install(1)` and every other tool that has to replace a
           sensitive file in place does it. Ownership is restored on a best-effort
           basis: an unprivileged process (the common case — the engine does not run
           as root) cannot `chown` at all, and failing the edit over that would make
-          every edit fail on exactly the deployments most likely to run this way.
+          every edit fail on exactly the deployments most likely to run this way —
+          logged at debug when it fails, because a process that runs as a different
+          user than the one that owns `cameras.json` will fail this silently on
+          *every* edit, quietly handing the file's ownership to itself one rename
+          at a time, and that is worth being able to diagnose.
         * **a temp file never survives a failed write.** Anything that goes wrong
           between creating the temp file and completing the rename — a full disk on
           write, a rename that fails because the target is on another filesystem —
           is re-raised after the temp file is removed, not before. Without that, the
           failure path leaves `cameras.json.tmp` behind holding a full copy of the
           document, credentials included, next to a `.json` ignore rule that does
-          not cover `.json.tmp` — a second, unprotected copy of the same secret.
+          not cover `.json.tmp` — a second, unprotected copy of the same secret. The
+          cleanup unlink is itself best-effort: if it fails (a read-only directory,
+          an `EIO`), that failure is swallowed rather than raised in place of the
+          real one — an operator staring at an `ENOSPC` from the write needs to see
+          `ENOSPC`, not an unrelated `PermissionError` from the cleanup that ran
+          while handling it.
         """
         tmp_path = self._path.with_name(f"{self._path.name}.tmp")
         try:
@@ -439,38 +466,64 @@ class CameraFileStore:
             previous = None
         try:
             body = json.dumps(document, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-            with tmp_path.open("w", encoding="utf-8") as handle:
+            # See the docstring above: created owner-only via `os.open` with an
+            # explicit mode, not `Path.open("w")` followed by a chmod, so the
+            # credential-bearing content is never sitting at the umask default.
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
+            mode = stat.S_IMODE(previous.st_mode) if previous is not None else 0o600
+            os.chmod(tmp_path, mode)
             if previous is not None:
-                os.chmod(tmp_path, stat.S_IMODE(previous.st_mode))
                 # Best-effort: an unprivileged process ordinarily cannot chown to an
                 # arbitrary owner, and that must not turn a metadata edit into a
                 # failed one — the mode, restored above, is the part that actually
                 # gates who can read the credentials.
-                with contextlib.suppress(PermissionError, OSError):
+                try:
                     os.chown(tmp_path, previous.st_uid, previous.st_gid)
+                except OSError:
+                    logger.debug(
+                        "%s: could not restore owner uid=%s gid=%s on the "
+                        "replacement file; it will be owned by whichever user this "
+                        "process runs as instead, which can lock the original "
+                        "owner out of their own cameras.json",
+                        tmp_path,
+                        previous.st_uid,
+                        previous.st_gid,
+                        exc_info=True,
+                    )
             tmp_path.replace(self._path)  # atomic rename on the same filesystem
         except BaseException:
-            tmp_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
             raise
 
-        directory = os.open(self._path.parent, os.O_RDONLY)
+        # The rename above already landed: the document on disk is the new one, and
+        # a reader opening `cameras.json` right now sees it. What is not guaranteed
+        # on every filesystem without an fsync of the directory *entry* is that it
+        # survives a crash the instant after — a durability guarantee about the
+        # rename's visibility, not about the data. Everything below, including
+        # opening the directory in the first place, is folded into one
+        # `except OSError`: `os.open` here can fail too (EMFILE/ENFILE under fd
+        # pressure is the realistic case, and it runs after the rename just the same
+        # as the fsync does), and a failure to open is no less "already landed" than
+        # a failure to fsync. Raising in either case would tell the caller the edit
+        # failed when it did not: `update_camera` would refuse to apply it to the
+        # running camera, the API would answer 500, and the next restart would
+        # silently pick up the very change the operator was told never happened —
+        # the file and memory disagreeing being exactly what `docs/operations.md`
+        # promises cannot happen. So every failure here is logged, not raised —
+        # including `os.close` in the `finally`, which can itself raise `EIO` on
+        # some filesystems even after the fd was opened and fsynced successfully.
         try:
-            os.fsync(directory)
+            directory = os.open(self._path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         except OSError:
-            # The rename above already landed: the document on disk is the new one,
-            # and a reader opening `cameras.json` right now sees it. What is not
-            # guaranteed on every filesystem without this fsync is that the
-            # directory *entry* pointing at it survives a crash the instant after —
-            # a durability guarantee about the rename's visibility, not about the
-            # data. Raising here would tell the caller the edit failed when it did
-            # not: `update_camera` would refuse to apply it to the running camera,
-            # the API would answer 500, and the next restart would silently pick up
-            # the very change the operator was told never happened — the file and
-            # memory disagreeing being exactly what `docs/operations.md` promises
-            # cannot happen. So this failure is logged, not raised.
             logger.warning(
                 "%s: directory entry fsync failed after cameras.json was written; "
                 "the edit is committed to disk, but its durability against a crash "
@@ -478,5 +531,3 @@ class CameraFileStore:
                 self._path.parent,
                 exc_info=True,
             )
-        finally:
-            os.close(directory)

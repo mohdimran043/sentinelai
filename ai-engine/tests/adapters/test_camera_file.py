@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 from pathlib import Path
 from typing import Any
@@ -287,6 +288,52 @@ class TestTheWriteIsAtomic:
         # full camera record, RTSP credentials included, and a stray `.tmp` next to
         # `cameras.json` is exactly the kind of file a careless `git add -A` picks up.
         assert sorted(entry.name for entry in tmp_path.iterdir()) == ["cameras.json"]
+
+    async def test_the_temp_file_is_never_group_or_world_readable_while_it_holds_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The write used to happen in two visible steps: the temp file was created,
+        the full document — RTSP credentials included — was written into it and
+        `fsync`ed (the slowest step in `_write`), and only *then* was its mode
+        narrowed to match `cameras.json`. On a host with an ordinary umask that left
+        `cameras.json.tmp` sitting group- or world-readable, holding every camera's
+        `rtsp://user:pass@host/stream`, for as long as the fsync took. The temp
+        filename is fixed, so a local user watching the directory with inotify could
+        read it on every edit — and the edit endpoint has no authentication, so they
+        can trigger one on demand.
+
+        Reproduced by monkeypatching `os.chmod`: `_write` calls it exactly once per
+        write (to land the file at its final, preserved mode), and the instant just
+        *before* that call is the worst case the old code ever produced — the file
+        fully written and fsynced, and, pre-fix, still sitting at whatever the umask
+        left it at. Capturing the file's mode and content at that instant captures
+        the exposure directly rather than inferring it from the end state, which was
+        always correct even when the window in the middle was not.
+        """
+        path = a_file(tmp_path, {**CAM, "url": "rtsp://user:s3cret@host/one"})
+        path.chmod(0o600)
+        old_umask = os.umask(0o022)
+        captured: dict[str, Any] = {}
+        original_chmod = os.chmod
+
+        def spy_chmod(target: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+            if not captured:
+                captured["mode"] = stat.S_IMODE(os.stat(target).st_mode)
+                captured["content"] = Path(target).read_text(encoding="utf-8")
+            return original_chmod(target, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", spy_chmod)
+        try:
+            await CameraFileStore(path).apply("cam-1", CameraEdit(label="Renamed"))
+        finally:
+            os.umask(old_umask)
+
+        assert captured, "os.chmod was never called — this test needs a previous file to exist"
+        assert "user:s3cret" in captured["content"]
+        assert captured["mode"] & (stat.S_IRWXG | stat.S_IRWXO) == 0, (
+            f"temp file was {oct(captured['mode'])} while it held credentials — "
+            f"group or other could read it"
+        )
 
     async def test_the_files_permissions_are_preserved_across_a_write(self, tmp_path: Path) -> None:
         """`cameras.json` holds RTSP credentials, so its mode is part of what

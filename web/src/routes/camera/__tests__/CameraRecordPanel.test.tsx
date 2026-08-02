@@ -70,11 +70,7 @@ describe('CameraRecordPanel, read-only', () => {
     // nothing else, never a URL that leaked through some other code path.
     expect(screen.getByText(/^url$/i)).toBeInTheDocument()
     expect(screen.getByText(/^profile$/i)).toBeInTheDocument()
-    const restartRequiredValues = screen.getAllByText('restart required')
-    expect(restartRequiredValues).toHaveLength(2)
-    for (const value of restartRequiredValues) {
-      expect(value).toHaveTextContent(/^restart required$/)
-    }
+    expect(screen.getAllByText('restart required')).toHaveLength(2)
   })
 })
 
