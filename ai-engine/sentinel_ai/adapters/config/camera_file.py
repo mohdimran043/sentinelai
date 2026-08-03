@@ -58,6 +58,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import stat
 from collections.abc import Mapping
@@ -67,6 +68,7 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,46 @@ class CameraConfig:
     written before zones existed keeps loading, and an ungrouped camera is a true
     statement about a deployment rather than a broken one. A zone that is *present and
     unknown* is a different thing — see `_zone_from`."""
+
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind)
+    """Which welfare concern kinds this camera notifies a human about. Not read
+    here — a later task's routing reads it — this module only loads and
+    validates it.
+
+    Absent means "every kind": a freshly configured camera notifies on
+    anything the VLM flags until an operator narrows it. An explicit empty
+    list means the opposite: never notify this camera, without turning
+    welfare monitoring off entirely. Collapsing that distinction either
+    starts alerting on a camera an operator silenced, or silences one they
+    never touched — see `_notify_on_from`, which mirrors `_zone_from`'s
+    absent-vs-unknown handling for the same reason."""
+
+    notify_min_confidence: Confidence = Confidence.LIKELY
+    """The minimum `domain.welfare.Confidence` tier a concern must clear before
+    it notifies. Defaults to the stronger tier: notifying on every `possible`
+    guess would fire on the majority of an ordinary day's VLM opinions, and an
+    operator who wants that lower bar can ask for it explicitly."""
+
+    clip_preroll_seconds: float | None = None
+    """Seconds of buffered video to include before a notified concern's
+    keyframe. `None` means use the process-wide default
+    (`Settings.clip_preroll_seconds`); a later task reads this."""
+
+    clip_postroll_seconds: float | None = None
+    """Seconds of video to keep recording after a notified concern's keyframe.
+    `None` means use the process-wide default
+    (`Settings.clip_postroll_seconds`); a later task reads this."""
+
+    summary_interval_seconds: float | None = None
+    """How often this camera's periodic summary runs, in seconds. `None` means
+    use `profile.summary_interval_seconds`.
+
+    Deliberately a field of its own rather than a replacement for
+    `profile.summary_interval_seconds` — the two look redundant, but they are
+    not: `profile` is in `RESTART_REQUIRED_FIELDS` and cannot change without
+    tearing down the camera runner (see this module's docstring), while this
+    field is meant to become runtime-editable. Do not fold them together;
+    that would take away the one thing this duplication buys."""
 
 
 class _Unset(Enum):
@@ -206,6 +248,98 @@ def _zone_from(camera_id: str, raw: Any) -> Zone | None:
         ) from None
 
 
+def _notify_on_from(camera_id: str, raw: Any) -> frozenset[ConcernKind]:
+    """Absent means every kind; present-but-unknown means the file is wrong.
+
+    The same shape as `_zone_from`, with one distinction that field does not
+    need: `notify_on: []` is not "absent" and must not fall back to "every
+    kind" — it is an operator's explicit instruction to mute this camera's
+    welfare notifications, and treating it the same as an unconfigured field
+    would either silence a camera nobody asked to silence or keep alerting on
+    one an operator deliberately quieted.
+    """
+    if raw is None:
+        return frozenset(ConcernKind)
+    if not isinstance(raw, list):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'notify_on' must be an array of strings or absent, "
+            f"got {type(raw).__name__}"
+        )
+    kinds: set[ConcernKind] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: 'notify_on' entries must be strings, got "
+                f"{item!r} ({type(item).__name__})"
+            )
+        try:
+            kinds.add(ConcernKind(item))
+        except ValueError:
+            raise CameraConfigError(
+                f"camera {camera_id!r}: unknown concern kind {item!r} in 'notify_on'; "
+                f"valid kinds are {[kind.value for kind in ConcernKind]}, or omit the "
+                f"field to notify on every kind"
+            ) from None
+    return frozenset(kinds)
+
+
+def _notify_min_confidence_from(camera_id: str, raw: Any) -> Confidence:
+    """Same unknown-value contract as `_zone_from` and `_notify_on_from`: a
+    typo'd confidence is a threshold the operator meant to set and did not."""
+    if raw is None:
+        return Confidence.LIKELY
+    if not isinstance(raw, str):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'notify_min_confidence' must be a string or absent, "
+            f"got {type(raw).__name__}"
+        )
+    try:
+        return Confidence(raw)
+    except ValueError:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: unknown confidence {raw!r} in 'notify_min_confidence'; "
+            f"valid values are {[confidence.value for confidence in Confidence]}, or omit "
+            f"the field to default to {Confidence.LIKELY.value!r}"
+        ) from None
+
+
+def _optional_seconds_from(
+    camera_id: str, field_name: str, raw: Any, *, minimum: float, inclusive: bool
+) -> float | None:
+    """A finite number within bounds, or absent meaning "use the default
+    elsewhere". Shared by the three duration fields below instead of three
+    near-identical bodies.
+
+    `bool` is rejected on purpose: `isinstance(True, int)` is `True` in
+    Python, so an unguarded numeric check would accept
+    `"clip_preroll_seconds": true` as `1.0` — a JSON typo silently becoming a
+    plausible-looking duration instead of the load error it should be.
+    `math.isfinite` rejects `NaN`/`Infinity`, which `json.loads` accepts as a
+    non-standard extension of the JSON it reads; without this check a file
+    that loads with `"clip_postroll_seconds": NaN` would produce a clip with
+    impossible bounds rather than fail at startup where it can be noticed
+    (the same reasoning `adapters/vision/qwen25vl.py`'s `threat_value` parsing
+    applies to a model-supplied float).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, int | float) or isinstance(raw, bool) or not math.isfinite(raw):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: {field_name!r} must be a finite number or absent, got {raw!r}"
+        )
+    value = float(raw)
+    if inclusive:
+        if value < minimum:
+            raise CameraConfigError(
+                f"camera {camera_id!r}: {field_name!r} must be >= {minimum}, got {value}"
+            )
+    elif value <= minimum:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: {field_name!r} must be > {minimum}, got {value}"
+        )
+    return value
+
+
 def parse_cameras(document: Any, origin: str) -> tuple[CameraConfig, ...]:
     """Validate an already-decoded camera document.
 
@@ -262,6 +396,31 @@ def parse_cameras(document: Any, origin: str) -> tuple[CameraConfig, ...]:
                 url=url,
                 profile=_profile_from(camera_id, raw_profile),
                 zone=_zone_from(camera_id, entry.get("zone")),
+                notify_on=_notify_on_from(camera_id, entry.get("notify_on")),
+                notify_min_confidence=_notify_min_confidence_from(
+                    camera_id, entry.get("notify_min_confidence")
+                ),
+                clip_preroll_seconds=_optional_seconds_from(
+                    camera_id,
+                    "clip_preroll_seconds",
+                    entry.get("clip_preroll_seconds"),
+                    minimum=0.0,
+                    inclusive=True,
+                ),
+                clip_postroll_seconds=_optional_seconds_from(
+                    camera_id,
+                    "clip_postroll_seconds",
+                    entry.get("clip_postroll_seconds"),
+                    minimum=0.0,
+                    inclusive=False,
+                ),
+                summary_interval_seconds=_optional_seconds_from(
+                    camera_id,
+                    "summary_interval_seconds",
+                    entry.get("summary_interval_seconds"),
+                    minimum=0.0,
+                    inclusive=False,
+                ),
             )
         )
     return tuple(configs)

@@ -37,6 +37,7 @@ from sentinel_ai.adapters.config.camera_file import (
     edited_document,
     load_cameras,
 )
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 
 
@@ -407,3 +408,136 @@ class TestEditedDocumentIsPure:
 
         assert result["cameras"][0]["label"] == "Front door"
         assert UNSET not in result["cameras"][0].values()
+
+
+class TestWelfareNotificationPolicy:
+    """T7. Per-camera welfare policy: what notifies, at what confidence, and how
+    much clip/summary context rides with it. Nothing reads these fields yet —
+    Task 10 routes on `notify_on`/`notify_min_confidence`, Task 9 reads the
+    clip/summary ones — so this only covers that they load, round-trip, and
+    fail loud on nonsense, the same bar `TestCameraZone` (tests/test_main.py)
+    holds `zone` to.
+    """
+
+    def test_a_pre_existing_camera_file_with_none_of_the_new_fields_still_loads(
+        self, tmp_path: Path
+    ) -> None:
+        path = a_file(tmp_path, CAM)
+        (camera,) = load_cameras(path)
+
+        assert camera.notify_on == frozenset(ConcernKind)
+        assert camera.notify_min_confidence is Confidence.LIKELY
+        assert camera.clip_preroll_seconds is None
+        assert camera.clip_postroll_seconds is None
+        assert camera.summary_interval_seconds is None
+
+    def test_notify_on_empty_means_never_notify(self, tmp_path: Path) -> None:
+        """The distinction the task exists to get right: absent and `[]` are
+        opposite instructions, not the same default spelled two ways. Get this
+        backwards and a camera an operator silenced starts alerting, or the
+        reverse."""
+        path = a_file(tmp_path, {**CAM, "notify_on": []})
+        (camera,) = load_cameras(path)
+        assert camera.notify_on == frozenset()
+
+    def test_notify_on_round_trips_the_configured_kinds(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, {**CAM, "notify_on": ["collapse", "self_harm"]})
+        (camera,) = load_cameras(path)
+        assert camera.notify_on == frozenset({ConcernKind.COLLAPSE, ConcernKind.SELF_HARM})
+
+    def test_an_unknown_concern_kind_fails_loud_and_names_the_vocabulary(
+        self, tmp_path: Path
+    ) -> None:
+        """A typo'd kind is a concern the operator meant to route and silently
+        would not — the same reasoning `_zone_from` applies to an unknown zone."""
+        path = a_file(tmp_path, {**CAM, "notify_on": ["fainting"]})
+        with pytest.raises(CameraConfigError, match=r"unknown concern kind 'fainting'.*collapse"):
+            load_cameras(path)
+
+    def test_notify_on_must_be_a_list(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, {**CAM, "notify_on": "collapse"})
+        with pytest.raises(CameraConfigError, match="'notify_on' must be an array"):
+            load_cameras(path)
+
+    def test_notify_on_rejects_a_non_string_entry(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, {**CAM, "notify_on": [1]})
+        with pytest.raises(CameraConfigError, match="'notify_on' entries must be strings"):
+            load_cameras(path)
+
+    def test_notify_min_confidence_round_trips(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, {**CAM, "notify_min_confidence": "possible"})
+        (camera,) = load_cameras(path)
+        assert camera.notify_min_confidence is Confidence.POSSIBLE
+
+    def test_an_unknown_confidence_fails_loud_and_names_the_vocabulary(
+        self, tmp_path: Path
+    ) -> None:
+        path = a_file(tmp_path, {**CAM, "notify_min_confidence": "certain"})
+        with pytest.raises(CameraConfigError, match=r"unknown confidence 'certain'.*likely"):
+            load_cameras(path)
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("clip_preroll_seconds", 2.5),
+            ("clip_postroll_seconds", 4.0),
+            ("summary_interval_seconds", 30.0),
+        ],
+    )
+    def test_a_duration_field_round_trips(
+        self, tmp_path: Path, field_name: str, value: float
+    ) -> None:
+        path = a_file(tmp_path, {**CAM, field_name: value})
+        (camera,) = load_cameras(path)
+        assert getattr(camera, field_name) == value
+
+    def test_clip_preroll_seconds_may_be_exactly_zero(self, tmp_path: Path) -> None:
+        """Preroll's bound is `>= 0`, unlike postroll's `> 0`: a camera can
+        legitimately want no lead-in before the keyframe, but a clip that ends
+        before it starts is never valid."""
+        path = a_file(tmp_path, {**CAM, "clip_preroll_seconds": 0})
+        (camera,) = load_cameras(path)
+        assert camera.clip_preroll_seconds == 0.0
+
+    def test_clip_preroll_seconds_rejects_a_negative_value(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, {**CAM, "clip_preroll_seconds": -1.0})
+        with pytest.raises(CameraConfigError, match=r"'clip_preroll_seconds' must be >= 0"):
+            load_cameras(path)
+
+    @pytest.mark.parametrize("field_name", ["clip_postroll_seconds", "summary_interval_seconds"])
+    def test_a_strictly_positive_duration_field_rejects_zero(
+        self, tmp_path: Path, field_name: str
+    ) -> None:
+        path = a_file(tmp_path, {**CAM, field_name: 0})
+        with pytest.raises(CameraConfigError, match=f"{field_name!r} must be > 0"):
+            load_cameras(path)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["clip_preroll_seconds", "clip_postroll_seconds", "summary_interval_seconds"],
+    )
+    def test_a_duration_field_rejects_a_non_numeric_value(
+        self, tmp_path: Path, field_name: str
+    ) -> None:
+        path = a_file(tmp_path, {**CAM, field_name: "soon"})
+        with pytest.raises(CameraConfigError, match=f"{field_name!r} must be a finite number"):
+            load_cameras(path)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["clip_preroll_seconds", "clip_postroll_seconds", "summary_interval_seconds"],
+    )
+    def test_a_duration_field_rejects_a_bool(self, tmp_path: Path, field_name: str) -> None:
+        """`isinstance(True, int)` is `True` in Python — without an explicit guard,
+        `clip_preroll_seconds: true` would silently become `1.0`, a plausible-looking
+        duration nobody configured."""
+        path = a_file(tmp_path, {**CAM, field_name: True})
+        with pytest.raises(CameraConfigError, match=f"{field_name!r} must be a finite number"):
+            load_cameras(path)
+
+    def test_a_duration_field_rejects_a_non_finite_float(self, tmp_path: Path) -> None:
+        """`json.loads` accepts the non-standard `NaN` token; a config that loads it
+        must not silently produce a clip with impossible bounds."""
+        path = a_file(tmp_path, {**CAM, "clip_postroll_seconds": float("nan")})
+        with pytest.raises(CameraConfigError, match=r"'clip_postroll_seconds' must be a finite"):
+            load_cameras(path)
