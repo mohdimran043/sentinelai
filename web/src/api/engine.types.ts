@@ -35,8 +35,9 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Edit a camera's label and zone — UNAUTHENTICATED, and off by default
-         * @description Change what a camera is called and which zone it is grouped into.
+         * Edit a camera's label, zone and welfare notification policy — UNAUTHENTICATED, and off by default
+         * @description Change what a camera is called, which zone it is grouped into, and what its
+         *     welfare concerns notify a human about.
          *
          *     ### This endpoint is not authenticated
          *
@@ -64,6 +65,20 @@ export interface paths {
          *     * `label` — the display name. Trimmed, non-empty, at most 120 characters.
          *     * `zone` — `room`, `corridor`, `dayroom`, or `null` to ungroup. Omitting the
          *       field and sending `null` are different instructions.
+         *     * `notify_on` — which welfare concern kinds notify a human, as a whole
+         *       replacement list. `[]` means never notify from this camera and is a real
+         *       edit, not an empty one; `null` is rejected because `[]` already says it.
+         *     * `notify_min_confidence` — `possible` or `likely`, the lowest tier that may
+         *       notify. There is no `certain`: one still frame cannot earn it.
+         *     * `clip_preroll_seconds`, `clip_postroll_seconds`,
+         *       `summary_interval_seconds` — per-camera overrides of the engine-wide clip
+         *       bounds and the profile's summary interval. **Omitting one and sending
+         *       `null` are different instructions**, as with `zone`: omit to leave the
+         *       override alone, send `null` to drop it and go back to the default. Pre-roll
+         *       may be `0` (no lead-in is a real choice); the other two must be above zero.
+         *
+         *     Every one of them comes back in the response as it was stored, so a console
+         *     renders what the file now says rather than what it hoped it would say.
          *
          *     **Not editable, and rejected with 422 rather than ignored** — the response's
          *     `restart_required_fields` names them:
@@ -242,7 +257,8 @@ export interface components {
     schemas: {
         /**
          * CameraEditRequest
-         * @description A partial edit to one camera's record: `label`, `zone`, or both.
+         * @description A partial edit to one camera's record: its label, its zone, and its welfare
+         *     notification policy, in any combination.
          *
          *     Partial on purpose — a console changing a label must not have to restate a zone
          *     it is not touching, because restating it is how one operator's window silently
@@ -257,10 +273,32 @@ export interface components {
          */
         CameraEditRequest: {
             /**
+             * Clip Postroll Seconds
+             * @description Seconds of video to keep recording after a notified concern's keyframe, for this camera only. `null` reverts it to the engine-wide default; omitting the field leaves it as configured. Must be greater than zero — a clip that ends where it begins is not a shorter clip, it is no clip.
+             */
+            clip_postroll_seconds?: number | null;
+            /**
+             * Clip Preroll Seconds
+             * @description Seconds of buffered video to keep before a notified concern's keyframe, for this camera only. `null` reverts it to the engine-wide default; omitting the field leaves it as configured — **the two are different instructions**, the same way `zone`'s are. `0` is allowed and means no lead-in at all, which is why this bound is `>= 0` where the other two durations are `> 0`.
+             */
+            clip_preroll_seconds?: number | null;
+            /**
              * Label
              * @description The camera's new display name. Trimmed; must be non-empty after trimming. Omit the field to leave the label alone — `null` is not a label and is rejected.
              */
             label?: string | null;
+            /** @description The lowest confidence tier that may notify. `likely` is the engine's default; `possible` widens it to everything the model flags at all, which on an ordinary day is most of its opinions. Omit to leave the threshold alone; `null` is rejected, because a camera has no 'no threshold' state. There are exactly two tiers and there is no `certain` — see `domain/welfare.py`: one still frame cannot earn it. */
+            notify_min_confidence?: components["schemas"]["Confidence"] | null;
+            /**
+             * Notify On
+             * @description Which welfare concern kinds this camera notifies a human about, replacing whatever is configured now — this is a whole new list, not an addition to the old one. **`[]` means never notify from this camera**, which is a real instruction and not an empty edit: it silences one camera without turning welfare monitoring off anywhere else. Omit the field to leave the routing alone; `null` is rejected, because `[]` already covers the only thing it could have meant. A kind outside the enum is a 422 rather than a silent narrowing of the list — a typo'd kind is a concern the operator meant to be told about and would not be.
+             */
+            notify_on?: components["schemas"]["ConcernKind"][] | null;
+            /**
+             * Summary Interval Seconds
+             * @description How often this camera's periodic summary runs. `null` reverts it to the camera profile's interval; omitting the field leaves it as configured. Distinct from `profile.summary_interval_seconds`, which is restart-only — this is the runtime-editable override of it, and it wins where both are set.
+             */
+            summary_interval_seconds?: number | null;
             /** @description The camera's new zone, or `null` to ungroup it. Unlike `label`, `null` here is a real instruction, so **omitting the field and sending null mean different things**: omit to leave the grouping alone, send null to remove it. A value outside the enum is a 422 — the same fail-loud `load_cameras` applies at startup, because a typo'd zone is a camera the operator meant to group and silently did not. */
             zone?: components["schemas"]["Zone"] | null;
         };
@@ -274,8 +312,25 @@ export interface components {
         CameraEditResponse: {
             /** Camera Id */
             camera_id: string;
+            /**
+             * Clip Postroll Seconds
+             * @description As `clip_preroll_seconds`: the stored override, or null for the default.
+             */
+            clip_postroll_seconds: number | null;
+            /**
+             * Clip Preroll Seconds
+             * @description The stored per-camera override, or null when this camera uses the engine-wide default. Null here is the answer to 'what is stored', not a report of the effective value — the default in force is not this endpoint's to state.
+             */
+            clip_preroll_seconds: number | null;
             /** Label */
             label: string;
+            /** @description The stored confidence threshold. Never null: a camera always has one. */
+            notify_min_confidence: components["schemas"]["Confidence"];
+            /**
+             * Notify On
+             * @description The concern kinds this camera will notify on, as stored — always the full list, never a diff, and sorted so two reads of the same record compare equal. A camera whose file says nothing about `notify_on` lists every kind here, because that is what saying nothing means. `[]` means this camera notifies nobody.
+             */
+            notify_on: components["schemas"]["ConcernKind"][];
             /**
              * Persisted
              * @description Always true, and present so it cannot be overlooked: this edit was written to the engine's `cameras.json` before this response was sent, and survives a restart. An edit that could not be written is an error response, never a 200 with this set to false.
@@ -288,6 +343,11 @@ export interface components {
              * @description Fields of the camera record that this endpoint will not change at all: they are stored in `cameras.json`, honoured at startup, and require editing that file and restarting the engine. `url` because changing it means tearing down the running camera and building a new source (and because an RTSP URL routinely carries credentials, which an unauthenticated API must not move in either direction); `profile` because it is the escalation policy the gate is part-way through applying. Sending either one is a 422, not a silent drop — a console should show them as read-only and say why, not offer a control that does nothing.
              */
             restart_required_fields?: string[];
+            /**
+             * Summary Interval Seconds
+             * @description The stored override, or null when this camera falls back to its profile's `summary_interval_seconds`.
+             */
+            summary_interval_seconds: number | null;
             /** @description The stored zone, or null when the camera is ungrouped. */
             zone: components["schemas"]["Zone"] | null;
             /** @description Derived from `zone`, exactly as on `CameraStatus`. Null when `zone` is. */
@@ -380,6 +440,21 @@ export interface components {
              */
             config_writable: boolean;
         };
+        /**
+         * ConcernKind
+         * @description What the VLM's welfare-focused prompt asks the frame to be checked for.
+         * @enum {string}
+         */
+        ConcernKind: "collapse" | "altercation" | "self_harm" | "medication" | "distress" | "other";
+        /**
+         * Confidence
+         * @description How sure a single still frame can honestly make the model.
+         *
+         *     Deliberately two members, not three: see the module docstring for why
+         *     there is no `CERTAIN`.
+         * @enum {string}
+         */
+        Confidence: "possible" | "likely";
         /** DescribeResponse */
         DescribeResponse: {
             /**

@@ -33,6 +33,7 @@ from sentinel_ai.api.routes import EngineServiceProtocol
 from sentinel_ai.config import Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, Event, ThreatScore
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.main import (
     BrokerLink,
@@ -800,6 +801,38 @@ class TestTheComposedEditPath:
             await service.stop()
 
         assert [camera.label for camera in load_cameras(camera_file)] == ["Renamed"]
+
+    async def test_a_welfare_policy_edit_survives_a_reload_of_the_file(
+        self, tmp_path: Path
+    ) -> None:
+        """The same "persisted means the next process reads it" bar, for the fields
+        Task 8 added. Nothing running reads them yet — Task 9 makes the runner
+        honour the clip/summary overrides and Task 10 routes on the rest — so the
+        file is the whole of what an edit to them can be checked against, and it is
+        also the whole of what survives a restart.
+        """
+        service, camera_file, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            await service.update_camera(
+                "cam-1",
+                CameraEdit(
+                    notify_on=frozenset({ConcernKind.COLLAPSE}),
+                    notify_min_confidence=Confidence.POSSIBLE,
+                    clip_preroll_seconds=3.0,
+                ),
+            )
+        finally:
+            await service.stop()
+
+        (stored,) = load_cameras(camera_file)
+        assert stored.notify_on == frozenset({ConcernKind.COLLAPSE})
+        assert stored.notify_min_confidence is Confidence.POSSIBLE
+        assert stored.clip_preroll_seconds == 3.0
+        # Untouched by an edit that did not name them, and still the loader's
+        # defaults rather than anything the writer invented.
+        assert stored.clip_postroll_seconds is None
+        assert stored.summary_interval_seconds is None
 
     async def test_the_new_label_reaches_the_next_event(self, tmp_path: Path) -> None:
         """The label is not decoration: `CameraRunner` puts it on every escalation it

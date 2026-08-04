@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from sentinel_ai.adapters.config.camera_file import EDITABLE_FIELDS
 from sentinel_ai.openapi_export import OPENAPI_PATH, openapi_document, render
 
 REGENERATE = "python -m sentinel_ai.openapi_export"
@@ -75,12 +76,22 @@ class TestTheWriteEndpointIsDocumentedAsUnauthenticated:
         assert "config_writable" in schema["properties"]
         assert "config_writable" in schema["required"]
 
-    def test_the_edit_request_admits_only_the_two_editable_fields(self) -> None:
+    def test_the_edit_request_admits_only_the_editable_fields(self) -> None:
         """`additionalProperties: false` is what makes a generated client's `url`
-        field a compile-time impossibility rather than a runtime surprise."""
+        field a compile-time impossibility rather than a runtime surprise.
+
+        Checked against `EDITABLE_FIELDS` rather than a list written out here,
+        because a field added to one and not the other is precisely the drift that
+        tuple is published to prevent."""
         schema = openapi_document()["components"]["schemas"]["CameraEditRequest"]
-        assert set(schema["properties"]) == {"label", "zone"}
+        assert set(schema["properties"]) == set(EDITABLE_FIELDS)
         assert schema["additionalProperties"] is False
+
+    def test_the_stored_record_that_comes_back_covers_every_editable_field(self) -> None:
+        """A console that has just written renders the response, so a field it can
+        edit and cannot read back is a control whose effect it has to guess at."""
+        schema = openapi_document()["components"]["schemas"]["CameraEditResponse"]
+        assert set(EDITABLE_FIELDS) <= set(schema["properties"])
 
 
 def test_the_stream_is_declared_as_an_event_stream_not_as_json() -> None:

@@ -12,10 +12,14 @@ The document shape is unchanged and documented in `main`'s own docstring and in
 
 What may be edited, and what may not
 ------------------------------------
-`label` and `zone` only. Both are metadata: nothing in the pipeline branches on
-either (`CameraRunner` carries them so `telemetry()` and the assembled event can
-report them), so changing one is an attribute write on a live object and the next
-frame is unaffected.
+`EDITABLE_FIELDS` is the list: `label`, `zone`, and the five per-camera welfare
+policy fields. None of them changes how a frame is processed. `label` and `zone`
+are metadata that `CameraRunner` carries so `telemetry()` and the assembled event
+can report them, so changing one is an attribute write on a live object and the
+next frame is unaffected; the welfare fields decide what a *notification* does
+with an already-assembled concern, which is downstream of the pipeline entirely.
+That is why they are editable where `profile` — the policy the escalation gate is
+part-way through applying — is not.
 
 `url` and `profile` are deliberately **not** editable through this store.
 
@@ -89,9 +93,27 @@ __all__ = [
 
 _PROFILE_FIELDS = frozenset(field.name for field in fields(CameraProfile)) - {"camera_id"}
 
-EDITABLE_FIELDS: Final = ("label", "zone")
+EDITABLE_FIELDS: Final = (
+    "label",
+    "zone",
+    "notify_on",
+    "notify_min_confidence",
+    "clip_preroll_seconds",
+    "clip_postroll_seconds",
+    "summary_interval_seconds",
+)
 """The fields `CameraFileStore.apply` will change. Published so the API contract
 and this module cannot drift about which those are."""
+
+_NULLABLE_SECONDS_FIELDS: Final = (
+    "clip_preroll_seconds",
+    "clip_postroll_seconds",
+    "summary_interval_seconds",
+)
+"""The editable fields whose `None` means "fall back to the global or profile
+default". Named once because the *writer* treats all three identically — their
+bounds differ, but that is the reader's business (`_optional_seconds_from`) and
+the API's, not this list's."""
 
 RESTART_REQUIRED_FIELDS: Final = ("url", "profile")
 """Stored in the file, honoured at startup, and not editable at runtime. See this
@@ -189,16 +211,34 @@ class CameraEdit:
     all — and silently re-grouping (or silently ungrouping) a camera an operator
     did not ask about is precisely the kind of half-applied edit this whole path
     exists to make impossible. `label` uses the same sentinel for symmetry.
+
+    The three duration overrides are `zone`'s case exactly: `None` means "revert
+    to the global or profile default", so it has to stay distinguishable from
+    "not mentioned". `notify_on` and `notify_min_confidence` are not nullable at
+    all — `notify_on=frozenset()` is already the "never notify" instruction and a
+    confidence threshold has no absent state, so `None` would be a third meaning
+    neither field has room for.
     """
 
     label: str | Unset = UNSET
     zone: Zone | Unset | None = UNSET
+    notify_on: frozenset[ConcernKind] | Unset = UNSET
+    notify_min_confidence: Confidence | Unset = UNSET
+    clip_preroll_seconds: float | Unset | None = UNSET
+    clip_postroll_seconds: float | Unset | None = UNSET
+    summary_interval_seconds: float | Unset | None = UNSET
 
     @property
     def is_empty(self) -> bool:
         """True when nothing was asked for. The API rejects this rather than
-        reporting a successful write that changed nothing."""
-        return self.label is UNSET and self.zone is UNSET
+        reporting a successful write that changed nothing.
+
+        Read off the dataclass's own fields rather than a list repeated here: a
+        field added above and forgotten in this property would make an edit that
+        names only that field look like an edit that names nothing, and be
+        refused.
+        """
+        return all(getattr(self, field.name) is UNSET for field in fields(self))
 
 
 # -- reading ------------------------------------------------------------------------
@@ -486,6 +526,22 @@ def edited_document(document: Any, camera_id: str, edit: CameraEdit, origin: str
             # records that someone chose this, where a deleted key looks like a
             # camera nobody has got round to grouping yet.
             changed["zone"] = None if edit.zone is None else edit.zone.value
+        if edit.notify_on is not UNSET:
+            # Sorted, not just listed: `frozenset` iterates in an order that
+            # depends on the process's string hash seed, so writing it raw would
+            # make the same edit produce a different file from one run to the
+            # next — a spurious diff on the one artefact an operator hand-edits.
+            changed["notify_on"] = sorted(kind.value for kind in edit.notify_on)
+        if edit.notify_min_confidence is not UNSET:
+            changed["notify_min_confidence"] = edit.notify_min_confidence.value
+        for field_name in _NULLABLE_SECONDS_FIELDS:
+            value = getattr(edit, field_name)
+            if value is not UNSET:
+                # `None` written through as an explicit null, for `zone`'s reason
+                # above: `parse_cameras` reads it as "use the default", and a
+                # visible null says an operator chose that where a deleted key
+                # says nobody ever looked.
+                changed[field_name] = value
         updated.append(changed)
 
     if not found:

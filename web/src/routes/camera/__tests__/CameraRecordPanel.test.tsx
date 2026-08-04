@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
 import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
 import * as engineClient from '@/api/engineClient'
-import { EngineHttpError } from '@/api/engineClient'
+import { EngineHttpError, type CameraEditResponse } from '@/api/engineClient'
 
 vi.mock('@/api/engineClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/engineClient')>()
@@ -14,12 +14,20 @@ vi.mock('@/api/engineClient', async (importOriginal) => {
 
 const updateCamera = vi.mocked(engineClient.updateCamera)
 
-const storedResponse = {
+const storedResponse: CameraEditResponse = {
   camera_id: 'avenue_01',
   label: 'East door',
-  zone: 'corridor' as const,
-  zone_kind: 'common_area' as const,
-  persisted: true as const,
+  zone: 'corridor',
+  zone_kind: 'common_area',
+  // The welfare notification policy the engine now echoes back on every edit. This
+  // panel neither renders nor edits it yet, but the response always carries it, and
+  // a fixture missing these fields would be a shape the engine never sends.
+  notify_on: ['altercation', 'collapse', 'distress', 'medication', 'other', 'self_harm'],
+  notify_min_confidence: 'likely',
+  clip_preroll_seconds: null,
+  clip_postroll_seconds: null,
+  summary_interval_seconds: null,
+  persisted: true,
   restart_required_fields: ['url', 'profile'],
 }
 

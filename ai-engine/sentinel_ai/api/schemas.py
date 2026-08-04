@@ -4,7 +4,7 @@ orchestrator's internal shape can change independently."""
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -16,6 +16,7 @@ from sentinel_ai.adapters.config.camera_file import (
     CameraConfig,
     CameraEdit,
 )
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone, ZoneKind
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, RecentEvent
 from sentinel_ai.pipeline.runner import CameraTelemetry
@@ -28,6 +29,33 @@ between `""` and `"   "` — both are falsy to an operator and only one is falsy
 Python. Trimming first makes them the same answer. The 120-character bound is
 about the console: a label is a nav item, and there is no length at which a
 longer one is more useful than a truncated one.
+"""
+
+NonNegativeSeconds = Annotated[float, Field(ge=0.0)]
+"""A duration that may be zero — currently only `clip_preroll_seconds`, where no
+lead-in at all is a real choice."""
+
+PositiveSeconds = Annotated[float, Field(gt=0.0)]
+"""A duration that must be greater than zero: a clip that ends where it starts,
+or a summary that runs every no-seconds, is never what anyone meant.
+
+Both aliases mirror the bounds `load_cameras` enforces, and they exist so the
+rejection happens *here*. `CameraFileStore.apply` re-parses the whole document
+before writing and would refuse these too, but as a `CameraConfigError` — which
+this API answers 409, i.e. "the file will not take your edit". For a value that
+was simply out of range that is a lie, and it sends an operator to inspect a file
+that is perfectly fine.
+
+Non-finite is the one bound deliberately *not* mirrored here, and it is worth
+saying why so nobody adds it back as an oversight. `1e999` is valid JSON that
+decodes to `inf` and clears every `ge`/`gt` check, so `allow_inf_nan=False` looks
+like the obvious completion — but FastAPI echoes the offending value in its 422
+body and Starlette's `JSONResponse` refuses to serialise `inf`, so the 422 fails
+to render and the caller gets a 500 instead. A 409 from the store's re-parse
+(which does check `math.isfinite`, and writes nothing) is a worse answer than a
+422 and a much better one than a crash, and no standard client can produce this
+body in the first place: `json.dumps` and `JSON.stringify` both refuse or nullify
+an infinity.
 """
 
 
@@ -116,8 +144,40 @@ class DescribeResponse(BaseModel):
     event_id: UUID
 
 
+_NULL_IS_NOT_AN_INSTRUCTION: Final = {
+    "label": (
+        "'label' must be a non-empty string; omit the field to leave the label "
+        "unchanged. A camera always has a label — an unset one falls back to its id "
+        "at load, which is not the same as no label."
+    ),
+    "notify_on": (
+        "'notify_on' must be an array of concern kinds; send [] to stop this camera "
+        "notifying anyone, or omit the field to leave its routing unchanged. Null "
+        "would have to mean one of those two, and guessing which is how a camera "
+        "someone muted starts alerting again."
+    ),
+    "notify_min_confidence": (
+        "'notify_min_confidence' must be a confidence tier; omit the field to leave "
+        "the threshold unchanged. There is no 'no threshold' state — every concern "
+        "arrives with a confidence, so something always has to be compared against."
+    ),
+}
+"""The editable fields where `None` is pydantic's "not mentioned" default and
+never an instruction, mapped to what to send instead.
+
+Each of these has to stay `X | None` on the model, because pydantic cannot
+represent "omitted" in the type at all — `model_fields_set` is the only thing
+that knows. So a mentioned-but-null is caught in the validator instead, and the
+message says what the caller should have sent: a 422 reading only "expected str"
+tells an operator their console is broken rather than which of two real
+instructions they meant. `zone` and the three duration overrides are deliberately
+absent from this map — for them null *is* an instruction.
+"""
+
+
 class CameraEditRequest(BaseModel):
-    """A partial edit to one camera's record: `label`, `zone`, or both.
+    """A partial edit to one camera's record: its label, its zone, and its welfare
+    notification policy, in any combination.
 
     Partial on purpose — a console changing a label must not have to restate a zone
     it is not touching, because restating it is how one operator's window silently
@@ -152,6 +212,61 @@ class CameraEditRequest(BaseModel):
             "the operator meant to group and silently did not."
         ),
     )
+    notify_on: list[ConcernKind] | None = Field(
+        default=None,
+        description=(
+            "Which welfare concern kinds this camera notifies a human about, "
+            "replacing whatever is configured now — this is a whole new list, not an "
+            "addition to the old one. **`[]` means never notify from this camera**, "
+            "which is a real instruction and not an empty edit: it silences one "
+            "camera without turning welfare monitoring off anywhere else. Omit the "
+            "field to leave the routing alone; `null` is rejected, because `[]` "
+            "already covers the only thing it could have meant. A kind outside the "
+            "enum is a 422 rather than a silent narrowing of the list — a typo'd "
+            "kind is a concern the operator meant to be told about and would not be."
+        ),
+    )
+    notify_min_confidence: Confidence | None = Field(
+        default=None,
+        description=(
+            "The lowest confidence tier that may notify. `likely` is the engine's "
+            "default; `possible` widens it to everything the model flags at all, "
+            "which on an ordinary day is most of its opinions. Omit to leave the "
+            "threshold alone; `null` is rejected, because a camera has no "
+            "'no threshold' state. There are exactly two tiers and there is no "
+            "`certain` — see `domain/welfare.py`: one still frame cannot earn it."
+        ),
+    )
+    clip_preroll_seconds: NonNegativeSeconds | None = Field(
+        default=None,
+        description=(
+            "Seconds of buffered video to keep before a notified concern's keyframe, "
+            "for this camera only. `null` reverts it to the engine-wide default; "
+            "omitting the field leaves it as configured — **the two are different "
+            "instructions**, the same way `zone`'s are. `0` is allowed and means no "
+            "lead-in at all, which is why this bound is `>= 0` where the other two "
+            "durations are `> 0`."
+        ),
+    )
+    clip_postroll_seconds: PositiveSeconds | None = Field(
+        default=None,
+        description=(
+            "Seconds of video to keep recording after a notified concern's keyframe, "
+            "for this camera only. `null` reverts it to the engine-wide default; "
+            "omitting the field leaves it as configured. Must be greater than zero — "
+            "a clip that ends where it begins is not a shorter clip, it is no clip."
+        ),
+    )
+    summary_interval_seconds: PositiveSeconds | None = Field(
+        default=None,
+        description=(
+            "How often this camera's periodic summary runs. `null` reverts it to the "
+            "camera profile's interval; omitting the field leaves it as configured. "
+            "Distinct from `profile.summary_interval_seconds`, which is restart-only "
+            "— this is the runtime-editable override of it, and it wins where both "
+            "are set."
+        ),
+    )
 
     @model_validator(mode="after")
     def _reject_an_edit_that_asks_for_nothing(self) -> CameraEditRequest:
@@ -162,18 +277,17 @@ class CameraEditRequest(BaseModel):
         answered 200 would report a successful save for a request that changed
         nothing, and the operator would believe their edit landed.
 
-        `label: null` is caught here rather than by the type because the type has to
-        stay nullable: `None` is `label`'s "not mentioned" default, and pydantic
-        cannot distinguish an omitted optional from an explicit null without
-        `model_fields_set`. `zone` is the opposite case and deliberately so — a null
-        zone is a real instruction to ungroup.
+        The nulls rejected here are the ones listed in
+        `_NULL_IS_NOT_AN_INSTRUCTION`, and they are caught by a validator rather
+        than by the type because the type has to stay nullable: `None` is also each
+        field's "not mentioned" default, and pydantic cannot distinguish an omitted
+        optional from an explicit null without `model_fields_set`. `zone` and the
+        three duration overrides are the opposite case and deliberately so — a null
+        there is a real instruction to ungroup, or to fall back to the default.
         """
-        if "label" in self.model_fields_set and self.label is None:
-            raise ValueError(
-                "'label' must be a non-empty string; omit the field to leave the "
-                "label unchanged. A camera always has a label — an unset one falls "
-                "back to its id at load, which is not the same as no label."
-            )
+        for field_name, what_to_send_instead in _NULL_IS_NOT_AN_INSTRUCTION.items():
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(what_to_send_instead)
         if not self.model_fields_set:
             raise ValueError(
                 f"name at least one field to change; editable fields are {list(EDITABLE_FIELDS)}"
@@ -186,13 +300,36 @@ class CameraEditRequest(BaseModel):
         `model_fields_set` is what carries that: pydantic cannot otherwise tell a
         `zone` the caller explicitly set to null from a `zone` the caller never
         mentioned, and those are the two instructions this endpoint most needs to
-        keep apart. The validator above has already ruled out a mentioned-but-null
-        `label`, so the narrowing below cannot silently drop one.
+        keep apart. The same applies to each duration override below.
+
+        The two shapes are visible in the lines: a field whose null the validator
+        already rejected is guarded with `is not None` (which is therefore a
+        narrowing for the type checker, not a decision), and a field whose null is
+        an instruction is passed straight through.
         """
         mentioned = self.model_fields_set
         return CameraEdit(
             label=self.label if "label" in mentioned and self.label is not None else UNSET,
             zone=self.zone if "zone" in mentioned else UNSET,
+            notify_on=(
+                frozenset(self.notify_on)
+                if "notify_on" in mentioned and self.notify_on is not None
+                else UNSET
+            ),
+            notify_min_confidence=(
+                self.notify_min_confidence
+                if "notify_min_confidence" in mentioned and self.notify_min_confidence is not None
+                else UNSET
+            ),
+            clip_preroll_seconds=(
+                self.clip_preroll_seconds if "clip_preroll_seconds" in mentioned else UNSET
+            ),
+            clip_postroll_seconds=(
+                self.clip_postroll_seconds if "clip_postroll_seconds" in mentioned else UNSET
+            ),
+            summary_interval_seconds=(
+                self.summary_interval_seconds if "summary_interval_seconds" in mentioned else UNSET
+            ),
         )
 
 
@@ -208,6 +345,35 @@ class CameraEditResponse(BaseModel):
     zone: Zone | None = Field(description="The stored zone, or null when the camera is ungrouped.")
     zone_kind: ZoneKind | None = Field(
         description="Derived from `zone`, exactly as on `CameraStatus`. Null when `zone` is."
+    )
+    notify_on: list[ConcernKind] = Field(
+        description=(
+            "The concern kinds this camera will notify on, as stored — always the "
+            "full list, never a diff, and sorted so two reads of the same record "
+            "compare equal. A camera whose file says nothing about `notify_on` lists "
+            "every kind here, because that is what saying nothing means. `[]` means "
+            "this camera notifies nobody."
+        )
+    )
+    notify_min_confidence: Confidence = Field(
+        description="The stored confidence threshold. Never null: a camera always has one."
+    )
+    clip_preroll_seconds: float | None = Field(
+        description=(
+            "The stored per-camera override, or null when this camera uses the "
+            "engine-wide default. Null here is the answer to 'what is stored', not "
+            "a report of the effective value — the default in force is not this "
+            "endpoint's to state."
+        )
+    )
+    clip_postroll_seconds: float | None = Field(
+        description="As `clip_preroll_seconds`: the stored override, or null for the default."
+    )
+    summary_interval_seconds: float | None = Field(
+        description=(
+            "The stored override, or null when this camera falls back to its "
+            "profile's `summary_interval_seconds`."
+        )
     )
     persisted: Literal[True] = Field(
         default=True,
@@ -241,6 +407,14 @@ class CameraEditResponse(BaseModel):
             label=config.label,
             zone=config.zone,
             zone_kind=None if config.zone is None else config.zone.kind,
+            # Sorted for the same reason the file's copy is: `notify_on` is a
+            # frozenset, whose iteration order varies with the process's hash seed,
+            # and a console diffing two reads should not see a change that is not one.
+            notify_on=sorted(config.notify_on),
+            notify_min_confidence=config.notify_min_confidence,
+            clip_preroll_seconds=config.clip_preroll_seconds,
+            clip_postroll_seconds=config.clip_postroll_seconds,
+            summary_interval_seconds=config.summary_interval_seconds,
         )
 
 

@@ -431,6 +431,34 @@ class TestWelfareNotificationPolicy:
         assert camera.clip_postroll_seconds is None
         assert camera.summary_interval_seconds is None
 
+    @pytest.mark.parametrize(
+        ("field_name", "default"),
+        [
+            ("notify_on", frozenset(ConcernKind)),
+            ("notify_min_confidence", Confidence.LIKELY),
+            ("clip_preroll_seconds", None),
+            ("clip_postroll_seconds", None),
+            ("summary_interval_seconds", None),
+        ],
+    )
+    def test_an_explicit_null_loads_as_the_default(
+        self, tmp_path: Path, field_name: str, default: object
+    ) -> None:
+        """A written `null` and an absent key mean the same thing to the reader.
+
+        Not merely a curiosity of `entry.get(...)`: `edited_document` writes an
+        explicit `null` rather than deleting the key when an edit reverts one of
+        these fields to its default (the same choice `zone` makes, and for the same
+        reason — a visible null records that someone chose it, where a deleted key
+        looks like nobody got round to it). So every null this engine writes has to
+        come back as the default at the next startup, or a console edit would brick
+        the restart it was meant to survive.
+        """
+        path = a_file(tmp_path, {**CAM, field_name: None})
+        (camera,) = load_cameras(path)
+
+        assert getattr(camera, field_name) == default
+
     def test_notify_on_empty_means_never_notify(self, tmp_path: Path) -> None:
         """The distinction the task exists to get right: absent and `[]` are
         opposite instructions, not the same default spelled two ways. Get this
@@ -541,3 +569,194 @@ class TestWelfareNotificationPolicy:
         path = a_file(tmp_path, {**CAM, "clip_postroll_seconds": float("nan")})
         with pytest.raises(CameraConfigError, match=r"'clip_postroll_seconds' must be a finite"):
             load_cameras(path)
+
+
+class TestTheWelfarePolicyIsEditable:
+    """T8. The same five fields, now through the writer.
+
+    The reader's cases are above; these are about what an edit puts in the file
+    and what comes back out of it. The property that carries the most weight is
+    the one the sentinel exists for and that no amount of reading tests can
+    check: for the three duration overrides, *not mentioning* a field and
+    *setting it to null* are opposite instructions, and the file must show the
+    difference.
+    """
+
+    async def test_the_notification_routing_is_stored_and_reloads(self, tmp_path: Path) -> None:
+        path = a_file(tmp_path, CAM)
+
+        record = await CameraFileStore(path).apply(
+            "cam-1",
+            CameraEdit(
+                notify_on=frozenset({ConcernKind.COLLAPSE, ConcernKind.SELF_HARM}),
+                notify_min_confidence=Confidence.POSSIBLE,
+            ),
+        )
+
+        assert record.notify_on == frozenset({ConcernKind.COLLAPSE, ConcernKind.SELF_HARM})
+        assert record.notify_min_confidence is Confidence.POSSIBLE
+        stored = read(path)["cameras"][0]
+        assert stored["notify_on"] == ["collapse", "self_harm"]
+        assert stored["notify_min_confidence"] == "possible"
+        (reloaded,) = load_cameras(path)
+        assert reloaded.notify_on == record.notify_on
+        assert reloaded.notify_min_confidence is Confidence.POSSIBLE
+
+    async def test_muting_a_camera_is_written_as_an_empty_array(self, tmp_path: Path) -> None:
+        """`[]` is the instruction "never notify from this camera", and the reader
+        reads it back as exactly that. Writing nothing — or dropping the key —
+        would silently restore every kind at the next startup, which is the one
+        outcome an operator who muted a camera must never get."""
+        path = a_file(tmp_path, CAM)
+
+        record = await CameraFileStore(path).apply("cam-1", CameraEdit(notify_on=frozenset()))
+
+        assert record.notify_on == frozenset()
+        assert read(path)["cameras"][0]["notify_on"] == []
+        (reloaded,) = load_cameras(path)
+        assert reloaded.notify_on == frozenset()
+
+    async def test_the_stored_kinds_are_ordered_so_a_repeated_edit_is_a_no_op_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """`notify_on` is a `frozenset`, whose iteration order depends on the
+        process's string hash seed. Written unsorted, the same edit applied twice
+        from two processes would produce two different files — a spurious diff on
+        the one artefact an operator hand-maintains, and a reason to distrust the
+        console's writes."""
+        path = a_file(tmp_path, CAM)
+        every_kind = frozenset(ConcernKind)
+
+        await CameraFileStore(path).apply("cam-1", CameraEdit(notify_on=every_kind))
+        first = path.read_text(encoding="utf-8")
+        await CameraFileStore(path).apply("cam-1", CameraEdit(notify_on=every_kind))
+
+        assert read(path)["cameras"][0]["notify_on"] == sorted(kind.value for kind in ConcernKind)
+        assert path.read_text(encoding="utf-8") == first
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("clip_preroll_seconds", 2.5),
+            ("clip_postroll_seconds", 4.0),
+            ("summary_interval_seconds", 30.0),
+        ],
+    )
+    async def test_a_duration_override_is_stored_and_reloads(
+        self, tmp_path: Path, field_name: str, value: float
+    ) -> None:
+        path = a_file(tmp_path, CAM)
+        edit: dict[str, Any] = {field_name: value}
+
+        record = await CameraFileStore(path).apply("cam-1", CameraEdit(**edit))
+
+        assert getattr(record, field_name) == value
+        assert read(path)["cameras"][0][field_name] == value
+        (reloaded,) = load_cameras(path)
+        assert getattr(reloaded, field_name) == value
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["clip_preroll_seconds", "clip_postroll_seconds", "summary_interval_seconds"],
+    )
+    async def test_a_null_duration_reverts_to_the_default_and_says_so_in_the_file(
+        self, tmp_path: Path, field_name: str
+    ) -> None:
+        """`null` means "go back to the global default", and the key stays visible
+        for the same reason `zone`'s does: a written null records that someone
+        chose it, where a deleted key looks like a camera nobody got round to."""
+        path = a_file(tmp_path, {**CAM, field_name: 9.0})
+        edit: dict[str, Any] = {field_name: None}
+
+        record = await CameraFileStore(path).apply("cam-1", CameraEdit(**edit))
+
+        assert getattr(record, field_name) is None
+        stored = read(path)["cameras"][0]
+        assert field_name in stored, "the key was deleted rather than nulled"
+        assert stored[field_name] is None
+        (reloaded,) = load_cameras(path)
+        assert getattr(reloaded, field_name) is None
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "notify_on",
+            "notify_min_confidence",
+            "clip_preroll_seconds",
+            "clip_postroll_seconds",
+            "summary_interval_seconds",
+        ],
+    )
+    async def test_an_unmentioned_policy_field_is_left_exactly_as_it_was(
+        self, tmp_path: Path, field_name: str
+    ) -> None:
+        """The other half of the sentinel, and the half that fails silently: an
+        edit that renames a camera must not reset the notification policy someone
+        tuned for it."""
+        configured = {
+            "notify_on": ["collapse"],
+            "notify_min_confidence": "possible",
+            "clip_preroll_seconds": 1.5,
+            "clip_postroll_seconds": 6.0,
+            "summary_interval_seconds": 90.0,
+        }
+        path = a_file(tmp_path, {**CAM, **configured})
+
+        await CameraFileStore(path).apply("cam-1", CameraEdit(label="Renamed"))
+
+        assert read(path)["cameras"][0][field_name] == configured[field_name]
+
+    async def test_a_duration_outside_its_bounds_is_refused_and_nothing_is_written(
+        self, tmp_path: Path
+    ) -> None:
+        """The re-parse before the write is the backstop, not the gate: the API
+        rejects this with a 422 long before it gets here. It still has to hold,
+        because any future caller reaching the store directly would otherwise
+        write a file the next startup refuses."""
+        path = a_file(tmp_path, CAM)
+        before = path.read_text(encoding="utf-8")
+
+        with pytest.raises(CameraConfigError, match=r"'clip_postroll_seconds' must be > 0"):
+            await CameraFileStore(path).apply("cam-1", CameraEdit(clip_postroll_seconds=0.0))
+
+        assert path.read_text(encoding="utf-8") == before
+
+    async def test_a_non_finite_duration_never_reaches_the_file(self, tmp_path: Path) -> None:
+        """The one bound the API layer does not mirror, so this is the only thing
+        standing between `1e999` in a hand-rolled request body and a `cameras.json`
+        the next startup refuses. (`api/schemas.py`'s `PositiveSeconds` explains why
+        the check is not also at the edge: FastAPI echoes the offending value into
+        its 422, and `inf` cannot be serialised into one.)
+
+        `json.dumps` would refuse to write `Infinity` anyway — but it refuses by
+        raising *after* the temp file exists, so without the re-parse this would be
+        an `OSError`-shaped 500 and a stray temp file rather than a clean refusal.
+        """
+        path = a_file(tmp_path, CAM)
+        before = path.read_text(encoding="utf-8")
+
+        with pytest.raises(CameraConfigError, match=r"'clip_preroll_seconds' must be a finite"):
+            await CameraFileStore(path).apply(
+                "cam-1", CameraEdit(clip_preroll_seconds=float("inf"))
+            )
+
+        assert path.read_text(encoding="utf-8") == before
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["cameras.json"]
+
+    async def test_a_policy_edit_leaves_the_rest_of_the_document_alone(
+        self, tmp_path: Path
+    ) -> None:
+        path = a_file(
+            tmp_path,
+            {**CAM, "_note": "pushed in with ffmpeg"},
+            {"id": "cam-2", "url": "rtsp://host/two"},
+            _comment=["read me first"],
+        )
+
+        await CameraFileStore(path).apply("cam-1", CameraEdit(notify_on=frozenset()))
+
+        document = read(path)
+        assert document["_comment"] == ["read me first"]
+        assert document["cameras"][0]["_note"] == "pushed in with ffmpeg"
+        assert document["cameras"][0]["label"] == "Front door"
+        assert document["cameras"][1] == {"id": "cam-2", "url": "rtsp://host/two"}

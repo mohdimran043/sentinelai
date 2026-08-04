@@ -238,7 +238,10 @@ async def describe_camera_now(camera_id: str, service: ServiceDep) -> DescribeRe
 @router.patch(
     "/cameras/{camera_id}",
     response_model=CameraEditResponse,
-    summary="Edit a camera's label and zone — UNAUTHENTICATED, and off by default",
+    summary=(
+        "Edit a camera's label, zone and welfare notification policy — "
+        "UNAUTHENTICATED, and off by default"
+    ),
     responses={
         403: {
             "description": (
@@ -264,7 +267,8 @@ async def update_camera(
     service: ServiceDep,
     writes_enabled: WritesEnabledDep,
 ) -> CameraEditResponse:
-    """Change what a camera is called and which zone it is grouped into.
+    """Change what a camera is called, which zone it is grouped into, and what its
+    welfare concerns notify a human about.
 
     ### This endpoint is not authenticated
 
@@ -292,6 +296,20 @@ async def update_camera(
     * `label` — the display name. Trimmed, non-empty, at most 120 characters.
     * `zone` — `room`, `corridor`, `dayroom`, or `null` to ungroup. Omitting the
       field and sending `null` are different instructions.
+    * `notify_on` — which welfare concern kinds notify a human, as a whole
+      replacement list. `[]` means never notify from this camera and is a real
+      edit, not an empty one; `null` is rejected because `[]` already says it.
+    * `notify_min_confidence` — `possible` or `likely`, the lowest tier that may
+      notify. There is no `certain`: one still frame cannot earn it.
+    * `clip_preroll_seconds`, `clip_postroll_seconds`,
+      `summary_interval_seconds` — per-camera overrides of the engine-wide clip
+      bounds and the profile's summary interval. **Omitting one and sending
+      `null` are different instructions**, as with `zone`: omit to leave the
+      override alone, send `null` to drop it and go back to the default. Pre-roll
+      may be `0` (no lead-in is a real choice); the other two must be above zero.
+
+    Every one of them comes back in the response as it was stored, so a console
+    renders what the file now says rather than what it hoped it would say.
 
     **Not editable, and rejected with 422 rather than ignored** — the response's
     `restart_required_fields` names them:

@@ -5,6 +5,7 @@ shapes only — no business logic lives here to test.
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -19,6 +20,7 @@ from sentinel_ai.adapters.config.camera_file import (
 from sentinel_ai.api.app import create_app
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Severity
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.event_history import (
     CameraEventHistory,
@@ -29,6 +31,14 @@ from sentinel_ai.orchestrator.event_history import (
 from sentinel_ai.orchestrator.service import UnknownCameraError
 from sentinel_ai.pipeline.runner import CameraTelemetry
 from sentinel_ai.ports.model_runtime import HealthReport, LifecycleState
+
+_WELFARE_POLICY_FIELDS = (
+    "notify_on",
+    "notify_min_confidence",
+    "clip_preroll_seconds",
+    "clip_postroll_seconds",
+    "summary_interval_seconds",
+)
 
 
 class _FakeEngineService:
@@ -113,6 +123,15 @@ class _FakeEngineService:
             url="rtsp://host/stream",
             profile=CameraProfile(camera_id=camera_id),
             zone=current.zone if edit.zone is UNSET else edit.zone,
+            # The welfare policy has no "current" here to fall back to: it is not on
+            # `CameraTelemetry` (Task 9 puts it there), so an unmentioned field lands
+            # on `CameraConfig`'s own default, which is what a camera the file says
+            # nothing about would load as anyway.
+            **{
+                name: getattr(edit, name)
+                for name in _WELFARE_POLICY_FIELDS
+                if getattr(edit, name) is not UNSET
+            },
         )
 
 
@@ -505,6 +524,15 @@ class TestCameraEdit:
             "label": "Back door",
             "zone": "corridor",
             "zone_kind": "common_area",
+            # Echoed even though this edit did not name them: the response is the
+            # record as it now stands, not a diff. A camera whose file says nothing
+            # about `notify_on` notifies on every kind, and saying so explicitly is
+            # what stops a console rendering "no kinds" for it.
+            "notify_on": sorted(ConcernKind),
+            "notify_min_confidence": "likely",
+            "clip_preroll_seconds": None,
+            "clip_postroll_seconds": None,
+            "summary_interval_seconds": None,
             "persisted": True,
             "restart_required_fields": ["url", "profile"],
         }
@@ -635,6 +663,193 @@ class TestCameraEdit:
 
         assert response.status_code == 500
         assert "nothing was changed" in response.json()["detail"]
+
+
+class TestCameraWelfarePolicyEdit:
+    """T8. The per-camera welfare policy over `PATCH /cameras/{camera_id}`.
+
+    Nothing in the engine reads these fields yet — Task 9 makes the runner honour
+    the clip/summary overrides, Task 10 routes notifications on the other two — so
+    what these tests own is exactly what this layer owns: that the HTTP body
+    becomes the right `CameraEdit`, that a value the file would refuse is a 422
+    here rather than a 409 from the store, and that the response says what was
+    stored.
+    """
+
+    def app(self) -> tuple[_FakeEngineService, TestClient]:
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1", label="Front door", zone=Zone.CORRIDOR),)
+        )
+        return service, TestClient(create_app(service, camera_writes_enabled=True))
+
+    def test_the_routing_is_editable_and_the_stored_record_comes_back(self) -> None:
+        service, client = self.app()
+        with client:
+            response = client.patch(
+                "/cameras/cam-1",
+                json={"notify_on": ["self_harm", "collapse"], "notify_min_confidence": "possible"},
+            )
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["notify_on"] == ["collapse", "self_harm"]
+        assert body["notify_min_confidence"] == "possible"
+        assert service.edits == [
+            (
+                "cam-1",
+                CameraEdit(
+                    notify_on=frozenset({ConcernKind.COLLAPSE, ConcernKind.SELF_HARM}),
+                    notify_min_confidence=Confidence.POSSIBLE,
+                ),
+            )
+        ]
+
+    def test_muting_a_camera_is_an_edit_and_not_an_empty_request(self) -> None:
+        """`notify_on: []` is the one instruction this endpoint could most easily
+        mistake for "asked for nothing" — the body names one field and that field
+        is empty. Rejecting it as empty would leave an operator with no way to
+        silence a camera short of editing the file."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"notify_on": []})
+
+        assert response.status_code == 200
+        assert response.json()["notify_on"] == []
+        assert service.edits == [("cam-1", CameraEdit(notify_on=frozenset()))]
+
+    @pytest.mark.parametrize("field", ["notify_on", "notify_min_confidence"])
+    def test_a_null_routing_field_is_rejected_and_says_what_to_send_instead(
+        self, field: str
+    ) -> None:
+        """Neither field has a "no value" state: `[]` already means "never notify",
+        and a camera always has some confidence threshold. A null accepted as
+        "unchanged" would report a save for a request that changed nothing."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={field: None})
+
+        assert response.status_code == 422
+        assert field in response.text
+        assert "omit" in response.text
+        assert service.edits == []
+
+    def test_an_unknown_concern_kind_is_rejected_rather_than_dropped(self) -> None:
+        """Dropping it would silently narrow the routing to the kinds that happened
+        to be spelled right — a camera an operator believes is watched for
+        `self_harm` and is not."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"notify_on": ["fainting"]})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_a_confidence_tier_that_does_not_exist_is_rejected(self) -> None:
+        """There is no `certain` tier and there never will be: a single still frame
+        cannot earn one (see `domain/welfare.py`). A caller asking for it is asking
+        for a threshold nothing can clear."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"notify_min_confidence": "certain"})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("clip_preroll_seconds", 2.5),
+            ("clip_postroll_seconds", 4.0),
+            ("summary_interval_seconds", 30.0),
+        ],
+    )
+    def test_a_duration_override_is_editable_and_comes_back(self, field: str, value: float) -> None:
+        service, client = self.app()
+        expected: dict[str, Any] = {field: value}
+        with client:
+            response = client.patch("/cameras/cam-1", json={field: value})
+
+        assert response.status_code == 200
+        assert response.json()[field] == value
+        assert service.edits == [("cam-1", CameraEdit(**expected))]
+
+    @pytest.mark.parametrize(
+        "field",
+        ["clip_preroll_seconds", "clip_postroll_seconds", "summary_interval_seconds"],
+    )
+    def test_an_omitted_duration_and_an_explicit_null_are_different_instructions(
+        self, field: str
+    ) -> None:
+        """The translation this layer exists to get right, for the three fields
+        where both instructions are legal. `null` reverts the camera to the global
+        default; omitting it leaves whatever the operator tuned. Pydantic gives both
+        the same attribute value and only `model_fields_set` tells them apart, so a
+        conflation here is invisible until someone's tuned pre-roll silently
+        resets."""
+        service, client = self.app()
+        reverting: dict[str, Any] = {field: None}
+        with client:
+            reverted = client.patch("/cameras/cam-1", json={field: None})
+            client.patch("/cameras/cam-1", json={"label": "Renamed"})
+
+        assert reverted.json()[field] is None
+        assert service.edits == [
+            # The second edit leaves this field `UNSET` — `CameraEdit`'s default —
+            # which is what makes the two lines below different objects. If omitted
+            # and null were conflated, both edits would carry the same value here
+            # and this assertion would pass whichever way round the conflation went.
+            ("cam-1", CameraEdit(**reverting)),
+            ("cam-1", CameraEdit(label="Renamed")),
+        ]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("clip_preroll_seconds", -0.5),
+            ("clip_postroll_seconds", 0),
+            ("summary_interval_seconds", 0),
+            ("summary_interval_seconds", -1),
+        ],
+    )
+    def test_a_duration_outside_its_bounds_is_a_422_not_a_conflict(
+        self, field: str, value: float
+    ) -> None:
+        """The store's re-parse would also refuse these, but as a `CameraConfigError`
+        — which this endpoint answers 409, meaning "the file is in a state that will
+        not take your edit". That is a lie about a request that was simply wrong, and
+        it points the operator at the file instead of at their own input."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={field: value})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_no_pre_roll_at_all_is_a_real_choice(self) -> None:
+        """Pre-roll's bound is `>= 0` where the other two are `> 0`, exactly as at
+        load time: a clip with no lead-in is legitimate, a clip of no length is
+        not."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"clip_preroll_seconds": 0})
+
+        assert response.status_code == 200
+        assert response.json()["clip_preroll_seconds"] == 0.0
+        assert service.edits == [("cam-1", CameraEdit(clip_preroll_seconds=0.0))]
+
+    def test_a_policy_edit_alongside_a_field_that_needs_a_restart_is_still_refused(self) -> None:
+        """Adding editable fields must not have widened what the body may carry: a
+        `url` smuggled in beside a legitimate policy change is still a 422, and
+        still changes nothing."""
+        service, client = self.app()
+        with client:
+            response = client.patch(
+                "/cameras/cam-1", json={"notify_on": [], "url": "rtsp://elsewhere/one"}
+            )
+
+        assert response.status_code == 422
+        assert "url" in response.text
+        assert service.edits == []
 
 
 def test_lifespan_starts_and_stops_the_service() -> None:
