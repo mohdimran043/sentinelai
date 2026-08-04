@@ -162,6 +162,10 @@ Extends `CameraEdit` and `CameraEditRequest` with the Task 7 fields. **The `UNSE
 
 Numeric bounds mirror the existing config: pre-roll `>= 0`, post-roll `> 0`, `summary_interval_seconds > 0`. A body carrying `url` or `profile` must still be a 422.
 
+**Also extend `CameraEditResponse`** with the new fields. It is built `from_config` off the re-parsed `CameraConfig`, so the values are already in hand, and its whole reason for returning the record rather than an acknowledgement is that "a console that has just written should render what was stored, not what it hoped was stored" — a PATCH that changed `notify_on` and echoed back only `label`/`zone` breaks that promise for exactly the fields being added.
+
+**Not this task:** the *list* read surface. `CameraStatus` is built from `CameraTelemetry`, not from `CameraConfig`, so putting the new fields on `GET /cameras` means carrying them through the runner — see Task 9, which now owns it.
+
 - [ ] **Step 1: Write the failing tests** — each field edits and persists; omitted vs null differ for the nullable ones; out-of-range values are 422; `url`/`profile` still 422; the whole-document atomicity guarantees still hold.
 - [ ] **Step 2: Run to verify. Step 3: Implement.** **Step 4: Verify**, including `test_openapi_contract.py`, then `cd web && npm run gen` and confirm `git diff` shows the regenerated types. **Step 5: Commit** both together: `feat(api): edit per-camera welfare policy at runtime`
 
@@ -172,6 +176,8 @@ Numeric bounds mirror the existing config: pre-roll `>= 0`, post-roll `> 0`, `su
 **Files:** Modify `ai-engine/sentinel_ai/pipeline/runner.py` and wherever `CameraProfile` is built from `CameraConfig` (find it — likely `main.py`); Tests: the runner's existing tests.
 
 The per-camera values override the globals when set. `summary_interval_seconds` flows into the `CameraProfile` the gate uses.
+
+**This task also owns the read surface**, found missing while dispatching Task 8: `CameraStatus` — what `GET /cameras` returns and what the Camera record panel is fed from — is built from `CameraTelemetry` (`pipeline/runner.py`), not from `CameraConfig`. `label` and `zone` already ride on the telemetry record for exactly this reason, and `service.apply_metadata(label=, zone=)` is the established path that pushes an accepted edit onto the running camera (`main.py:609`). The Task 7 fields need the same treatment, or Task 11's read-only branch has nothing to render and a live edit is invisible until restart. Extend `CameraTelemetry`, `apply_metadata`, `CameraStatus`, the OpenAPI contract and the regenerated TS types alongside the runner work — the same edit that makes the runner honour a value must make the console able to read it back.
 
 **A live edit of these takes effect on the next escalation, not retroactively** — a clip mid-recording keeps the length it started with. State that in the docstring and test it, because the alternative (mutating an in-flight clip's bounds) is how a clip ends up with impossible timestamps.
 
