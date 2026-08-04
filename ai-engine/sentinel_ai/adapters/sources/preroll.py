@@ -16,13 +16,49 @@ class PreRollBuffer:
     """A clip cannot start mid-GOP (spec §5.1): `flush()` always begins at a
     keyframe, which quantises the actual pre-roll up to the GOP boundary --
     more context than requested, never less.
+
+    Zero is a valid horizon and means "no lead-in": the clip starts at the
+    escalation, with whatever the open GOP already holds and nothing older.
+    That is not a special case in the code below -- a zero horizon simply puts
+    the target at the newest packet, so the anchor is the newest keyframe at or
+    before it -- but it has to be *allowed*, because both configuration edges
+    already accept it: `Settings.clip_preroll_seconds` is declared `ge=0` and
+    `PATCH /cameras/{camera_id}` takes `0` for the per-camera override. A buffer
+    that rejected zero would turn a value the API calls valid into a crash at
+    camera construction. Negative is still refused: it asks for a clip that
+    starts after the thing it is evidence of.
     """
 
     def __init__(self, preroll_seconds: float) -> None:
-        if preroll_seconds <= 0:
-            raise ValueError(f"preroll_seconds must be positive, got {preroll_seconds}")
-        self._preroll_seconds = preroll_seconds
+        self._preroll_seconds = self._validated(preroll_seconds)
         self._packets: deque[EncodedPacket] = deque()
+
+    @property
+    def preroll_seconds(self) -> float:
+        return self._preroll_seconds
+
+    @preroll_seconds.setter
+    def preroll_seconds(self, seconds: float) -> None:
+        """Re-target a live ring, for a per-camera `clip_preroll_seconds` edit.
+
+        Settable rather than rebuild-on-edit: the ring holds the history the very
+        next escalation is going to want, and replacing it to change one number
+        would throw that away for however long it takes to refill.
+
+        The new horizon applies from the next `append`/`flush` onward and cannot
+        act backwards -- widening it does not resurrect packets already evicted
+        under the narrower one, so the extra lead-in appears as the ring refills.
+        That is a property of the ring, not a limitation to work around: the
+        evicted packets are gone from memory, and there is nowhere else to get
+        them from.
+        """
+        self._preroll_seconds = self._validated(seconds)
+
+    @staticmethod
+    def _validated(seconds: float) -> float:
+        if seconds < 0:
+            raise ValueError(f"preroll_seconds must be >= 0, got {seconds}")
+        return seconds
 
     def _anchor_index(self) -> int | None:
         """Index of the keyframe `flush()` would start from, or None.

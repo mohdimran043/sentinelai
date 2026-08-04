@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -591,6 +592,77 @@ class TestCompose:
         )
         assert [t.zone for t in composition.service.cameras()] == [Zone.DAYROOM, None]
 
+    def test_the_per_camera_welfare_policy_survives_composition_and_reaches_the_api(
+        self, tmp_path: Path
+    ) -> None:
+        """The same argument as the zone above, for the five Task 7 fields: a value
+        that stops at `CameraConfig` changes nothing and shows nowhere. `GET /cameras`
+        is built from `CameraRunner.telemetry()`, and the runner is also what has to
+        honour the three durations, so both halves depend on this wiring."""
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+        )
+        cameras = (
+            CameraConfig(
+                "cam-1",
+                "Camera One",
+                str(ASSET),
+                _profile("cam-1"),
+                notify_on=frozenset({ConcernKind.COLLAPSE}),
+                notify_min_confidence=Confidence.POSSIBLE,
+                clip_preroll_seconds=0.0,
+                clip_postroll_seconds=2.5,
+                summary_interval_seconds=90.0,
+            ),
+            CameraConfig("cam-2", "Camera Two", str(ASSET), _profile("cam-2")),
+        )
+        composition = compose(
+            settings,
+            cameras,
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+
+        configured, plain = composition.service.cameras()
+        assert configured.notify_on == frozenset({ConcernKind.COLLAPSE})
+        assert configured.notify_min_confidence is Confidence.POSSIBLE
+        assert configured.clip_preroll_seconds == 0.0
+        assert configured.clip_postroll_seconds == 2.5
+        assert configured.summary_interval_seconds == 90.0
+        # A camera the file says nothing about reports nulls, not the resolved
+        # engine-wide values: null is "this camera follows the default".
+        assert plain.notify_on == frozenset(ConcernKind)
+        assert plain.notify_min_confidence is Confidence.LIKELY
+        assert (
+            plain.clip_preroll_seconds,
+            plain.clip_postroll_seconds,
+            plain.summary_interval_seconds,
+        ) == (None, None, None)
+
+    def test_a_zero_preroll_camera_composes_rather_than_crashing(self, tmp_path: Path) -> None:
+        """`0` is accepted by `Settings` (`ge=0`), by `load_cameras` and by `PATCH`, so
+        a camera configured with it must build. Before the pre-roll ring accepted zero
+        this raised out of `compose` and took the whole engine's startup with it."""
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+            clip_preroll_seconds=0.0,
+        )
+        composition = compose(
+            settings,
+            (CameraConfig("cam-1", "Camera One", str(ASSET), _profile("cam-1")),),
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        assert [t.camera_id for t in composition.service.cameras()] == ["cam-1"]
+
     def test_the_scheduler_is_wired_to_the_same_resident_set_the_service_owns(
         self, tmp_path: Path
     ) -> None:
@@ -833,6 +905,72 @@ class TestTheComposedEditPath:
         # defaults rather than anything the writer invented.
         assert stored.clip_postroll_seconds is None
         assert stored.summary_interval_seconds is None
+
+    async def test_a_welfare_policy_edit_reaches_the_running_camera(self, tmp_path: Path) -> None:
+        """The other half of the test above, and the reason Task 9 owns this seam: an
+        edit that only lands in the file leaves the running camera recording the old
+        clip lengths and summarising on the old interval until a restart, while the
+        console — fed from `telemetry()` — cheerfully reports the new ones."""
+        service, _, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            await service.update_camera(
+                "cam-1",
+                CameraEdit(
+                    notify_on=frozenset({ConcernKind.DISTRESS}),
+                    notify_min_confidence=Confidence.POSSIBLE,
+                    clip_preroll_seconds=0.0,
+                    clip_postroll_seconds=2.5,
+                    summary_interval_seconds=90.0,
+                ),
+            )
+
+            live = service.telemetry("cam-1")
+            assert live.notify_on == frozenset({ConcernKind.DISTRESS})
+            assert live.notify_min_confidence is Confidence.POSSIBLE
+            assert live.clip_preroll_seconds == 0.0
+            assert live.clip_postroll_seconds == 2.5
+            assert live.summary_interval_seconds == 90.0
+        finally:
+            await service.stop()
+
+    async def test_the_audit_log_records_the_old_and_new_welfare_policy(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """This endpoint is unauthenticated, so the log line is the only record of what
+        a camera used to be. Muting a camera's welfare notifications is the most
+        consequential thing an anonymous caller can do here — quieter, and worse, than
+        renaming one — so it cannot be the one edit that goes unrecorded.
+        """
+        service, _, _ = self._service(tmp_path)
+        await service.start()
+        try:
+            with caplog.at_level(logging.INFO, logger="sentinel_ai.main"):
+                await service.update_camera(
+                    "cam-1",
+                    CameraEdit(
+                        notify_on=frozenset(),
+                        notify_min_confidence=Confidence.POSSIBLE,
+                        clip_preroll_seconds=0.0,
+                        clip_postroll_seconds=2.5,
+                        summary_interval_seconds=90.0,
+                    ),
+                )
+        finally:
+            await service.stop()
+
+        (record,) = [r for r in caplog.records if "reconfigured" in r.getMessage()]
+        message = record.getMessage()
+        # Both sides of every field: the new value alone would say what the camera is
+        # now and leave no way to reconstruct what it was a minute earlier.
+        # Sorted and bracketed: frozenset iteration order follows the process's hash
+        # seed, so an unsorted rendering would make the same edit read differently on
+        # every run, and an unbracketed empty set would vanish into the separator.
+        assert "notify_on=[altercation,collapse,distress,medication,other,self_harm]->[]" in message
+        assert "notify_min_confidence=likely->possible" in message
+        assert "clip_preroll_seconds=None->0.0" in message
+        assert "clip_postroll_seconds=None->2.5" in message
+        assert "summary_interval_seconds=None->90.0" in message
 
     async def test_the_new_label_reaches_the_next_event(self, tmp_path: Path) -> None:
         """The label is not decoration: `CameraRunner` puts it on every escalation it

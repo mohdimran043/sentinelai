@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import replace
 from types import TracebackType
 from uuid import UUID
 
@@ -13,6 +14,8 @@ from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.config import Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, Detection
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
@@ -21,7 +24,13 @@ from sentinel_ai.pipeline import runner as runner_module
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData
-from tests.fakes.io import FakeClipWriter, FakeFailedEventSink, FakePublisher, FakeSource
+from tests.fakes.io import (
+    FakeClipHandle,
+    FakeClipWriter,
+    FakeFailedEventSink,
+    FakePublisher,
+    FakeSource,
+)
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
 NEAR = Detection("person", 0.9, BBox(0.0, 0.0, 10.0, 10.0))
@@ -157,6 +166,46 @@ class ClearSpyPreRoll(PreRollBuffer):
         super().clear()
 
 
+class EditingClipHandle(FakeClipHandle):
+    def __init__(self, camera_id: str, event_id: UUID, *, writer: EditingClipWriter) -> None:
+        super().__init__(camera_id, event_id)
+        self._writer = writer
+
+    async def append(self, packet: EncodedPacket) -> None:
+        await super().append(packet)
+        after = self._writer.after_packets
+        if after is not None and not self._writer.fired and len(self.packets) >= after:
+            self._writer.fired = True
+            self._writer.on_packet()
+
+
+class EditingClipWriter(FakeClipWriter):
+    """Fires a callback at a chosen point inside one clip's lifecycle.
+
+    Two hooks, for the two moments a live edit can land inside a single escalation
+    and be mistaken for the next one:
+
+      * `on_open` runs inside `ClipWriter.open` — the await `_escalate` suspends on
+        after the gate has decided and before the clip's deadline is computed;
+      * `on_packet` runs from the Nth `append` — the clip is recording and its
+        deadline is already set.
+    """
+
+    def __init__(self, *, after_packets: int | None = None) -> None:
+        super().__init__()
+        self.after_packets = after_packets
+        self.fired = False
+        self.on_open: Callable[[], None] = lambda: None
+        self.on_packet: Callable[[], None] = lambda: None
+
+    async def open(self, camera_id: str, event_id: UUID, fps: float) -> FakeClipHandle:
+        self.opened.append((camera_id, event_id, fps))
+        handle = EditingClipHandle(camera_id, event_id, writer=self)
+        self.handles.append(handle)
+        self.on_open()
+        return handle
+
+
 class Worker:
     """Runs the single scheduler worker for the duration of an `async with` block."""
 
@@ -227,6 +276,9 @@ def make_runner(
     motion: MotionAnalyzer | None = None,
     preroll: PreRollBuffer | None = None,
     detect_every_n_frames: int = 1,
+    clip_preroll_seconds: float | None = None,
+    clip_postroll_seconds: float | None = None,
+    summary_interval_seconds: float | None = None,
 ) -> CameraRunner:
     return CameraRunner(
         camera_id="cam-1",
@@ -240,6 +292,42 @@ def make_runner(
         clip_writer=clip_writer,
         preroll=preroll or PreRollBuffer(preroll_seconds=3.0),
         detect_every_n_frames=detect_every_n_frames,
+        clip_preroll_seconds=clip_preroll_seconds,
+        clip_postroll_seconds=clip_postroll_seconds,
+        summary_interval_seconds=summary_interval_seconds,
+    )
+
+
+def apply_policy(
+    runner: CameraRunner,
+    *,
+    label: str = "Front Door",
+    zone: Zone | None = None,
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
+    notify_min_confidence: Confidence = Confidence.LIKELY,
+    clip_preroll_seconds: float | None = None,
+    clip_postroll_seconds: float | None = None,
+    summary_interval_seconds: float | None = None,
+) -> None:
+    """`apply_metadata` takes the camera's whole editable record, deliberately (see
+    its docstring). These tests name only the field under test and let the rest
+    default to what a `cameras.json` entry that mentions none of them loads as."""
+    runner.apply_metadata(
+        label=label,
+        zone=zone,
+        notify_on=notify_on,
+        notify_min_confidence=notify_min_confidence,
+        clip_preroll_seconds=clip_preroll_seconds,
+        clip_postroll_seconds=clip_postroll_seconds,
+        summary_interval_seconds=summary_interval_seconds,
+    )
+
+
+def history_packet(pts: float) -> EncodedPacket:
+    """A keyframe from before the stream under test started, as the packet loop would
+    have buffered it during the seconds before an anomaly."""
+    return EncodedPacket(
+        camera_id="cam-1", data=b"history", pts=pts, is_keyframe=True, codec="h264"
     )
 
 
@@ -1150,3 +1238,442 @@ class TestOneTimeBasePerCamera:
             "the clip must keep recording for its whole post-roll after the escalation; "
             f"escalated at {owning.source_timestamp}, last packet at {last_pts}"
         )
+
+
+class TestPerCameraClipAndSummaryOverrides:
+    """`cameras.json`'s `clip_preroll_seconds`, `clip_postroll_seconds` and
+    `summary_interval_seconds`: the per-camera values that win over the process-wide
+    settings and the camera profile.
+
+    Every override test below is paired with the same scenario run without the
+    override, so a runner that quietly kept reading the global still fails: the
+    global is deliberately set to a value whose outcome is the opposite one.
+    """
+
+    async def test_a_camera_without_overrides_uses_the_global_postroll(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=0.5)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert handle.packets[-1].pts == pytest.approx(0.5)
+
+    async def test_a_per_camera_postroll_overrides_the_global(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The global is 60s — longer than the whole stream — so a runner that read it
+        would leave the clip open and abort it at end of stream."""
+        patch_postroll(monkeypatch, seconds=60.0)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            clip_postroll_seconds=0.5,
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        handle = writer.handles[0]
+        assert handle.finished is True, "the per-camera post-roll must be the one in force"
+        assert handle.aborted is False
+        assert handle.packets[-1].pts == pytest.approx(0.5)
+
+    async def test_a_camera_without_overrides_uses_the_global_preroll(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=60.0)
+        writer, scheduler, runner, preroll = self._preroll_camera(override=None)
+
+        for index in range(4):
+            preroll.append(history_packet(round(-0.3 + index / 10.0, 4)))
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        pts = [packet.pts for packet in writer.handles[0].packets]
+        assert pts == [-0.3, -0.2, -0.1, 0.0], "a 3s horizon keeps every buffered keyframe"
+
+    async def test_a_per_camera_preroll_of_zero_gives_the_clip_no_lead_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Zero is an accepted value at both configuration edges (`Settings` declares
+        `ge=0`, `PATCH /cameras/{id}` accepts it), so it has to mean something rather
+        than crash: the clip starts at the escalation with no buffered history."""
+        patch_postroll(monkeypatch, seconds=60.0)
+        writer, scheduler, runner, preroll = self._preroll_camera(override=0.0)
+
+        for index in range(4):
+            preroll.append(history_packet(round(-0.3 + index / 10.0, 4)))
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        pts = [packet.pts for packet in writer.handles[0].packets]
+        assert pts == [0.0], "no lead-in: only the keyframe the escalation lands on"
+
+    @staticmethod
+    def _preroll_camera(
+        *, override: float | None
+    ) -> tuple[FakeClipWriter, VlmScheduler, CameraRunner, PreRollBuffer]:
+        """A camera whose source produces frames but no packets, so the only thing that
+        can reach the clip is the pre-roll flush.
+
+        Without that, the packet loop races the frame loop and the clip's contents
+        depend on which got further — which is exactly the ambiguity a test about how
+        much history a clip starts with must not have.
+        """
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        frames = [
+            FakeSource.make_frame("cam-1", index, index / 10.0, value=0 if index % 2 == 0 else 200)
+            for index in range(5)
+        ]
+        preroll = PreRollBuffer(preroll_seconds=3.0)
+        runner = make_runner(
+            source=FakeSource(frames, packets=[]),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            preroll=preroll,
+            clip_preroll_seconds=override,
+        )
+        return writer, scheduler, runner, preroll
+
+    async def test_a_camera_without_overrides_uses_the_profiles_summary_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=1.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher, maxsize=32)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=30, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            profile=self._summary_profile(interval=60.0),
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().escalations == 1, "one initial summary, then 60s of silence"
+
+    async def test_a_per_camera_summary_interval_overrides_the_profiles(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The profile asks for one summary a minute; this camera is told to look every
+        half second, and a 3s stream must produce several."""
+        patch_postroll(monkeypatch, seconds=1.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher, maxsize=32)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=30, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            profile=self._summary_profile(interval=60.0),
+            summary_interval_seconds=0.5,
+        )
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        telemetry = runner.telemetry()
+        assert telemetry.escalations >= 5, "0.5s apart across a 3s stream"
+        assert telemetry.escalations_dropped == 0
+        assert {event.reason.value for event in publisher.events} == {"periodic_summary"}
+
+    async def test_the_override_does_not_touch_the_rest_of_the_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`summary_interval_seconds` is the only profile field an edit may move — the
+        gate is part way through applying every other one, which is why `profile` is a
+        restart-required field."""
+        patch_postroll(monkeypatch, seconds=1.0)
+        publisher = FakePublisher()
+        base = self._summary_profile(interval=60.0)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=2, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=new_scheduler(publisher),
+            profile=base,
+            summary_interval_seconds=0.5,
+        )
+
+        effective = runner._profile
+        assert effective.summary_interval_seconds == 0.5
+        assert replace(effective, summary_interval_seconds=60.0) == base
+
+    @staticmethod
+    def _summary_profile(*, interval: float) -> CameraProfile:
+        """A profile on which PERIODIC_SUMMARY is the only trigger that can fire.
+
+        `scene_delta_frames` is set past the length of any stream here to silence the
+        scene-change trigger, which outranks the summary in `ALL_TRIGGERS` and would
+        otherwise claim the alternating source's every-frame delta and report its
+        reason instead. The cooldown and bucket are widened so the governors do not
+        decide the escalation count instead of the interval under test.
+        """
+        return CameraProfile(
+            camera_id="cam-1",
+            summary_interval_seconds=interval,
+            scene_delta_frames=10_000,
+            cooldown_seconds=0.05,
+            bucket_capacity=8,
+            bucket_refill_seconds=0.05,
+        )
+
+
+class TestALiveEditTakesEffectOnTheNextEscalation:
+    """`apply_metadata` on a running camera, for the three fields that are policy.
+
+    The contract is deliberately *not* "immediately": a clip already recording keeps
+    the length it started with, because recomputing an in-flight clip's deadline from
+    a new post-roll is how a clip ends up with impossible timestamps — a deadline
+    already behind the packets being written into it, or one moved past the end of
+    the stream that will record it.
+    """
+
+    async def test_an_edited_postroll_is_used_by_the_next_escalation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=60.0)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+        )
+        apply_policy(runner, clip_postroll_seconds=0.5)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert handle.packets[-1].pts == pytest.approx(0.5)
+
+    async def test_an_edit_reverting_to_null_restores_the_global(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`null` on the wire means "use the engine-wide default again", and it has to
+        reach the running camera as such — otherwise the only way to undo an override
+        is a restart."""
+        patch_postroll(monkeypatch, seconds=0.5)
+        writer = FakeClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            clip_postroll_seconds=60.0,
+        )
+        apply_policy(runner, clip_postroll_seconds=None)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        handle = writer.handles[0]
+        assert handle.finished is True, "the global post-roll must be back in force"
+        assert handle.packets[-1].pts == pytest.approx(0.5)
+
+    async def test_an_edit_mid_recording_leaves_the_open_clips_deadline_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The edit lands from inside the clip's own `append`, so it is unambiguously
+        mid-recording. An implementation that recomputed `_ActiveClip.deadline` would
+        cut this clip off at ~0.2s instead of the 1.0s it opened with.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = EditingClipWriter(after_packets=2)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+        )
+        writer.on_packet = lambda: apply_policy(runner, clip_postroll_seconds=0.2)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert writer.fired is True, "test setup: the edit must land while the clip records"
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert handle.packets[-1].pts == pytest.approx(1.0), (
+            "the clip must keep the post-roll it opened with, not the edited one"
+        )
+
+    async def test_an_edit_landing_while_the_clip_opens_does_not_split_the_escalation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_escalate` awaits `ClipWriter.open()` between the gate's decision and the
+        deadline it derives from it, so an edit genuinely can land inside one
+        escalation. The post-roll is read before that await, which is what keeps the
+        escalation whole: half on the policy the gate decided under and half on the
+        one that arrived a millisecond later is the outcome with no meaning.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        writer = EditingClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            clip_writer=writer,
+        )
+        writer.on_open = lambda: apply_policy(runner, clip_postroll_seconds=0.2)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().clip_postroll_seconds == 0.2, "test setup: the edit landed"
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert handle.packets[-1].pts == pytest.approx(1.0), (
+            "the clip's length is the one the escalation was decided under"
+        )
+
+    async def test_an_edited_summary_interval_reaches_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=1.0)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher, maxsize=32)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=30, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            profile=TestPerCameraClipAndSummaryOverrides._summary_profile(interval=60.0),
+        )
+        apply_policy(runner, summary_interval_seconds=0.5)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().escalations >= 5
+
+    async def test_an_edited_preroll_resizes_the_live_ring(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Re-sized, not replaced: the ring holds the history the next escalation will
+        want, and rebuilding it would throw that away to change one number."""
+        patch_postroll(monkeypatch, seconds=1.0)
+        preroll = PreRollBuffer(preroll_seconds=3.0)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=2, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=new_scheduler(FakePublisher()),
+            preroll=preroll,
+        )
+        preroll.append(history_packet(-0.2))
+
+        apply_policy(runner, clip_preroll_seconds=0.0)
+
+        assert preroll.preroll_seconds == 0.0
+        assert [packet.pts for packet in preroll.flush()] == [-0.2], "history is kept, not dropped"
+
+
+class TestTheWelfarePolicyOnTelemetry:
+    """`GET /cameras` is built from `CameraTelemetry`, so the per-camera welfare policy
+    has to ride on it or a console cannot read back what it just wrote."""
+
+    def _runner(
+        self,
+        *,
+        clip_preroll_seconds: float | None = None,
+        clip_postroll_seconds: float | None = None,
+        summary_interval_seconds: float | None = None,
+    ) -> CameraRunner:
+        return make_runner(
+            source=FakeSource.constant("cam-1", count=1),
+            detector=FakeDetector(script=[()]),
+            scheduler=new_scheduler(FakePublisher()),
+            clip_preroll_seconds=clip_preroll_seconds,
+            clip_postroll_seconds=clip_postroll_seconds,
+            summary_interval_seconds=summary_interval_seconds,
+        )
+
+    def test_an_unconfigured_camera_reports_the_loaders_defaults(self) -> None:
+        telemetry = self._runner().telemetry()
+        assert telemetry.notify_on == frozenset(ConcernKind)
+        assert telemetry.notify_min_confidence is Confidence.LIKELY
+        assert telemetry.clip_preroll_seconds is None
+        assert telemetry.clip_postroll_seconds is None
+        assert telemetry.summary_interval_seconds is None
+
+    def test_the_durations_are_reported_as_stored_not_as_resolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Null means "this camera follows the default", which is what `PATCH` stores
+        and what `CameraEditResponse` reports. Reporting the resolved 5.0 here instead
+        would make a console that re-submits what it read pin the camera to a value
+        nobody chose."""
+        patch_postroll(monkeypatch, seconds=5.0)
+        assert self._runner().telemetry().clip_postroll_seconds is None
+
+    def test_a_configured_camera_reports_its_overrides(self) -> None:
+        telemetry = self._runner(
+            clip_preroll_seconds=0.0,
+            clip_postroll_seconds=2.5,
+            summary_interval_seconds=90.0,
+        ).telemetry()
+        assert telemetry.clip_preroll_seconds == 0.0
+        assert telemetry.clip_postroll_seconds == 2.5
+        assert telemetry.summary_interval_seconds == 90.0
+
+    def test_a_live_edit_is_visible_on_the_very_next_read(self) -> None:
+        runner = self._runner()
+        apply_policy(
+            runner,
+            label="Wing B corridor",
+            zone=Zone.CORRIDOR,
+            notify_on=frozenset({ConcernKind.COLLAPSE}),
+            notify_min_confidence=Confidence.POSSIBLE,
+            clip_preroll_seconds=0.0,
+            clip_postroll_seconds=2.5,
+            summary_interval_seconds=90.0,
+        )
+
+        telemetry = runner.telemetry()
+        assert telemetry.label == "Wing B corridor"
+        assert telemetry.zone is Zone.CORRIDOR
+        assert telemetry.notify_on == frozenset({ConcernKind.COLLAPSE})
+        assert telemetry.notify_min_confidence is Confidence.POSSIBLE
+        assert telemetry.clip_preroll_seconds == 0.0
+        assert telemetry.clip_postroll_seconds == 2.5
+        assert telemetry.summary_interval_seconds == 90.0

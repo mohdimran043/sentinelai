@@ -93,6 +93,18 @@ class TestTheWriteEndpointIsDocumentedAsUnauthenticated:
         schema = openapi_document()["components"]["schemas"]["CameraEditResponse"]
         assert set(EDITABLE_FIELDS) <= set(schema["properties"])
 
+    def test_the_camera_list_covers_every_editable_field_too(self) -> None:
+        """`GET /cameras` is what a console renders when it has *not* just written —
+        on first load, after a restart, and on the read-only deployments where the
+        PATCH endpoint answers 403. A field readable only in an edit response is one a
+        console can never show until someone changes it."""
+        schema = openapi_document()["components"]["schemas"]["CameraStatus"]
+        assert set(EDITABLE_FIELDS) <= set(schema["properties"])
+        assert set(EDITABLE_FIELDS) - {"zone"} <= set(schema["required"]), (
+            "the engine always knows this camera's policy, so a client must not have "
+            "to treat it as optional"
+        )
+
 
 def test_the_stream_is_declared_as_an_event_stream_not_as_json() -> None:
     """A generated client that believes `/events/stream` returns

@@ -109,6 +109,40 @@ class CameraStatus(BaseModel):
             "separately, so the two cannot disagree. Null exactly when `zone` is null."
         ),
     )
+    notify_on: list[ConcernKind] = Field(
+        description=(
+            "The concern kinds this camera will notify a human about, as stored — "
+            "always the full list, never a diff, and sorted so two reads of the same "
+            "record compare equal. A camera whose file says nothing about `notify_on` "
+            "lists every kind, because that is what saying nothing means. `[]` means "
+            "this camera notifies nobody, which is a stored choice rather than an "
+            "unset field: **render it as muted, not as unconfigured.** Identical in "
+            "meaning to `CameraEditResponse.notify_on`, so a console can compare what "
+            "it wrote against what it later reads here."
+        )
+    )
+    notify_min_confidence: Confidence = Field(
+        description="The stored confidence threshold. Never null: a camera always has one."
+    )
+    clip_preroll_seconds: float | None = Field(
+        description=(
+            "The stored per-camera override, or null when this camera follows the "
+            "engine-wide default. **Null is the answer to 'what is stored', not a "
+            "report of the effective value** — the same meaning `CameraEditResponse` "
+            "gives it. A console that resolved it locally and then submitted what it "
+            "showed would pin the camera to a number nobody chose and opt it out of "
+            "any later change to the default."
+        )
+    )
+    clip_postroll_seconds: float | None = Field(
+        description="As `clip_preroll_seconds`: the stored override, or null for the default."
+    )
+    summary_interval_seconds: float | None = Field(
+        description=(
+            "The stored override, or null when this camera falls back to its "
+            "profile's `summary_interval_seconds`."
+        )
+    )
 
     @classmethod
     def from_telemetry(cls, telemetry: CameraTelemetry) -> CameraStatus:
@@ -127,6 +161,15 @@ class CameraStatus(BaseModel):
             discontinuities=telemetry.discontinuities,
             last_frame_at=telemetry.last_frame_at,
             last_escalation_at=telemetry.last_escalation_at,
+            # Sorted for the reason `CameraEditResponse.from_config` sorts it: the
+            # source is a frozenset, whose iteration order varies with the process's
+            # hash seed, and a console diffing two reads should not see a change that
+            # is not one.
+            notify_on=sorted(telemetry.notify_on),
+            notify_min_confidence=telemetry.notify_min_confidence,
+            clip_preroll_seconds=telemetry.clip_preroll_seconds,
+            clip_postroll_seconds=telemetry.clip_postroll_seconds,
+            summary_interval_seconds=telemetry.summary_interval_seconds,
         )
 
 

@@ -67,6 +67,13 @@ A clip only ever ends one of two ways: `finish()` at its deadline, or `abort()` 
 shutdown, or on a discontinuity, both of which leave it unable to be completed. It is
 never carried across a discontinuity, for the same reason the pre-roll is not.
 
+Its two lengths, and the gate's forced-look interval, are per camera: `cameras.json`
+may set `clip_preroll_seconds`, `clip_postroll_seconds` and `summary_interval_seconds`,
+and an unset one falls back to `Settings` (the clip lengths) or to the camera profile
+(the interval). All three are editable on a running camera through `apply_metadata`,
+which documents field by field when each new value is first read. The short version:
+on the next escalation. A clip already recording keeps the deadline it opened with.
+
 Deadlock analysis
 -----------------
 Three concurrent flows share one lock (`_clip_lock`) and one mailbox:
@@ -101,6 +108,7 @@ from sentinel_ai.config import get_settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, SceneState
 from sentinel_ai.domain.policy.escalation import GateState, decide, force
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
@@ -150,6 +158,43 @@ class CameraTelemetry:
     two to describe different sets of cameras. Defaulted so that every existing
     construction site keeps working and an ungrouped camera stays representable.
     """
+
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind)
+    """Which welfare concern kinds this camera notifies a human about.
+
+    Here for `zone`'s reason exactly — `GET /cameras` is built from this record, and a
+    console that can edit the policy has to be able to read it back — and carried, not
+    read, by this module: nothing in the frame loop branches on it. Routing is a later
+    task's, downstream of the published event.
+
+    Empty means "notify nobody about this camera", and that is a real, storable
+    instruction rather than an unconfigured field; see `CameraConfig.notify_on`.
+    """
+
+    notify_min_confidence: Confidence = Confidence.LIKELY
+    """The lowest confidence tier that may notify. Carried for the same reason and read
+    by the same nobody as `notify_on`."""
+
+    clip_preroll_seconds: float | None = None
+    """The camera's own pre-roll length, or None when it follows
+    `Settings.clip_preroll_seconds`.
+
+    **The stored override, not the resolved value.** None here means "this camera
+    follows the engine-wide default", which is the same answer `CameraEditResponse`
+    gives for the same field, so a console can compare what it wrote with what it
+    reads back. Reporting the resolved 3.0 instead would make a console that
+    re-submits the record it just read pin the camera to a number nobody chose, and
+    silently opt it out of any future change to the default.
+    """
+
+    clip_postroll_seconds: float | None = None
+    """The camera's own post-roll length, or None for `Settings.clip_postroll_seconds`.
+    Stored-not-resolved, as `clip_preroll_seconds`."""
+
+    summary_interval_seconds: float | None = None
+    """The camera's own forced-look interval, or None for the profile's. Stored-not-
+    resolved, as `clip_preroll_seconds` — and note the fallback here is the camera
+    profile rather than a setting."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +258,11 @@ class CameraRunner:
         preroll: PreRollBuffer,
         detect_every_n_frames: int = 1,
         zone: Zone | None = None,
+        notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
+        notify_min_confidence: Confidence = Confidence.LIKELY,
+        clip_preroll_seconds: float | None = None,
+        clip_postroll_seconds: float | None = None,
+        summary_interval_seconds: float | None = None,
     ) -> None:
         if detect_every_n_frames < 1:
             raise ValueError(f"detect_every_n_frames must be >= 1, got {detect_every_n_frames}")
@@ -223,20 +273,42 @@ class CameraRunner:
         # does not branch on it — a zone changes how a console groups a camera, not how
         # this loop watches one.
         self._zone = zone
+        # Carried for the same reason and read by the same nobody: welfare notification
+        # routing happens downstream of the published event, not in this loop.
+        self._notify_on = notify_on
+        self._notify_min_confidence = notify_min_confidence
         self._source = source
         self._detector = detector
         self._tracker = tracker
         self._motion = motion
-        self._profile = profile
+        # The file's profile, kept apart from `self._profile` (set below) because
+        # `summary_interval_seconds` overrides one field of it and reverting that
+        # override has to restore the profile's own value rather than a remembered
+        # copy of it. Everything else about the profile is restart-only.
+        self._base_profile = profile
         self._scheduler = scheduler
         self._clip_writer = clip_writer
         self._preroll = preroll
         self._detect_every_n_frames = detect_every_n_frames
 
-        # `clip_postroll_seconds` has no S11 constructor slot: it is a process-wide
-        # tuning value (S1), read once here rather than threaded through every
-        # `CameraRunner` construction site.
-        self._clip_postroll_seconds = get_settings().clip_postroll_seconds
+        # The three duration overrides, exactly as `cameras.json` stores them: `None`
+        # is "follow the default", and `telemetry()` reports them unresolved so the
+        # console reads back the record rather than the number in force. The resolved
+        # values live where they are used — on the pre-roll ring, in
+        # `_clip_postroll_seconds` and in `_profile` — and only this block and
+        # `apply_metadata` write either half, so the two cannot drift.
+        self._clip_preroll_override = clip_preroll_seconds
+        self._clip_postroll_override = clip_postroll_seconds
+        self._summary_interval_override = summary_interval_seconds
+        # The ring arrives already sized to the process-wide default by whoever built
+        # it (`main.compose`), so an absent override leaves it exactly as given rather
+        # than re-deriving a number the builder already knew. `apply_metadata` cannot
+        # do the same — by then the builder is long gone — and reads the default back
+        # from `get_settings()` instead.
+        if clip_preroll_seconds is not None:
+            preroll.preroll_seconds = clip_preroll_seconds
+        self._clip_postroll_seconds = self._resolved_postroll()
+        self._profile = self._resolved_profile()
 
         # Deferred to the first frame, which is the earliest point at which a time on
         # the only timeline this pipeline has is available. `_on_discontinuity`
@@ -307,25 +379,108 @@ class CameraRunner:
             now=now,
         )
 
-    def apply_metadata(self, *, label: str, zone: Zone | None) -> None:
-        """Change what this camera is *called* and where it is *grouped*, live.
-
-        Safe to do to a running camera precisely because neither field is policy:
-        the loop never branches on either (see `_zone`'s note in `__init__`), so no
-        decision already taken can be invalidated by changing them. They are read
-        at two points — `telemetry()` and `_escalate`'s request assembly — and both
-        are synchronous reads with no await between the read and its use, so an
-        edit lands wholly before or wholly after an escalation and can never split
-        one.
+    def apply_metadata(
+        self,
+        *,
+        label: str,
+        zone: Zone | None,
+        notify_on: frozenset[ConcernKind],
+        notify_min_confidence: Confidence,
+        clip_preroll_seconds: float | None,
+        clip_postroll_seconds: float | None,
+        summary_interval_seconds: float | None,
+    ) -> None:
+        """Apply an already-persisted edit of this camera's record to the running
+        camera. **The new values take effect on the next escalation, never
+        retroactively.**
 
         Whole-record rather than per-field on purpose: the caller has just read the
-        persisted record, and passing both keeps "apply what the file now says" a
-        single statement instead of two conditionals that could apply one and skip
-        the other. `url` and `profile` have no equivalent here and must not grow
-        one — see `adapters/config/camera_file.py`.
+        persisted record back, and passing all of it keeps "apply what the file now
+        says" a single statement instead of seven conditionals that could apply some
+        and skip others. `url` and `profile` have no equivalent here and must not
+        grow one — see `adapters/config/camera_file.py`.
+
+        Safety, field by field. Every read below is a synchronous attribute read of a
+        value this method replaces wholesale, and this method is itself synchronous
+        and runs on the event loop (`main.ComposedService.update_camera` awaits the
+        store and then calls straight through), so no read can observe a half-applied
+        edit. What differs between the fields is *when* the new value is first read:
+
+        * `label` and `zone` are not policy at all. The loop never branches on
+          either; they are read by `telemetry()` and by `_escalate`'s request
+          assembly, and either read simply returns whichever value is current.
+        * `notify_on` and `notify_min_confidence` are policy, but not *this*
+          component's: nothing here branches on them. They are carried to
+          `telemetry()` so the console can read back what it wrote, and consumed
+          downstream of the published event.
+        * `summary_interval_seconds` is read by the gate, once per frame, inside
+          `decide()`. Swapping `_profile` between frames is safe because no gate
+          state is derived from the interval: `GateState` remembers *when* the last
+          summary happened, and `periodic_summary` compares that against whatever
+          interval is current. So a shortened interval can make the next frame due
+          for a summary and a lengthened one can make an already-due camera wait —
+          which is what an operator asking for a different interval means — and
+          neither invalidates a decision already taken.
+        * `clip_postroll_seconds` is read once per escalation, in `_escalate`,
+          before its first await, and written into `_ActiveClip.deadline`. **An
+          in-flight clip keeps the deadline it opened with**: nothing recomputes it,
+          because a deadline moved backwards past packets already written lands in
+          the clip's own past, and one moved forwards past the end of the stream
+          leaves the recording to be aborted instead of finished. A second
+          escalation while that clip is still recording extends the deadline, and
+          *that* extension uses the new value — it is the next escalation.
+        * `clip_preroll_seconds` is the one duration read *after* an await: the ring's
+          horizon is read inside `flush()`, which `_escalate` calls after opening the
+          clip. An edit landing in that window gives the clip a lead-in somewhere
+          between the old and the new length, and cannot do worse than that —
+          `flush()` only ever returns already-buffered packets, all of them older
+          than the escalation, so every reachable outcome is a valid clip. Narrowing
+          the horizon takes effect on the next `append`; widening it takes effect as
+          the ring refills, since packets already evicted are gone (see
+          `PreRollBuffer.preroll_seconds`).
         """
         self._camera_label = label
         self._zone = zone
+        self._notify_on = notify_on
+        self._notify_min_confidence = notify_min_confidence
+        self._clip_preroll_override = clip_preroll_seconds
+        self._clip_postroll_override = clip_postroll_seconds
+        self._summary_interval_override = summary_interval_seconds
+        self._preroll.preroll_seconds = (
+            get_settings().clip_preroll_seconds
+            if clip_preroll_seconds is None
+            else clip_preroll_seconds
+        )
+        self._clip_postroll_seconds = self._resolved_postroll()
+        self._profile = self._resolved_profile()
+
+    def _resolved_postroll(self) -> float:
+        """The per-camera post-roll if set, else the process-wide default.
+
+        `Settings` rather than a constructor slot for the default: it is a
+        process-wide tuning value (S1), and reading it here is what lets an edit that
+        reverts the override to `None` restore it without the runner having to
+        remember what it was built with.
+        """
+        if self._clip_postroll_override is not None:
+            return self._clip_postroll_override
+        return get_settings().clip_postroll_seconds
+
+    def _resolved_profile(self) -> CameraProfile:
+        """`_base_profile`, with `summary_interval_seconds` replaced when the camera
+        overrides it.
+
+        A copy rather than a mutation because `CameraProfile` is frozen, and only
+        this one field because it is the only one `cameras.json` lets an operator
+        change without a restart — the gate is part-way through applying every other
+        one. `dataclasses.replace` re-runs `__post_init__`, so an interval of zero or
+        below cannot get this far; both configuration edges already refuse it (`> 0`
+        in `load_cameras` and in `CameraEditRequest`), which is what makes this
+        method total rather than fallible.
+        """
+        if self._summary_interval_override is None:
+            return self._base_profile
+        return replace(self._base_profile, summary_interval_seconds=self._summary_interval_override)
 
     def telemetry(self) -> CameraTelemetry:
         return CameraTelemetry(
@@ -340,6 +495,13 @@ class CameraRunner:
             last_frame_at=self._last_frame_at,
             last_escalation_at=self._last_escalation_at,
             zone=self._zone,
+            notify_on=self._notify_on,
+            notify_min_confidence=self._notify_min_confidence,
+            # The stored overrides, not the resolved values — see the field docstrings
+            # on `CameraTelemetry`.
+            clip_preroll_seconds=self._clip_preroll_override,
+            clip_postroll_seconds=self._clip_postroll_override,
+            summary_interval_seconds=self._summary_interval_override,
         )
 
     # -- stage 1: frame arrival, with backpressure -----------------------------------
@@ -497,6 +659,15 @@ class CameraRunner:
         history = tuple(self._history)
         self._history.append(detail)
         self._last_escalation_at = now
+        # Read here, before the first await, so this escalation runs on the policy that
+        # was in force when it was decided: `decide()` has just read `_profile` and
+        # returns to this method without suspending, and the deadline below has to be
+        # the post-roll the operator had configured at that instant. `apply_metadata`
+        # can land during the clip-open await otherwise, and an escalation half on the
+        # old policy and half on the new one is the one outcome with no defensible
+        # meaning. See `apply_metadata` for the field-by-field argument.
+        profile = self._profile
+        postroll_seconds = self._clip_postroll_seconds
 
         def request_with(clip: ClipHandle | None) -> EscalationRequest:
             return EscalationRequest(
@@ -506,7 +677,7 @@ class CameraRunner:
                 detail=detail,
                 scene=scene,
                 keyframe=keyframe,
-                profile=self._profile,
+                profile=profile,
                 camera_label=self._camera_label,
                 history=history,
                 clip=clip,
@@ -552,7 +723,7 @@ class CameraRunner:
                     return event_id
                 self._active_clip = _ActiveClip(
                     handle=handle,
-                    deadline=now + self._clip_postroll_seconds,
+                    deadline=now + postroll_seconds,
                     request=request_with(handle),
                 )
             else:
@@ -560,9 +731,11 @@ class CameraRunner:
                 # second, overlapping one (spec §5.5). This escalation still gets its
                 # own event — just no clip of its own, since a `ClipHandle` may only
                 # ever be finished once, and only after its window has actually closed.
-                self._active_clip = replace(
-                    self._active_clip, deadline=now + self._clip_postroll_seconds
-                )
+                # The extension uses *this* escalation's post-roll, which is the point
+                # of "the next escalation": an edit that landed after the clip opened
+                # lengthens or shortens the window from here, without ever moving the
+                # deadline the clip already had out from under the packets in it.
+                self._active_clip = replace(self._active_clip, deadline=now + postroll_seconds)
                 self._submit(request_with(None))
         return event_id
 

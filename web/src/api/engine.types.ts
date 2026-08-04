@@ -404,6 +404,16 @@ export interface components {
         CameraStatus: {
             /** Camera Id */
             camera_id: string;
+            /**
+             * Clip Postroll Seconds
+             * @description As `clip_preroll_seconds`: the stored override, or null for the default.
+             */
+            clip_postroll_seconds: number | null;
+            /**
+             * Clip Preroll Seconds
+             * @description The stored per-camera override, or null when this camera follows the engine-wide default. **Null is the answer to 'what is stored', not a report of the effective value** — the same meaning `CameraEditResponse` gives it. A console that resolved it locally and then submitted what it showed would pin the camera to a number nobody chose and opt it out of any later change to the default.
+             */
+            clip_preroll_seconds: number | null;
             /** Detections Run */
             detections_run: number;
             /** Discontinuities */
@@ -425,6 +435,18 @@ export interface components {
             last_escalation_at: number | null;
             /** Last Frame At */
             last_frame_at: number | null;
+            /** @description The stored confidence threshold. Never null: a camera always has one. */
+            notify_min_confidence: components["schemas"]["Confidence"];
+            /**
+             * Notify On
+             * @description The concern kinds this camera will notify a human about, as stored — always the full list, never a diff, and sorted so two reads of the same record compare equal. A camera whose file says nothing about `notify_on` lists every kind, because that is what saying nothing means. `[]` means this camera notifies nobody, which is a stored choice rather than an unset field: **render it as muted, not as unconfigured.** Identical in meaning to `CameraEditResponse.notify_on`, so a console can compare what it wrote against what it later reads here.
+             */
+            notify_on: components["schemas"]["ConcernKind"][];
+            /**
+             * Summary Interval Seconds
+             * @description The stored override, or null when this camera falls back to its profile's `summary_interval_seconds`.
+             */
+            summary_interval_seconds: number | null;
             /** @description Which space this camera watches — the field cameras are grouped by. Null means ungrouped: nobody has assigned this camera a zone. Null is not a group; do not render it as one alongside the real zones. */
             zone?: components["schemas"]["Zone"] | null;
             /** @description The coarse grouping `zone` falls into, derived from it and never stored separately, so the two cannot disagree. Null exactly when `zone` is null. */

@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from uuid import UUID
 
+from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry
@@ -297,8 +298,20 @@ class EngineService:
     def telemetry(self, camera_id: str) -> CameraTelemetry:
         return self._get_runner(camera_id).telemetry()
 
-    def update_camera_metadata(self, camera_id: str, *, label: str, zone: Zone | None) -> None:
-        """Apply an already-persisted label/zone change to a running camera.
+    def update_camera_metadata(
+        self,
+        camera_id: str,
+        *,
+        label: str,
+        zone: Zone | None,
+        notify_on: frozenset[ConcernKind],
+        notify_min_confidence: Confidence,
+        clip_preroll_seconds: float | None,
+        clip_postroll_seconds: float | None,
+        summary_interval_seconds: float | None,
+    ) -> None:
+        """Apply an already-persisted change of a camera's editable record to the
+        running camera.
 
         Deliberately knows nothing about `cameras.json`: this service owns running
         cameras, not the record of configured ones, and the caller that owns both
@@ -306,10 +319,24 @@ class EngineService:
         before this call. Keeping the file out of here is what stops a future
         change from making an in-memory edit that never reaches disk.
 
-        Synchronous and total — `CameraRunner.apply_metadata` cannot fail — so
-        there is no partial-application case for a caller to unwind.
+        The whole editable record rather than a diff, for the reason
+        `CameraRunner.apply_metadata` gives: the caller has just read the persisted
+        record back, and applying all of it cannot leave some fields applied and
+        others not.
+
+        Synchronous and total — `apply_metadata` performs attribute writes and one
+        `dataclasses.replace` over values both configuration edges have already
+        validated — so there is no partial-application case for a caller to unwind.
         """
-        self._get_runner(camera_id).apply_metadata(label=label, zone=zone)
+        self._get_runner(camera_id).apply_metadata(
+            label=label,
+            zone=zone,
+            notify_on=notify_on,
+            notify_min_confidence=notify_min_confidence,
+            clip_preroll_seconds=clip_preroll_seconds,
+            clip_postroll_seconds=clip_postroll_seconds,
+            summary_interval_seconds=summary_interval_seconds,
+        )
 
     def event_history(self, camera_id: str) -> CameraEventHistory:
         """The console's bounded, volatile view of what this camera recently produced.

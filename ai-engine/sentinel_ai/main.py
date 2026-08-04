@@ -102,6 +102,7 @@ from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.app import create_app
 from sentinel_ai.config import Settings, get_settings
+from sentinel_ai.domain.welfare import ConcernKind
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
@@ -431,6 +432,18 @@ def compose(
             preroll=PreRollBuffer(preroll_seconds=settings.clip_preroll_seconds),
             detect_every_n_frames=settings.detect_every_n_frames,
             zone=config.zone,
+            # The per-camera welfare policy, passed as stored rather than resolved:
+            # `None` means "follow the engine-wide default", and `CameraRunner` is what
+            # turns that into a number — so a camera whose file says nothing keeps
+            # getting whatever the settings say, and one whose override is reverted at
+            # runtime gets the setting back rather than the value it booted with. The
+            # ring above is the one exception, built at the default and narrowed by the
+            # runner when this camera overrides it.
+            notify_on=config.notify_on,
+            notify_min_confidence=config.notify_min_confidence,
+            clip_preroll_seconds=config.clip_preroll_seconds,
+            clip_postroll_seconds=config.clip_postroll_seconds,
+            summary_interval_seconds=config.summary_interval_seconds,
         )
         for config in cameras
     }
@@ -463,6 +476,19 @@ def compose(
         # console must not silently overwrite what they wrote.
         camera_store=CameraFileStore(Path(settings.cameras_file)),
     )
+
+
+def _rendered_kinds(kinds: frozenset[ConcernKind]) -> str:
+    """`notify_on` as a stable, unambiguous string for the audit log below.
+
+    Sorted, because `frozenset` iteration order follows the process's hash seed and an
+    audit line that renders the same policy differently on every run cannot be compared
+    with the one before it — the same reason `edited_document` writes the field sorted.
+    Bracketed, because the empty set is the "notify nobody" instruction rather than an
+    absent value, and unbracketed it would render as nothing at all between the `=` and
+    the `->` and read as a field the log forgot.
+    """
+    return f"[{','.join(sorted(kinds))}]"
 
 
 class ComposedService:
@@ -597,7 +623,7 @@ class ComposedService:
              wherever the file's normalisation differs from what was asked for.
 
         A failure in (2) therefore leaves the system exactly as it was, and a
-        success in (2) is always followed by (3) — the apply is two attribute
+        success in (2) is always followed by (3) — the apply is a run of attribute
         writes on an object already proven to exist, with no await between them, so
         there is no window where the file has moved and the camera has not.
         """
@@ -606,21 +632,43 @@ class ComposedService:
         before = self._composition.service.telemetry(camera_id)
         record = await self._composition.camera_store.apply(camera_id, edit)
         self._composition.service.update_camera_metadata(
-            camera_id, label=record.label, zone=record.zone
+            camera_id,
+            label=record.label,
+            zone=record.zone,
+            notify_on=record.notify_on,
+            notify_min_confidence=record.notify_min_confidence,
+            clip_preroll_seconds=record.clip_preroll_seconds,
+            clip_postroll_seconds=record.clip_postroll_seconds,
+            summary_interval_seconds=record.summary_interval_seconds,
         )
-        # Old value logged alongside the new one: this endpoint is unauthenticated
-        # (see the module docstring), so the log line is the only record of what a
-        # camera used to be called or where it used to be grouped once the write
-        # above overwrites both in the file. Without it, an anonymous caller could
-        # rename a camera to something misleading and nobody could reconstruct what
-        # the console said about that location a minute earlier.
+        # Old value logged alongside the new one, for every field this endpoint can
+        # change: this endpoint is unauthenticated (see the module docstring), so the
+        # log line is the only record of what a camera used to be once the write above
+        # overwrites it in the file. Without it, an anonymous caller could rename a
+        # camera to something misleading and nobody could reconstruct what the console
+        # said about that location a minute earlier — and, since Task 8, could mute a
+        # camera's welfare notifications with even less trace, because a camera that
+        # has stopped telling anyone about a collapse looks exactly like a camera with
+        # nothing to report.
         logger.info(
-            "camera %s reconfigured: label=%r->%r zone=%s->%s",
+            "camera %s reconfigured: label=%r->%r zone=%s->%s notify_on=%s->%s "
+            "notify_min_confidence=%s->%s clip_preroll_seconds=%s->%s "
+            "clip_postroll_seconds=%s->%s summary_interval_seconds=%s->%s",
             camera_id,
             before.label,
             record.label,
             before.zone,
             record.zone,
+            _rendered_kinds(before.notify_on),
+            _rendered_kinds(record.notify_on),
+            before.notify_min_confidence,
+            record.notify_min_confidence,
+            before.clip_preroll_seconds,
+            record.clip_preroll_seconds,
+            before.clip_postroll_seconds,
+            record.clip_postroll_seconds,
+            before.summary_interval_seconds,
+            record.summary_interval_seconds,
         )
         return record
 

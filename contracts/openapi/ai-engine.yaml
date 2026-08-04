@@ -253,6 +253,22 @@ components:
         camera_id:
           title: Camera Id
           type: string
+        clip_postroll_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: 'As `clip_preroll_seconds`: the stored override, or null for the default.'
+          title: Clip Postroll Seconds
+        clip_preroll_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: "The stored per-camera override, or null when this camera follows the engine-wide\
+            \ default. **Null is the answer to 'what is stored', not a report of the effective value**\
+            \ \u2014 the same meaning `CameraEditResponse` gives it. A console that resolved it locally\
+            \ and then submitted what it showed would pin the camera to a number nobody chose and opt\
+            \ it out of any later change to the default."
+          title: Clip Preroll Seconds
         detections_run:
           title: Detections Run
           type: integer
@@ -287,6 +303,27 @@ components:
           - type: number
           - type: 'null'
           title: Last Frame At
+        notify_min_confidence:
+          $ref: '#/components/schemas/Confidence'
+          description: 'The stored confidence threshold. Never null: a camera always has one.'
+        notify_on:
+          description: "The concern kinds this camera will notify a human about, as stored \u2014 always\
+            \ the full list, never a diff, and sorted so two reads of the same record compare equal. A\
+            \ camera whose file says nothing about `notify_on` lists every kind, because that is what\
+            \ saying nothing means. `[]` means this camera notifies nobody, which is a stored choice rather\
+            \ than an unset field: **render it as muted, not as unconfigured.** Identical in meaning to\
+            \ `CameraEditResponse.notify_on`, so a console can compare what it wrote against what it later\
+            \ reads here."
+          items:
+            $ref: '#/components/schemas/ConcernKind'
+          title: Notify On
+          type: array
+        summary_interval_seconds:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: The stored override, or null when this camera falls back to its profile's `summary_interval_seconds`.
+          title: Summary Interval Seconds
         zone:
           anyOf:
           - $ref: '#/components/schemas/Zone'
@@ -311,6 +348,11 @@ components:
       - discontinuities
       - last_frame_at
       - last_escalation_at
+      - notify_on
+      - notify_min_confidence
+      - clip_preroll_seconds
+      - clip_postroll_seconds
+      - summary_interval_seconds
       title: CameraStatus
       type: object
     CamerasResponse:

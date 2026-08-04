@@ -123,20 +123,28 @@ class _FakeEngineService:
             url="rtsp://host/stream",
             profile=CameraProfile(camera_id=camera_id),
             zone=current.zone if edit.zone is UNSET else edit.zone,
-            # The welfare policy has no "current" here to fall back to: it is not on
-            # `CameraTelemetry` (Task 9 puts it there), so an unmentioned field lands
-            # on `CameraConfig`'s own default, which is what a camera the file says
-            # nothing about would load as anyway.
+            # The welfare policy rides on `CameraTelemetry` too, so an unmentioned
+            # field falls back to what the camera already has, exactly as the real
+            # store's re-parse of the edited document does.
             **{
-                name: getattr(edit, name)
+                name: (
+                    getattr(current, name) if getattr(edit, name) is UNSET else getattr(edit, name)
+                )
                 for name in _WELFARE_POLICY_FIELDS
-                if getattr(edit, name) is not UNSET
             },
         )
 
 
 def _telemetry(
-    camera_id: str = "cam-1", *, zone: Zone | None = None, label: str | None = None
+    camera_id: str = "cam-1",
+    *,
+    zone: Zone | None = None,
+    label: str | None = None,
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
+    notify_min_confidence: Confidence = Confidence.LIKELY,
+    clip_preroll_seconds: float | None = None,
+    clip_postroll_seconds: float | None = None,
+    summary_interval_seconds: float | None = None,
 ) -> CameraTelemetry:
     return CameraTelemetry(
         camera_id=camera_id,
@@ -150,6 +158,11 @@ def _telemetry(
         last_frame_at=12.5,
         last_escalation_at=10.0,
         zone=zone,
+        notify_on=notify_on,
+        notify_min_confidence=notify_min_confidence,
+        clip_preroll_seconds=clip_preroll_seconds,
+        clip_postroll_seconds=clip_postroll_seconds,
+        summary_interval_seconds=summary_interval_seconds,
     )
 
 
@@ -207,7 +220,67 @@ def test_camera_telemetry_returns_the_expected_shape() -> None:
         "last_escalation_at": 10.0,
         "zone": None,
         "zone_kind": None,
+        "notify_on": ["altercation", "collapse", "distress", "medication", "other", "self_harm"],
+        "notify_min_confidence": "likely",
+        "clip_preroll_seconds": None,
+        "clip_postroll_seconds": None,
+        "summary_interval_seconds": None,
     }
+
+
+class TestTheWelfarePolicyOnTheCameraList:
+    """The read side of `PATCH /cameras/{id}`'s welfare fields.
+
+    Without it, Task 11's read-only camera record has nothing to render and every
+    edit is invisible until the engine restarts — the endpoint would accept a change
+    the console could never confirm.
+    """
+
+    def test_the_camera_list_carries_the_stored_policy(self) -> None:
+        service = _FakeEngineService(
+            cameras=(
+                _telemetry(
+                    "cam-1",
+                    notify_on=frozenset({ConcernKind.COLLAPSE, ConcernKind.DISTRESS}),
+                    notify_min_confidence=Confidence.POSSIBLE,
+                    clip_preroll_seconds=0.0,
+                    clip_postroll_seconds=2.5,
+                    summary_interval_seconds=90.0,
+                ),
+            )
+        )
+        with TestClient(create_app(service)) as client:
+            (camera,) = client.get("/cameras").json()["cameras"]
+
+        # Sorted, exactly as `CameraEditResponse` sorts it: a console diffing what it
+        # wrote against what it reads back must not see a change that is not one.
+        assert camera["notify_on"] == ["collapse", "distress"]
+        assert camera["notify_min_confidence"] == "possible"
+        assert camera["clip_preroll_seconds"] == 0.0
+        assert camera["clip_postroll_seconds"] == 2.5
+        assert camera["summary_interval_seconds"] == 90.0
+
+    def test_an_empty_notify_on_is_a_muted_camera_not_a_missing_field(self) -> None:
+        """`[]` is the "never notify" instruction `PATCH` accepts, so it has to come
+        back as `[]` rather than as the every-kind default — a console that could not
+        tell the two apart would show a muted camera as fully armed."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1", notify_on=frozenset()),))
+        with TestClient(create_app(service)) as client:
+            (camera,) = client.get("/cameras").json()["cameras"]
+
+        assert camera["notify_on"] == []
+
+    def test_the_durations_report_what_is_stored_not_what_is_in_force(self) -> None:
+        """Null means "this camera follows the engine-wide default", the same answer
+        `CameraEditResponse` gives. Resolving it here would make a console that
+        re-submits what it read pin the camera to a value nobody chose."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        with TestClient(create_app(service)) as client:
+            (camera,) = client.get("/cameras").json()["cameras"]
+
+        assert camera["clip_preroll_seconds"] is None
+        assert camera["clip_postroll_seconds"] is None
+        assert camera["summary_interval_seconds"] is None
 
 
 class TestCameraZone:

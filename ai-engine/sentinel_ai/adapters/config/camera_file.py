@@ -13,13 +13,27 @@ The document shape is unchanged and documented in `main`'s own docstring and in
 What may be edited, and what may not
 ------------------------------------
 `EDITABLE_FIELDS` is the list: `label`, `zone`, and the five per-camera welfare
-policy fields. None of them changes how a frame is processed. `label` and `zone`
-are metadata that `CameraRunner` carries so `telemetry()` and the assembled event
-can report them, so changing one is an attribute write on a live object and the
-next frame is unaffected; the welfare fields decide what a *notification* does
-with an already-assembled concern, which is downstream of the pipeline entirely.
-That is why they are editable where `profile` — the policy the escalation gate is
-part-way through applying — is not.
+policy fields. What they have in common is not that they are inert — three of them
+are genuinely policy — but that changing one can never invalidate a decision the
+pipeline has already taken:
+
+* `label` and `zone` are metadata that `CameraRunner` carries so `telemetry()` and
+  the assembled event can report them. The loop never branches on either, so
+  changing one is an attribute write on a live object and the next frame is
+  unaffected.
+* `notify_on` and `notify_min_confidence` decide what a *notification* does with
+  an already-assembled concern, which is downstream of the pipeline entirely.
+* `clip_preroll_seconds`, `clip_postroll_seconds` and `summary_interval_seconds`
+  **are** read by the running camera — the gate compares the interval every frame
+  and the clip lengths shape every recording. They are still editable because each
+  is read afresh at the point it is used and nothing is derived from an earlier
+  reading: a clip already recording keeps the deadline it opened with, and the new
+  values apply from the next escalation. `CameraRunner.apply_metadata` states that
+  argument field by field, and is the place to check it if any of these grows a
+  second reader.
+
+`profile` — the policy the escalation gate is part-way through applying — is the
+case where that does not hold, which is why it is not editable.
 
 `url` and `profile` are deliberately **not** editable through this store.
 
@@ -169,12 +183,16 @@ class CameraConfig:
     clip_preroll_seconds: float | None = None
     """Seconds of buffered video to include before a notified concern's
     keyframe. `None` means use the process-wide default
-    (`Settings.clip_preroll_seconds`); a later task reads this."""
+    (`Settings.clip_preroll_seconds`); `CameraRunner` resolves that.
+
+    `0.0` is a real value meaning "no lead-in", not a disabled field — see
+    `adapters/sources/preroll.py`, which has to accept it because this edge and
+    the API edge both do."""
 
     clip_postroll_seconds: float | None = None
     """Seconds of video to keep recording after a notified concern's keyframe.
     `None` means use the process-wide default
-    (`Settings.clip_postroll_seconds`); a later task reads this."""
+    (`Settings.clip_postroll_seconds`); `CameraRunner` resolves that."""
 
     summary_interval_seconds: float | None = None
     """How often this camera's periodic summary runs, in seconds. `None` means
@@ -184,8 +202,10 @@ class CameraConfig:
     `profile.summary_interval_seconds` — the two look redundant, but they are
     not: `profile` is in `RESTART_REQUIRED_FIELDS` and cannot change without
     tearing down the camera runner (see this module's docstring), while this
-    field is meant to become runtime-editable. Do not fold them together;
-    that would take away the one thing this duplication buys."""
+    field is runtime-editable. `CameraRunner` composes the two by copying the
+    profile with this value substituted, so the override wins where both are
+    set and reverting it to `None` restores the profile's own. Do not fold them
+    together; that would take away the one thing this duplication buys."""
 
 
 class _Unset(Enum):

@@ -18,6 +18,13 @@ function makeCamera(overrides: Partial<CameraStatus> = {}): CameraStatus {
     discontinuities: 0,
     last_frame_at: null,
     last_escalation_at: null,
+    // The welfare policy an unconfigured camera loads with: every concern kind,
+    // the stronger tier, and null durations meaning "follow the engine default".
+    notify_on: ['collapse', 'altercation', 'self_harm', 'medication', 'distress', 'other'],
+    notify_min_confidence: 'likely',
+    clip_preroll_seconds: null,
+    clip_postroll_seconds: null,
+    summary_interval_seconds: null,
     ...overrides,
   }
 }
