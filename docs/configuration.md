@@ -188,10 +188,16 @@ credentials in them.
 
 ### This file is written as well as read
 
-With `SENTINEL_ENABLE_CAMERA_WRITES=true`, `PATCH /cameras/{id}` edits `label`
-and `zone` **in this file** — write-then-rename, with the whole document
-re-validated before anything is written. Consequences worth knowing:
+With `SENTINEL_ENABLE_CAMERA_WRITES=true`, `PATCH /cameras/{id}` edits `label`,
+`zone` and the per-camera welfare policy (`notify_on`,
+`notify_min_confidence`, `clip_preroll_seconds`, `clip_postroll_seconds`,
+`summary_interval_seconds`) **in this file** — write-then-rename, with the whole
+document re-validated before anything is written. Consequences worth knowing:
 
+- The welfare-policy fields are written and **survive a restart**, but are not
+  yet honoured by the running pipeline. So an edit to them is not a no-op that
+  can be left lying around: `notify_on: []` looks like it did nothing today and
+  mutes that camera from the moment a later version starts reading these.
 - Comment keys (`_comment`, `_note`), profiles, URLs, other cameras and any
   field a later version adds are all preserved; the file is edited, not
   regenerated. Formatting is normalised to 2-space JSON, so expect a reflow on

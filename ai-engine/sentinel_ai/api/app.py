@@ -57,8 +57,14 @@ async def _render_validation_error(_: Request, exc: RequestValidationError) -> J
     """
     return JSONResponse(
         # The same 422 FastAPI's own handler sends, spelled as an integer because
-        # Starlette's constant for it is mid-rename and deprecated under both names
-        # at some point in the version range this runs on.
+        # importing Starlette's constant for it is a test failure: on the pinned
+        # 1.3.1 the old `HTTP_422_UNPROCESSABLE_ENTITY` raises
+        # `StarletteDeprecationWarning` on import *and* on attribute access, and
+        # this suite runs under `filterwarnings = ["error"]`, so a module that
+        # names it does not even collect. The replacement
+        # (`HTTP_422_UNPROCESSABLE_CONTENT`) is not deprecated, but pinning to it
+        # buys nothing over the literal and `routes.py` spells its statuses as
+        # bare ints throughout.
         status_code=422,
         content={"detail": jsonable_encoder(_with_non_finite_floats_nulled(exc.errors()))},
     )

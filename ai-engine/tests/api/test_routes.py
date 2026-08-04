@@ -905,7 +905,7 @@ class TestCameraWelfarePolicyEdit:
 class TestValidationErrorRendering:
     """`create_app`'s `RequestValidationError` handler, which is app-wide and
     therefore owns the 422 body of *every* endpoint, not just the one that needed
-    it. Both properties below are the reason it can be there at all."""
+    it. The properties below are the reason it can be there at all."""
 
     def app(self) -> TestClient:
         service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
@@ -952,6 +952,68 @@ class TestValidationErrorRendering:
                     "loc": ["body", "clip_preroll_seconds"],
                     "msg": "Input should be a finite number",
                     "input": None,
+                }
+            ]
+        }
+
+    def test_a_non_finite_inside_the_echoed_input_is_nulled_too(self) -> None:
+        """The property the whole handler turns on, and the one a plausible
+        simplification loses: the offending float is not always *at* `input`, it can
+        be anywhere inside it. A list where a float belongs makes pydantic echo the
+        list back, so the infinity is one level down and a sanitiser that only
+        checks whether `input` is itself a non-finite float leaves it there — a 500,
+        with every other test in this file still green. Hence the recursive walk in
+        `_with_non_finite_floats_nulled`."""
+        with self.app() as client:
+            response = client.patch(
+                "/cameras/cam-1",
+                content='{"clip_preroll_seconds": [1e999]}',
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "float_type",
+                    "loc": ["body", "clip_preroll_seconds"],
+                    "msg": "Input should be a valid number",
+                    "input": [None],
+                }
+            ]
+        }
+
+    def test_a_non_finite_reaches_the_body_through_a_field_that_is_not_a_float(self) -> None:
+        """Nothing about this is specific to the duration fields that motivated the
+        handler. `notify_on` takes an enum, and an infinity in the array is rejected
+        by the enum check — but it is still echoed back, so the 422 is still
+        unrenderable without the handler. This is the general shape of the bug: any
+        field of any type, on any endpoint, because JSON can carry a non-finite
+        float into any of them."""
+        with self.app() as client:
+            response = client.patch(
+                "/cameras/cam-1",
+                content='{"notify_on": [1e999]}',
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "enum",
+                    "loc": ["body", "notify_on", 0],
+                    "msg": (
+                        "Input should be 'collapse', 'altercation', 'self_harm', "
+                        "'medication', 'distress' or 'other'"
+                    ),
+                    "input": None,
+                    "ctx": {
+                        "expected": (
+                            "'collapse', 'altercation', 'self_harm', 'medication', "
+                            "'distress' or 'other'"
+                        )
+                    },
                 }
             ]
         }
