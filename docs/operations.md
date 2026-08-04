@@ -107,6 +107,7 @@ What the endpoint will and will not change:
 |---|---|---|
 | `label` | **Yes** — applied live, written to `cameras.json` | Metadata. Nothing in the pipeline branches on it |
 | `zone` | **Yes** — same. `null` ungroups; omitting the field leaves the grouping alone | Metadata. Changes how a console groups a camera, not how the engine watches one |
+| `notify_on`, `notify_min_confidence`, `clip_preroll_seconds`, `clip_postroll_seconds`, `summary_interval_seconds` | **Yes** — written to `cameras.json` and **survive a restart**. Not yet honoured by the running pipeline | The per-camera welfare policy. Note the gap: an anonymous caller can write `notify_on: []` today, nothing changes today, and the camera is muted from the moment the pipeline starts reading these — which is why they belong in this table now rather than when they take effect |
 | `url` | **No — restart required** | Changing the source means tearing down the running `CameraRunner`, its pre-roll buffer and any clip mid-recording, and building a new source. Separately, an RTSP URL routinely carries credentials, so an unauthenticated API neither accepts nor returns it |
 | `profile` | **No — restart required** | It is the escalation policy the gate is part-way through applying (cooldowns, a token bucket with live state) |
 

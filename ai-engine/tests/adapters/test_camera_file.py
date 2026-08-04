@@ -722,11 +722,11 @@ class TestTheWelfarePolicyIsEditable:
         assert path.read_text(encoding="utf-8") == before
 
     async def test_a_non_finite_duration_never_reaches_the_file(self, tmp_path: Path) -> None:
-        """The one bound the API layer does not mirror, so this is the only thing
-        standing between `1e999` in a hand-rolled request body and a `cameras.json`
-        the next startup refuses. (`api/schemas.py`'s `PositiveSeconds` explains why
-        the check is not also at the edge: FastAPI echoes the offending value into
-        its 422, and `inf` cannot be serialised into one.)
+        """The API layer rejects non-finite durations too, with a 422 — this locks
+        the property that one does not *depend* on the other. The store is reachable
+        from anywhere the API is not, and a re-parse that trusted its caller would
+        make the edge check load-bearing for the file's integrity rather than for
+        the quality of the error message.
 
         `json.dumps` would refuse to write `Infinity` anyway — but it refuses by
         raising *after* the temp file exists, so without the re-parse this would be

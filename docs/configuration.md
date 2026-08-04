@@ -26,7 +26,7 @@ spelling.
 | Setting | Default | Effect |
 |---|---|---|
 | `SENTINEL_CAMERAS_FILE` | `./cameras.json` | Path to the camera list. See [below](#camerasjson). |
-| `SENTINEL_ENABLE_CAMERA_WRITES` | `false` | Whether `PATCH /cameras/{id}` may edit a camera's `label` and `zone` and write the change back to this file. **Off by default: the engine has no authentication**, so an enabled write endpoint is reconfigurable by anything that can reach the port. Read [Operations → Editing cameras from the console](operations.md#editing-cameras-from-the-console) before turning it on. |
+| `SENTINEL_ENABLE_CAMERA_WRITES` | `false` | Whether `PATCH /cameras/{id}` may edit a camera's `label`, `zone` and per-camera welfare policy (`notify_on`, `notify_min_confidence`, the clip and summary overrides) and write the change back to this file. The welfare fields persist but are not yet honoured by the running pipeline. **Off by default: the engine has no authentication**, so an enabled write endpoint is reconfigurable by anything that can reach the port. Read [Operations → Editing cameras from the console](operations.md#editing-cameras-from-the-console) before turning it on. |
 | `SENTINEL_DEVICE` | *(unset)* | Torch device for **both** models. Unset auto-detects via `yolo11.select_device()` — CUDA when visible, else CPU. Set it to pin a device, or to force CPU on a box that has a GPU. |
 
 ## VRAM budget

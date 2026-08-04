@@ -31,11 +31,11 @@ about the console: a label is a nav item, and there is no length at which a
 longer one is more useful than a truncated one.
 """
 
-NonNegativeSeconds = Annotated[float, Field(ge=0.0)]
+NonNegativeSeconds = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
 """A duration that may be zero — currently only `clip_preroll_seconds`, where no
 lead-in at all is a real choice."""
 
-PositiveSeconds = Annotated[float, Field(gt=0.0)]
+PositiveSeconds = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
 """A duration that must be greater than zero: a clip that ends where it starts,
 or a summary that runs every no-seconds, is never what anyone meant.
 
@@ -46,16 +46,21 @@ this API answers 409, i.e. "the file will not take your edit". For a value that
 was simply out of range that is a lie, and it sends an operator to inspect a file
 that is perfectly fine.
 
-Non-finite is the one bound deliberately *not* mirrored here, and it is worth
-saying why so nobody adds it back as an oversight. `1e999` is valid JSON that
-decodes to `inf` and clears every `ge`/`gt` check, so `allow_inf_nan=False` looks
-like the obvious completion — but FastAPI echoes the offending value in its 422
-body and Starlette's `JSONResponse` refuses to serialise `inf`, so the 422 fails
-to render and the caller gets a 500 instead. A 409 from the store's re-parse
-(which does check `math.isfinite`, and writes nothing) is a worse answer than a
-422 and a much better one than a crash, and no standard client can produce this
-body in the first place: `json.dumps` and `JSON.stringify` both refuse or nullify
-an infinity.
+`allow_inf_nan=False` completes the mirror, and is the part most likely to be
+dropped as noise. `1e999` and `NaN` are valid JSON that `json.loads` decodes
+happily — Python's `json.dumps` emits them by default, so a client does not have
+to be hand-rolled to send one — and `inf` clears every `gt`/`ge` check above,
+which makes it the one out-of-range value that reaches the store looking in
+range. Rejecting it here is what keeps "out of range is a 422" true without
+exception.
+
+The reason this needs saying: the 422 body FastAPI builds echoes the offending
+value back, and Starlette renders it with `allow_nan=False`, so *any* 422
+carrying a non-finite input fails to serialise and becomes a 500. That is not a
+reason to stop rejecting non-finite values — `-inf` and `NaN` already fail
+`ge`/`gt` and hit the same crash whatever this line says. It is handled where it
+happens instead, by `api/app.py`'s `RequestValidationError` handler, which nulls
+non-finite floats out of the error body before rendering it.
 """
 
 

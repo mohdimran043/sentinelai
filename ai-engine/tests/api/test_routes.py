@@ -825,6 +825,56 @@ class TestCameraWelfarePolicyEdit:
         assert response.status_code == 422
         assert service.edits == []
 
+    @pytest.mark.parametrize(
+        "field",
+        ["clip_preroll_seconds", "clip_postroll_seconds", "summary_interval_seconds"],
+    )
+    @pytest.mark.parametrize("literal", ["-1e999", "1e999", "NaN"])
+    def test_a_non_finite_duration_is_a_422_and_not_a_crash(self, field: str, literal: str) -> None:
+        """`1e999` and `NaN` are things `json.loads` accepts and `math.isfinite`
+        does not, so they are the one out-of-range family that can arrive without
+        looking out of range. They have to be answered here for the same reason
+        every other bound is — but they also have to be answered *renderably*: the
+        422 body echoes the input that failed, and a bare `Infinity` in it is not
+        JSON that Starlette will serialise. An unhandled serialisation failure turns
+        this into a 500, which tells an operator the engine is broken when their
+        request was.
+
+        Sent as a raw body because `json=` cannot express these: Python's
+        `json.dumps` will emit them (its `allow_nan` defaults to true) but
+        `requests`/`httpx` build the body themselves, so the literal has to be
+        written out. A Python client doing exactly that is how this arrives in
+        practice.
+        """
+        service, client = self.app()
+        with client:
+            response = client.patch(
+                "/cameras/cam-1",
+                content=f'{{"{field}": {literal}}}',
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_a_non_finite_duration_beside_another_bad_field_is_still_a_422(self) -> None:
+        """The same value, reached through the model-level validator rather than the
+        field's own bound — `label: null` is what trips it. That path echoes the
+        *whole* body as the failing input, so the infinity lands in the 422 even
+        though nothing about the infinity is what failed. Worth its own case: a fix
+        that only sanitises the field that was out of range leaves this one
+        crashing."""
+        service, client = self.app()
+        with client:
+            response = client.patch(
+                "/cameras/cam-1",
+                content='{"label": null, "clip_postroll_seconds": 1e999}',
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert service.edits == []
+
     def test_no_pre_roll_at_all_is_a_real_choice(self) -> None:
         """Pre-roll's bound is `>= 0` where the other two are `> 0`, exactly as at
         load time: a clip with no lead-in is legitimate, a clip of no length is
@@ -850,6 +900,61 @@ class TestCameraWelfarePolicyEdit:
         assert response.status_code == 422
         assert "url" in response.text
         assert service.edits == []
+
+
+class TestValidationErrorRendering:
+    """`create_app`'s `RequestValidationError` handler, which is app-wide and
+    therefore owns the 422 body of *every* endpoint, not just the one that needed
+    it. Both properties below are the reason it can be there at all."""
+
+    def app(self) -> TestClient:
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),))
+        return TestClient(create_app(service, camera_writes_enabled=True))
+
+    def test_an_ordinary_422_keeps_fastapis_shape(self) -> None:
+        """A console parses these. Replacing the default handler must be invisible
+        to it, so the body is asserted key by key rather than "is a 422": the
+        failure this guards against is a handler that answers the right status with
+        a shape nothing downstream can read."""
+        with self.app() as client:
+            response = client.patch("/cameras/cam-1", json={"clip_postroll_seconds": 0})
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "greater_than",
+                    "loc": ["body", "clip_postroll_seconds"],
+                    "msg": "Input should be greater than 0",
+                    "input": 0,
+                    "ctx": {"gt": 0.0},
+                }
+            ]
+        }
+
+    def test_a_non_finite_input_is_echoed_back_as_null(self) -> None:
+        """Null rather than dropped or stringified: the key stays where a client
+        expects it, and `null` is what `JSON.stringify` and pydantic's `to_json`
+        would have made of the same value. Only the unserialisable float changes —
+        the type, location and message are the ones pydantic produced."""
+        with self.app() as client:
+            response = client.patch(
+                "/cameras/cam-1",
+                content='{"clip_preroll_seconds": 1e999}',
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "finite_number",
+                    "loc": ["body", "clip_preroll_seconds"],
+                    "msg": "Input should be a finite number",
+                    "input": None,
+                }
+            ]
+        }
 
 
 def test_lifespan_starts_and_stops_the_service() -> None:

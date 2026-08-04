@@ -3,12 +3,65 @@ constructed here, so tests never build a real EngineService."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import math
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from sentinel_ai.api.routes import EngineServiceProtocol, router
+
+
+def _with_non_finite_floats_nulled(value: Any) -> Any:
+    """Replace every `inf`/`-inf`/`NaN` anywhere in a validation-error structure
+    with `null`, leaving everything else — including every message — untouched.
+
+    `null` rather than a string because that is what the rest of the JSON world
+    already does with these: `JSON.stringify` emits `null`, and pydantic's own
+    `to_json` nulls them by default. A caller who sent an infinity and reads
+    `"input": null` learns the same thing either way, which is that the value the
+    server saw was not a number it can work with.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {key: _with_non_finite_floats_nulled(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return [_with_non_finite_floats_nulled(item) for item in value]
+    return value
+
+
+async def _render_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's own 422, with any non-finite float in it nulled out first.
+
+    **App-wide: this replaces the default handler for every endpoint, not just the
+    one that made it necessary.** The body shape is deliberately identical to
+    FastAPI's — `{"detail": [ ... ]}` with the same `type`/`loc`/`msg`/`input`/`ctx`
+    per error — because a console parses these, and the only difference a caller can
+    observe is a `null` where an unserialisable float would have been.
+
+    Without this, *any* validation error whose echoed input contains an infinity or
+    a `NaN` is a 500 rather than a 422. FastAPI puts the offending value in the
+    error's `input`, and Starlette's `JSONResponse` renders with `allow_nan=False`,
+    so rendering the 422 raises and the caller gets a crash instead of the answer.
+    The reachable route today is `PATCH /cameras/{camera_id}`'s duration overrides —
+    `1e999` and `NaN` are valid JSON that `json.loads` accepts and every `ge`/`gt`
+    bound rejects — but nothing about the failure is specific to them, so the fix
+    belongs where the response is rendered rather than on the fields. Any float
+    field added anywhere later is covered by having been added, with nobody needing
+    to know this exists.
+    """
+    return JSONResponse(
+        # The same 422 FastAPI's own handler sends, spelled as an integer because
+        # Starlette's constant for it is mid-rename and deprecated under both names
+        # at some point in the version range this runs on.
+        status_code=422,
+        content={"detail": jsonable_encoder(_with_non_finite_floats_nulled(exc.errors()))},
+    )
 
 
 def create_app(service: EngineServiceProtocol, *, camera_writes_enabled: bool = False) -> FastAPI:
@@ -45,6 +98,7 @@ def create_app(service: EngineServiceProtocol, *, camera_writes_enabled: bool = 
                 service.close_event_streams()
 
     app = FastAPI(title="SentinelAI AI Engine", lifespan=lifespan)
+    app.exception_handler(RequestValidationError)(_render_validation_error)
     app.state.service = service
     app.state.camera_writes_enabled = camera_writes_enabled
     app.include_router(router)
