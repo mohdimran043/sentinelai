@@ -69,8 +69,9 @@ never carried across a discontinuity, for the same reason the pre-roll is not.
 
 Its two lengths, and the gate's forced-look interval, are per camera: `cameras.json`
 may set `clip_preroll_seconds`, `clip_postroll_seconds` and `summary_interval_seconds`,
-and an unset one falls back to `Settings` (the clip lengths) or to the camera profile
-(the interval). All three are editable on a running camera through `apply_metadata`,
+and an unset one falls back to the default it overrides: the horizon the composer sized
+the pre-roll ring at, `Settings.clip_postroll_seconds`, and the camera profile's own
+interval. All three are editable on a running camera through `apply_metadata`,
 which documents field by field when each new value is first read. The short version:
 on the next escalation. A clip already recording keeps the deadline it opened with.
 
@@ -289,6 +290,16 @@ class CameraRunner:
         self._scheduler = scheduler
         self._clip_writer = clip_writer
         self._preroll = preroll
+        # This camera's pre-roll default, captured *before* the override below narrows
+        # the ring: the horizon the ring arrived with is, by construction, the value
+        # whoever composed this runner chose for it (`main.compose` sizes it from its
+        # own `settings` argument). Reverting the override to `None` has to return the
+        # ring to that number and no other. Deriving it from `get_settings()` at edit
+        # time instead would answer with the process-wide default, which is the same
+        # number only when the composer happened to be handed `get_settings()`'s own
+        # object — true of `create_default_app`, false of any other composition, and
+        # the divergence is silent because both answers are plausible floats.
+        self._default_preroll_seconds = preroll.preroll_seconds
         self._detect_every_n_frames = detect_every_n_frames
 
         # The three duration overrides, exactly as `cameras.json` stores them: `None`
@@ -300,15 +311,12 @@ class CameraRunner:
         self._clip_preroll_override = clip_preroll_seconds
         self._clip_postroll_override = clip_postroll_seconds
         self._summary_interval_override = summary_interval_seconds
-        # The ring arrives already sized to the process-wide default by whoever built
-        # it (`main.compose`), so an absent override leaves it exactly as given rather
-        # than re-deriving a number the builder already knew. `apply_metadata` cannot
-        # do the same — by then the builder is long gone — and reads the default back
-        # from `get_settings()` instead.
+        # An absent override leaves the ring exactly as given rather than re-asserting
+        # the size it already has.
         if clip_preroll_seconds is not None:
             preroll.preroll_seconds = clip_preroll_seconds
-        self._clip_postroll_seconds = self._resolved_postroll()
-        self._profile = self._resolved_profile()
+        self._clip_postroll_seconds = self._postroll_for(clip_postroll_seconds)
+        self._profile = self._profile_for(summary_interval_seconds)
 
         # Deferred to the first frame, which is the earliest point at which a time on
         # the only timeline this pipeline has is available. `_on_discontinuity`
@@ -434,11 +442,36 @@ class CameraRunner:
           clip. An edit landing in that window gives the clip a lead-in somewhere
           between the old and the new length, and cannot do worse than that —
           `flush()` only ever returns already-buffered packets, all of them older
-          than the escalation, so every reachable outcome is a valid clip. Narrowing
-          the horizon takes effect on the next `append`; widening it takes effect as
-          the ring refills, since packets already evicted are gone (see
-          `PreRollBuffer.preroll_seconds`).
+          than the escalation, so every reachable outcome is a valid clip. A
+          narrowing takes effect on the next `flush()` or `append`, whichever comes
+          first: `PreRollBuffer._anchor_index` recomputes the horizon from the
+          current value on every call, so the narrower one is honoured by the very
+          next read and not only by the next eviction. A widening takes effect as the
+          ring refills, since packets already evicted are gone (see
+          `PreRollBuffer.preroll_seconds`). An override reverted to `None` restores
+          the horizon this runner was *composed* with — `_default_preroll_seconds`,
+          captured in `__init__` — not whatever `get_settings()` says now.
+
+        Applied all-or-nothing. Two of the values are fallible — a negative pre-roll
+        is refused by `PreRollBuffer`, a non-positive interval by
+        `CameraProfile.__post_init__` — so both are resolved, and the ring (the only
+        object here that is not ours) is written, before a single attribute of this
+        runner moves. Neither raise is reachable through `PATCH /cameras/{id}`, whose
+        request model and file loader both enforce the same bounds; the ordering is
+        what makes "totally applied or not applied at all" a property of this method
+        rather than of who happens to call it. `main.ComposedService.update_camera`
+        has already persisted the file by the time this runs and has nothing to
+        unwind with, and it should not need one.
         """
+        new_profile = self._profile_for(summary_interval_seconds)
+        new_postroll = self._postroll_for(clip_postroll_seconds)
+        new_horizon = (
+            self._default_preroll_seconds if clip_preroll_seconds is None else clip_preroll_seconds
+        )
+        # First and only write that can raise; the setter validates before it assigns,
+        # so a refused horizon leaves the ring on its old one and this runner untouched.
+        self._preroll.preroll_seconds = new_horizon
+
         self._camera_label = label
         self._zone = zone
         self._notify_on = notify_on
@@ -446,41 +479,46 @@ class CameraRunner:
         self._clip_preroll_override = clip_preroll_seconds
         self._clip_postroll_override = clip_postroll_seconds
         self._summary_interval_override = summary_interval_seconds
-        self._preroll.preroll_seconds = (
-            get_settings().clip_preroll_seconds
-            if clip_preroll_seconds is None
-            else clip_preroll_seconds
-        )
-        self._clip_postroll_seconds = self._resolved_postroll()
-        self._profile = self._resolved_profile()
+        self._clip_postroll_seconds = new_postroll
+        self._profile = new_profile
 
-    def _resolved_postroll(self) -> float:
-        """The per-camera post-roll if set, else the process-wide default.
+    def _postroll_for(self, override: float | None) -> float:
+        """The given per-camera post-roll if set, else the process-wide default.
 
         `Settings` rather than a constructor slot for the default: it is a
         process-wide tuning value (S1), and reading it here is what lets an edit that
         reverts the override to `None` restore it without the runner having to
-        remember what it was built with.
+        remember what it was built with. The pre-roll cannot do the same — its
+        default reaches the runner through the ring the composer sized, not through
+        the settings object — which is why `_default_preroll_seconds` exists and this
+        does not need an equivalent.
+
+        Takes the override as an argument rather than reading
+        `self._clip_postroll_override`, so `apply_metadata` can resolve a new value
+        before it commits the field that value came from.
         """
-        if self._clip_postroll_override is not None:
-            return self._clip_postroll_override
+        if override is not None:
+            return override
         return get_settings().clip_postroll_seconds
 
-    def _resolved_profile(self) -> CameraProfile:
+    def _profile_for(self, override: float | None) -> CameraProfile:
         """`_base_profile`, with `summary_interval_seconds` replaced when the camera
         overrides it.
 
         A copy rather than a mutation because `CameraProfile` is frozen, and only
         this one field because it is the only one `cameras.json` lets an operator
         change without a restart — the gate is part-way through applying every other
-        one. `dataclasses.replace` re-runs `__post_init__`, so an interval of zero or
-        below cannot get this far; both configuration edges already refuse it (`> 0`
-        in `load_cameras` and in `CameraEditRequest`), which is what makes this
-        method total rather than fallible.
+        one. `dataclasses.replace` re-runs `__post_init__`, so this raises on an
+        interval of zero or below; both configuration edges already refuse it (`> 0`
+        in `load_cameras` and in `CameraEditRequest`), so no caller can reach that,
+        and `apply_metadata` calls this before it writes anything so that the
+        unreachable case would still be harmless.
+
+        Takes the override as an argument for the reason `_postroll_for` gives.
         """
-        if self._summary_interval_override is None:
+        if override is None:
             return self._base_profile
-        return replace(self._base_profile, summary_interval_seconds=self._summary_interval_override)
+        return replace(self._base_profile, summary_interval_seconds=override)
 
     def telemetry(self) -> CameraTelemetry:
         return CameraTelemetry(

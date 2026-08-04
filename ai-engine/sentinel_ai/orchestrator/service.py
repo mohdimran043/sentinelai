@@ -324,9 +324,13 @@ class EngineService:
         record back, and applying all of it cannot leave some fields applied and
         others not.
 
-        Synchronous and total — `apply_metadata` performs attribute writes and one
-        `dataclasses.replace` over values both configuration edges have already
-        validated — so there is no partial-application case for a caller to unwind.
+        Synchronous and total: `apply_metadata` resolves every value that can be
+        rejected before it writes a single field, so a rejected edit leaves the
+        camera exactly as it was and there is no partial-application case for a
+        caller to unwind. Both configuration edges validate the same bounds, so
+        nothing reaching here can be rejected in the first place — but the totality
+        is a property of `apply_metadata`, not of that argument, and a caller may
+        rely on it as such.
         """
         self._get_runner(camera_id).apply_metadata(
             label=label,

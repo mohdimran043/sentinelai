@@ -331,6 +331,26 @@ def history_packet(pts: float) -> EncodedPacket:
     )
 
 
+def two_gops() -> tuple[EncodedPacket, ...]:
+    """Two complete GOPs of buffered history, keyframes at -0.4 and -0.2.
+
+    A single GOP cannot tell two horizons apart: with one keyframe held, every
+    horizon anchors on it — the wide one because nothing older exists to fall back
+    from, the narrow one because that keyframe is also the newest. Two are the
+    fewest that make `flush()` answer differently for a wide and a narrow ring.
+    """
+    return tuple(
+        EncodedPacket(
+            camera_id="cam-1",
+            data=b"history",
+            pts=pts,
+            is_keyframe=is_keyframe,
+            codec="h264",
+        )
+        for pts, is_keyframe in ((-0.4, True), (-0.3, False), (-0.2, True), (-0.1, False))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -1567,6 +1587,98 @@ class TestALiveEditTakesEffectOnTheNextEscalation:
             "the clip's length is the one the escalation was decided under"
         )
 
+    @pytest.mark.parametrize(
+        ("clip_preroll_seconds", "summary_interval_seconds"),
+        [(-1.0, None), (None, 0.0)],
+        ids=["negative-preroll", "zero-interval"],
+    )
+    def test_a_rejected_edit_leaves_the_camera_exactly_as_it_was(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        clip_preroll_seconds: float | None,
+        summary_interval_seconds: float | None,
+    ) -> None:
+        """`apply_metadata` is documented as total, and `ComposedService.update_camera`
+        leans on that: the file is already written by the time the apply runs, so a
+        half-applied edit would leave memory and disk disagreeing with nothing to
+        unwind it with.
+
+        Neither value below can reach here through `PATCH /cameras/{id}` —
+        `CameraEditRequest` and `load_cameras` enforce the same two bounds — which is
+        why this asserts the property directly instead of through the endpoint. The
+        totality has to be a property of this method, not of the two callers that
+        happen to validate first: the argument that it is unreachable is one edge
+        change away from being wrong, and the failure it would then produce is a
+        camera whose ring and label moved while its profile did not.
+        """
+        patch_postroll(monkeypatch, seconds=1.0)
+        preroll = PreRollBuffer(preroll_seconds=3.0)
+        base = CameraProfile(camera_id="cam-1", summary_interval_seconds=45.0)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=2, fps=10.0),
+            detector=FakeDetector(script=[()]),
+            scheduler=new_scheduler(FakePublisher()),
+            preroll=preroll,
+            profile=base,
+        )
+        before = runner.telemetry()
+
+        with pytest.raises(ValueError):
+            apply_policy(
+                runner,
+                label="Renamed",
+                clip_preroll_seconds=clip_preroll_seconds,
+                summary_interval_seconds=summary_interval_seconds,
+            )
+
+        after = runner.telemetry()
+        assert after == before, "not one field of the record may have moved"
+        assert preroll.preroll_seconds == 3.0, "the ring keeps the horizon it had"
+        assert runner._profile == base
+        assert runner._clip_postroll_seconds == pytest.approx(1.0)
+
+    async def test_a_second_escalation_extends_using_the_edited_postroll(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of "next escalation, not retroactively". The clip already
+        recording keeps the deadline it opened with; the escalation that arrives while
+        it records *is* the next escalation, so its extension must use the value in
+        force now, not the one the first escalation was decided under.
+
+        The edit lands inside `ClipWriter.open()` for the one clip here — after the
+        first escalation has read its post-roll and before the second escalation
+        exists — so there is no race to lose. PERIODIC_SUMMARY opens the clip at 0.0s
+        with the un-edited 0.5s post-roll; NEW_SALIENT_TRACK extends it at 0.3s.
+        Against an implementation that reused the opening escalation's value, or
+        cached the post-roll on `_ActiveClip`, the clip closes at 0.8s.
+        """
+        patch_postroll(monkeypatch, seconds=0.5)
+        writer = EditingClipWriter()
+        publisher = FakePublisher()
+        scheduler = new_scheduler(publisher)
+        runner = make_runner(
+            source=alternating_source("cam-1", count=15, fps=10.0),
+            detector=FakeDetector(script=[(NEAR,)]),
+            scheduler=scheduler,
+            clip_writer=writer,
+            profile=CameraProfile(camera_id="cam-1", min_track_frames=2, cooldown_seconds=0.2),
+        )
+        writer.on_open = lambda: apply_policy(runner, clip_postroll_seconds=1.0)
+
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+        assert runner.telemetry().clip_postroll_seconds == 1.0, "test setup: the edit landed"
+        assert runner.telemetry().escalations == 2, "test setup: exactly one extension"
+        assert len(writer.handles) == 1, "the second escalation extends, it does not open a clip"
+        handle = writer.handles[0]
+        assert handle.finished is True
+        assert handle.aborted is False
+        assert handle.packets[-1].pts == pytest.approx(1.3), (
+            "the extension must use the edited post-roll: 0.3s + 1.0s, not 0.3s + 0.5s"
+        )
+
     async def test_an_edited_summary_interval_reaches_the_gate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1591,7 +1703,15 @@ class TestALiveEditTakesEffectOnTheNextEscalation:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Re-sized, not replaced: the ring holds the history the next escalation will
-        want, and rebuilding it would throw that away to change one number."""
+        want, and rebuilding it would throw that away to change one number.
+
+        Two GOPs, so the flush is a real discriminator rather than a formality: under
+        the 3.0s horizon the ring was built with, no keyframe is old enough and the
+        flush falls back to the earliest one it holds (everything); under the edited
+        0.0s horizon the newest keyframe already satisfies it and the flush is the
+        open GOP alone. A runner that dropped the edit on the floor returns the first
+        list, one that rebuilt the ring returns nothing at all.
+        """
         patch_postroll(monkeypatch, seconds=1.0)
         preroll = PreRollBuffer(preroll_seconds=3.0)
         runner = make_runner(
@@ -1600,12 +1720,22 @@ class TestALiveEditTakesEffectOnTheNextEscalation:
             scheduler=new_scheduler(FakePublisher()),
             preroll=preroll,
         )
-        preroll.append(history_packet(-0.2))
+        for packet in two_gops():
+            preroll.append(packet)
+        assert [p.pts for p in preroll.flush()] == [-0.4, -0.3, -0.2, -0.1], (
+            "test setup: under the original horizon the whole buffer is in reach"
+        )
 
         apply_policy(runner, clip_preroll_seconds=0.0)
 
         assert preroll.preroll_seconds == 0.0
-        assert [packet.pts for packet in preroll.flush()] == [-0.2], "history is kept, not dropped"
+        assert [p.pts for p in preroll.flush()] == [-0.2, -0.1], (
+            "the narrowed horizon anchors on the newest keyframe, from the next flush on"
+        )
+        assert preroll.span_seconds == pytest.approx(0.3), (
+            "history is kept, not dropped: the older GOP is still buffered, merely "
+            "out of the flush's reach"
+        )
 
 
 class TestTheWelfarePolicyOnTelemetry:

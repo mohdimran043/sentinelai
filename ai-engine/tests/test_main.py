@@ -663,6 +663,60 @@ class TestCompose:
         )
         assert [t.camera_id for t in composition.service.cameras()] == ["cam-1"]
 
+    def test_reverting_a_preroll_override_restores_the_composed_default(
+        self, tmp_path: Path
+    ) -> None:
+        """`null` means "follow the default", and the default is the one this engine
+        was *composed* with, not whatever `Settings()` answers now.
+
+        The two agree in production — `create_default_app` hands `compose` the very
+        object `get_settings()` returns — and disagree in every composition that
+        builds its own `Settings`, which is every test in this file and any embedding
+        of the engine. A runner that re-derived the pre-roll default at edit time
+        would silently re-size this camera's ring from the 0.0s it was composed at to
+        the process-wide 3.0s, the first time an operator undid an override, and
+        every clip afterwards would carry three seconds of lead-in nobody asked for.
+        """
+        assert Settings().clip_preroll_seconds != 0.0, (
+            "test setup: the composed and process-wide defaults must differ, or this "
+            "test cannot tell which one the revert used"
+        )
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+            clip_preroll_seconds=0.0,
+        )
+        composition = compose(
+            settings,
+            (CameraConfig("cam-1", "Camera One", str(ASSET), _profile("cam-1")),),
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        ring = composition.service._cameras["cam-1"]._preroll
+
+        def revise(clip_preroll_seconds: float | None) -> None:
+            composition.service.update_camera_metadata(
+                "cam-1",
+                label="Camera One",
+                zone=None,
+                notify_on=frozenset(ConcernKind),
+                notify_min_confidence=Confidence.LIKELY,
+                clip_preroll_seconds=clip_preroll_seconds,
+                clip_postroll_seconds=None,
+                summary_interval_seconds=None,
+            )
+
+        assert ring.preroll_seconds == 0.0, "test setup: composed at the settings given"
+        revise(2.0)
+        assert ring.preroll_seconds == 2.0, "test setup: the override took"
+        revise(None)
+        assert ring.preroll_seconds == 0.0, (
+            "reverting must restore the composed 0.0s, not the process-wide 3.0s"
+        )
+
     def test_the_scheduler_is_wired_to_the_same_resident_set_the_service_owns(
         self, tmp_path: Path
     ) -> None:

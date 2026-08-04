@@ -437,8 +437,12 @@ def compose(
             # turns that into a number — so a camera whose file says nothing keeps
             # getting whatever the settings say, and one whose override is reverted at
             # runtime gets the setting back rather than the value it booted with. The
-            # ring above is the one exception, built at the default and narrowed by the
-            # runner when this camera overrides it.
+            # pre-roll is the one whose default arrives by another route: the ring above
+            # is built at `settings.clip_preroll_seconds` and narrowed by the runner when
+            # this camera overrides it, and the runner records the size it was handed as
+            # the value a reverted override returns to — so a composition given settings
+            # other than `get_settings()`'s (every test that calls this function) reverts
+            # to *its* default rather than the process-wide one.
             notify_on=config.notify_on,
             notify_min_confidence=config.notify_min_confidence,
             clip_preroll_seconds=config.clip_preroll_seconds,
@@ -623,9 +627,11 @@ class ComposedService:
              wherever the file's normalisation differs from what was asked for.
 
         A failure in (2) therefore leaves the system exactly as it was, and a
-        success in (2) is always followed by (3) — the apply is a run of attribute
-        writes on an object already proven to exist, with no await between them, so
-        there is no window where the file has moved and the camera has not.
+        success in (2) is always followed by (3) — the apply is synchronous, has no
+        await inside it, and is all-or-nothing by construction (`apply_metadata`
+        resolves every fallible value before it writes any field), so there is no
+        window where the file has moved and the camera has not, and no half-applied
+        state for a failure here to leave behind.
         """
         if self._composition is None:
             raise UnknownCameraError(camera_id)
