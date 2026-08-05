@@ -297,6 +297,30 @@ def build_notifier(settings: Settings, dead_letter: DeadLetterSpool) -> Notifier
     whole feature exists for. Failing at startup is the only outcome they can act
     on.
 
+    **A dispatch ceiling that cannot clear the adapter's retries raises too.**
+    `notifier_timeout_seconds` is the *outer* deadline `NotificationDispatcher`
+    puts around one whole delivery, and nothing in its name stops an operator from
+    reading it as the per-request HTTP timeout and setting 5.0. That combination
+    cannot deliver anything that needs a retry and does not merely fail — it
+    *destroys*: `asyncio.timeout` cancels `WebhookNotifier.notify` mid-retry, the
+    `CancelledError` misses that adapter's `except Exception`, and the note is lost
+    with no dead-letter record and a WARNING naming a `TimeoutError` whose `str()`
+    is empty. So the two numbers are compared here, where an operator can still act
+    on it, against `retry_worst_case_seconds` read off the adapter rather than a
+    second copy of `18.0`.
+
+    Raising rather than warning, on the same reasoning as the missing URL and as
+    `load_cameras`' typo'd `profile` and `zone` fields: this codebase fails a
+    misconfiguration at startup rather than running on with it. The failure being
+    guarded against here is silent by construction — no delivery, no spool, no
+    stated reason — so a WARNING would be a log line whose only reader is somebody
+    already looking for a problem they have no other evidence of. It is one
+    environment variable away from fixed at exactly the moment this raises, and it
+    costs a deployment nothing to unset `SENTINEL_NOTIFIER_TIMEOUT_SECONDS` and get
+    the default that was sized for this adapter. A ceiling *equal* to the worst
+    case fails too: it makes the deadline and the adapter's last attempt race, and
+    a coin-flip between delivery and destruction is not a configuration to accept.
+
     **`install_httpx_log_redaction()` is called here, and only here.** Task 6
     exposed it as an explicit named function so it would not be a hidden side
     effect of constructing an adapter — which left it with no caller at all.
@@ -316,6 +340,18 @@ def build_notifier(settings: Settings, dead_letter: DeadLetterSpool) -> Notifier
                 "set SENTINEL_NOTIFIER_WEBHOOK_URL or choose notifier_kind='logging'"
             )
         notifier = WebhookNotifier(settings.notifier_webhook_url, dead_letter)
+        # Before `install_httpx_log_redaction`, so the raising path leaves no
+        # filter attached to the process-wide `httpx` logger behind it.
+        if settings.notifier_timeout_seconds <= notifier.retry_worst_case_seconds:
+            raise ValueError(
+                f"notifier_timeout_seconds ({settings.notifier_timeout_seconds}) does not "
+                f"exceed the webhook notifier's retry worst case "
+                f"({notifier.retry_worst_case_seconds}s); it is the outer ceiling on one "
+                "whole delivery, retries included, not the per-request HTTP timeout, and "
+                "below that figure it cancels a delivery mid-retry and destroys the note "
+                "without a dead-letter record. Raise SENTINEL_NOTIFIER_TIMEOUT_SECONDS "
+                "above it or leave it unset"
+            )
         notifier.install_httpx_log_redaction()
         # Deliberately no URL in this line, for the reason the redaction exists.
         logger.info("welfare notifications will be delivered by webhook")

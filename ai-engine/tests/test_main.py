@@ -1234,6 +1234,74 @@ class TestTheNotifierIsComposed:
         with pytest.raises(ValueError, match="notifier_webhook_url"):
             main.build_notifier(settings, main.build_dead_letter(settings))
 
+    def test_a_dispatch_ceiling_below_the_adapters_retries_fails_at_startup(
+        self, tmp_path: Path
+    ) -> None:
+        """`notifier_timeout_seconds` is the *outer* ceiling on one whole delivery,
+        and an operator reading "timeout" as "the HTTP timeout" reaches for 5.0. That
+        combination does not merely fail: the deadline cancels `WebhookNotifier.notify`
+        mid-retry, the `CancelledError` misses the adapter's `except Exception`, and the
+        note is destroyed with no dead-letter record and a warning whose reason is
+        blank. Startup is the last place an operator can still act on it."""
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url="https://ntfy.sh/secret-topic",
+            notifier_timeout_seconds=5.0,
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        httpx_logger = logging.getLogger("httpx")
+        assert httpx_logger.filters == [], "test setup: no redaction filter is installed yet"
+        try:
+            with pytest.raises(ValueError, match="notifier_timeout_seconds"):
+                main.build_notifier(settings, main.build_dead_letter(settings))
+            assert httpx_logger.filters == [], (
+                "the refusal lands before the process-wide redaction filter is attached; "
+                "a filter installed by a notifier nobody kept outlives this process's "
+                "startup and holds a credential-bearing closure for its lifetime"
+            )
+        finally:
+            # A leaked filter would otherwise fail an unrelated test instead of this one.
+            httpx_logger.filters.clear()
+
+    def test_a_ceiling_equal_to_the_worst_case_fails_too(self, tmp_path: Path) -> None:
+        """A ceiling exactly at the adapter's worst case makes the deadline race the
+        adapter's last attempt, and the losing side of that race destroys the note."""
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url="https://ntfy.sh/secret-topic",
+            notifier_timeout_seconds=18.0,
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        with pytest.raises(ValueError, match=r"18\.0"):
+            main.build_notifier(settings, main.build_dead_letter(settings))
+
+    def test_a_ceiling_that_clears_the_worst_case_is_accepted(self, tmp_path: Path) -> None:
+        """The guard is against a combination that cannot deliver, not against
+        configuring this at all — the shipped default is on this side of it."""
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url="https://ntfy.sh/secret-topic",
+            notifier_timeout_seconds=25.0,
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        notifier = main.build_notifier(settings, main.build_dead_letter(settings))
+        assert isinstance(notifier, WebhookNotifier)
+        try:
+            assert Settings().notifier_timeout_seconds > notifier.retry_worst_case_seconds, (
+                "the default must not be a configuration this guard would refuse"
+            )
+        finally:
+            notifier.remove_httpx_log_redaction()
+
+    def test_the_guard_does_not_touch_a_deployment_with_no_webhook(self) -> None:
+        """`LoggingNotifier` neither retries nor reaches a network, so a short ceiling
+        is merely a short ceiling there. Refusing to start over it would take the
+        pipeline down for a setting that costs nothing."""
+        settings = Settings(notifier_timeout_seconds=0.5)
+        assert isinstance(
+            main.build_notifier(settings, main.build_dead_letter(settings)), LoggingNotifier
+        )
+
     def test_building_a_webhook_notifier_redacts_its_url_from_httpx_own_logging(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

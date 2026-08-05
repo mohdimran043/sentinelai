@@ -158,8 +158,15 @@ class NotificationDispatcher:
             raise
         except Exception as error:
             self._failures += 1
+            # `%r`, not `%s`: the exception this frame catches most often is the
+            # `TimeoutError` from the deadline just above it, and `str(TimeoutError())`
+            # is the empty string — the message alone renders "... (camera cam-1): "
+            # and names no cause at all, which is indistinguishable from a log line
+            # with a formatting bug. `repr` always names the type and never leaves a
+            # dangling colon, the same reason `WebhookNotifier` logs its connection and
+            # timeout failures by exception type.
             logger.warning(
-                "welfare notification failed for event %s (camera %s): %s",
+                "welfare notification failed for event %s (camera %s): %r",
                 note.event_id,
                 note.camera_id,
                 error,

@@ -126,6 +126,29 @@ async def test_a_notifier_that_raises_is_logged(caplog: pytest.LogCaptureFixture
     assert any(str(note.event_id) in record.getMessage() for record in caplog.records)
 
 
+async def test_a_failure_whose_message_is_empty_is_still_named_by_type(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`str(TimeoutError())` is `""`, and the dispatch deadline is the failure this
+    frame catches most often against the shipped webhook adapter — which swallows
+    every other delivery failure itself. A line reading `... (camera cam-1): ` with
+    nothing after the colon names no cause and reads like a formatting bug, so the
+    exception's `repr` — which always names the type — is what goes in the line."""
+    note = a_note()
+    dispatcher = NotificationDispatcher(HangingNotifier(), timeout_seconds=0.0)
+    with caplog.at_level(logging.WARNING, logger="sentinel_ai.orchestrator.notifications"):
+        async with Worker(dispatcher):
+            dispatcher.submit(note)
+            await asyncio.wait_for(dispatcher.drain(), timeout=5.0)
+
+    assert dispatcher.failures == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("TimeoutError" in message for message in messages), messages
+    assert all(not message.rstrip().endswith(":") for message in messages), (
+        "the reason is empty for this exception; the type is what makes the line legible"
+    )
+
+
 async def test_a_hanging_notifier_is_timed_out_and_the_worker_moves_on() -> None:
     """`timeout_seconds=0.0` costs no wall-clock time: `asyncio.timeout` schedules
     the deadline at `loop.time()`, which the loop reaches on its next pass. The

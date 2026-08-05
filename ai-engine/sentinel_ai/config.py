@@ -156,9 +156,12 @@ class Settings(BaseSettings):
     transient failure up to three times with backoff, a documented worst case of
     18.0 seconds; this is the outer deadline `NotificationDispatcher` enforces
     around all of that, so it must sit *above* the adapter's worst case or it
-    cancels the retries midway and turns every transient 429 into a lost note.
-    Hence 20.0 rather than the 5.0 an operator reading "timeout" as "HTTP timeout"
-    would reach for.
+    cancels the retries midway and turns every transient 429 into a lost note —
+    lost with no dead-letter record, because the cancellation does not reach the
+    adapter's own last-resort spool. Hence 20.0 rather than the 5.0 an operator
+    reading "timeout" as "HTTP timeout" would reach for, and hence
+    `main.build_notifier` **refusing to start** a webhook deployment whose value
+    here does not clear `WebhookNotifier.retry_worst_case_seconds`.
 
     It exists at all because `Notifier` the port promises no bound of its own: the
     webhook adapter happens to bound itself, a future adapter need not, and neither

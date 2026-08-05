@@ -263,6 +263,36 @@ class WebhookNotifier(Notifier):
         # latter is a safe no-op if the former was never called.
         self._httpx_redaction_filter: logging.Filter | None = None
 
+    @property
+    def retry_worst_case_seconds(self) -> float:
+        """How long one `notify()` may take before it gives up and dead-letters.
+
+        The figure `notify`'s docstring states in prose — `max_attempts` attempts
+        each bounded at `timeout_seconds`, plus the backoff slept between them,
+        i.e. 18.0 with the shipped defaults — computed from this instance's own
+        retry parameters rather than restated as a literal. It exists as a value
+        because a *caller* has to size an outer deadline above it: the composition
+        root refuses to start a webhook deployment whose
+        `notifier_timeout_seconds` does not clear this number, because such a
+        deadline cancels `notify()` mid-retry, and a cancelled `notify()` never
+        reaches the `except Exception` that would have spooled the note — the one
+        path in this module that loses a note with no disk record.
+
+        The `Retry-After` case is deliberately not folded in. A 429 carrying a
+        header larger than the doubling backoff can make an individual sleep as
+        long as `max_backoff_seconds`, so a hostile endpoint can push a single
+        call past this figure; treating *that* as the number to size against
+        would make the shipped 20.0 ceiling fail its own guard against the
+        shipped 5.0/3/1.0/10.0 defaults. This is the worst case of what this
+        adapter decides on its own, which is what a deployment can plan for.
+        """
+        total = self._max_attempts * self.timeout_seconds
+        backoff = self._initial_backoff
+        for _ in range(self._max_attempts - 1):
+            total += backoff
+            backoff = min(backoff * 2.0, self._max_backoff)
+        return total
+
     def install_httpx_log_redaction(self) -> logging.Filter:
         """Attach a `_RedactWebhookUrl` filter to the process-wide `httpx`
         logger so this notifier's `url` — which commonly carries a
@@ -322,7 +352,9 @@ class WebhookNotifier(Notifier):
         the defaults) `3 * 5.0 + (1.0 + 2.0) = 18.0` seconds — bounded
         because `max_attempts` is finite and backoff (including any
         `Retry-After` this notifier honours) is capped at
-        `max_backoff_seconds`, not because either shrinks over time.
+        `max_backoff_seconds`, not because either shrinks over time. The same
+        figure is available as `retry_worst_case_seconds`, for the callers that
+        have to size a deadline around this one.
         """
         try:
             await self._deliver(note)

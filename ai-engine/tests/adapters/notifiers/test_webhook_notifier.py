@@ -202,6 +202,49 @@ async def test_a_configured_timeout_overrides_the_default(tmp_path: Path) -> Non
     assert seen["timeout"] == {"connect": 1.5, "read": 1.5, "write": 1.5, "pool": 1.5}
 
 
+async def test_the_retry_worst_case_is_the_documented_18_seconds_by_default(
+    tmp_path: Path,
+) -> None:
+    """The figure a caller has to size an outer deadline above, as a value rather
+    than a literal repeated wherever somebody needs it — `main.build_notifier`
+    refuses a `notifier_timeout_seconds` that does not clear it."""
+    notifier = WebhookNotifier("https://example.invalid/hook", DeadLetterSpool(tmp_path))
+    assert notifier.retry_worst_case_seconds == pytest.approx(18.0)  # 3 * 5.0 + (1.0 + 2.0)
+
+
+async def test_the_retry_worst_case_tracks_the_retry_schedule_actually_run(
+    tmp_path: Path,
+) -> None:
+    """Not arithmetic restated in a test: the property is asserted against the
+    attempts and the sleeps this adapter really performs when every attempt fails,
+    so a change to the retry schedule that leaves the property behind fails here."""
+    attempts = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        raise httpx.ConnectError("simulated connection failure")
+
+    sleep = _RecordingSleep()
+    notifier = WebhookNotifier(
+        "https://example.invalid/hook",
+        DeadLetterSpool(tmp_path),
+        timeout_seconds=2.0,
+        max_attempts=4,
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=3.0,
+        sleep=sleep,
+        transport=httpx.MockTransport(handle),
+    )
+
+    await notifier.notify(a_note())
+
+    assert attempts["n"] == 4
+    assert sleep.calls == pytest.approx([1.0, 2.0, 3.0])  # doubling, capped
+    assert notifier.retry_worst_case_seconds == pytest.approx(
+        attempts["n"] * notifier.timeout_seconds + sum(sleep.calls)
+    )
+
+
 async def test_timeout_seconds_bounds_wall_clock_time_not_just_per_phase_gaps(
     tmp_path: Path,
 ) -> None:
