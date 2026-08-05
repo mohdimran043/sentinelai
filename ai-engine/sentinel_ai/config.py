@@ -16,6 +16,22 @@ class Mode(StrEnum):
     PRODUCTION = "production"
 
 
+class NotifierKind(StrEnum):
+    """Which `Notifier` the composition root builds (spec §5, T10).
+
+    An enum rather than "a webhook URL is set, so use a webhook": those are two
+    different facts, and conflating them makes turning notifications off require
+    deleting the URL — so an operator silencing a site for an afternoon has to
+    keep the credential somewhere else and paste it back. It also gives the
+    unreachable-webhook case a name: `webhook` with no URL is a configuration
+    error a deployment can be told about, where the implicit form would silently
+    fall back to logging and look like it worked.
+    """
+
+    LOGGING = "logging"
+    WEBHOOK = "webhook"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SENTINEL_", env_file=".env", extra="ignore")
 
@@ -112,6 +128,41 @@ class Settings(BaseSettings):
     rtsp_reconnect_max_seconds: float = Field(default=30.0, gt=0)
 
     clip_temp_dir: str = "./var/clips"
+
+    notifier_kind: NotifierKind = NotifierKind.LOGGING
+    """Which welfare notifier the engine delivers through. **Logging by default.**
+
+    Not `None`: there is no "no notifier" state. `LoggingNotifier` touches no
+    network and needs no configuration, so a deployment that has thought about
+    nothing still leaves a trail an operator can tail — and every routing decision
+    the engine makes is observable somewhere rather than only in the absence of an
+    alert nobody was expecting."""
+
+    notifier_webhook_url: str | None = None
+    """Where `notifier_kind=webhook` POSTs. Required by that kind and ignored by
+    every other.
+
+    **Treat this as a credential.** ntfy and Slack both put a per-recipient token
+    in the URL path, which is why `WebhookNotifier` never logs it, never follows a
+    redirect that could re-send it elsewhere, and why the composition root installs
+    httpx's log redaction around it (see `main.build_notifier`)."""
+
+    notifier_timeout_seconds: float = Field(default=20.0, gt=0)
+    """Wall-clock ceiling on **one whole notification**, retries included — not the
+    per-request HTTP timeout.
+
+    The distinction matters, because the two numbers pull opposite ways.
+    `WebhookNotifier` bounds each individual attempt at its own 5s and retries a
+    transient failure up to three times with backoff, a documented worst case of
+    18.0 seconds; this is the outer deadline `NotificationDispatcher` enforces
+    around all of that, so it must sit *above* the adapter's worst case or it
+    cancels the retries midway and turns every transient 429 into a lost note.
+    Hence 20.0 rather than the 5.0 an operator reading "timeout" as "HTTP timeout"
+    would reach for.
+
+    It exists at all because `Notifier` the port promises no bound of its own: the
+    webhook adapter happens to bound itself, a future adapter need not, and neither
+    may park the single notification worker forever."""
 
 
 @lru_cache(maxsize=1)

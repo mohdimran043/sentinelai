@@ -14,12 +14,14 @@ from pathlib import Path
 import pytest
 
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector, select_device
+from sentinel_ai.adapters.notifiers.logging import LoggingNotifier
 from sentinel_ai.adapters.sources.file import FileSource
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
@@ -67,6 +69,7 @@ async def test_full_pipeline_produces_a_real_event_with_real_models() -> None:
         resident_set=resident_set,
         vlm_model_key=VLM_SPEC.model_key,
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(LoggingNotifier()),
         maxsize=4,
         timeout_seconds=30.0,
         clock=time.monotonic,

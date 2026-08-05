@@ -118,6 +118,11 @@ def encode_event(event: Event) -> dict[str, object]:
                     "kind": concern.kind.value,
                     "confidence": concern.confidence.value,
                     "evidence": concern.evidence,
+                    # Always written, never conditional on its value: a consumer
+                    # that has to tell "not stated" from "false" is back where
+                    # the flag started. See `_decode_welfare` for why the *read*
+                    # side still tolerates its absence.
+                    "evidence_stated": concern.evidence_stated,
                 }
                 for concern in event.welfare.concerns
             ],
@@ -138,6 +143,15 @@ def _decode_welfare(payload: Mapping[str, object]) -> WelfareAssessment:
     Absent `welfare` (a payload from before this field existed, or an event with
     nothing to report — the two are indistinguishable on the wire, by design; see
     `encode_event`) decodes to `WelfareAssessment.none()`.
+
+    `evidence_stated` is read with a default rather than as a required key, and the
+    default is `True`. The disk spool can hold concerns written by a build that did
+    not encode the flag at all, and those must replay rather than raise; `True` is
+    the honest reading of them, because a build that could not make the distinction
+    only ever wrote the model's own words. Unlike `basis`, this *is* read from the
+    payload: it is the producer's report about its own output, not a provenance
+    claim a consumer trusts, so there is nothing here for a tampered value to
+    escalate — the worst a lie achieves is what an absent key already meant.
     """
     raw = payload.get("welfare")
     if raw is None:
@@ -148,6 +162,7 @@ def _decode_welfare(payload: Mapping[str, object]) -> WelfareAssessment:
             kind=ConcernKind(item["kind"]),
             confidence=Confidence(item["confidence"]),
             evidence=item["evidence"],
+            evidence_stated=bool(item.get("evidence_stated", True)),
         )
         for item in cast(list[dict[str, Any]], raw_welfare["concerns"])
     )

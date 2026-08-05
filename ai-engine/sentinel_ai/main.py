@@ -92,6 +92,8 @@ from sentinel_ai.adapters.config.camera_file import (
     load_cameras,
 )
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector, select_device
+from sentinel_ai.adapters.notifiers.logging import LoggingNotifier
+from sentinel_ai.adapters.notifiers.webhook import WebhookNotifier
 from sentinel_ai.adapters.publishers.dead_letter import DeadLetterSpool
 from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
 from sentinel_ai.adapters.sources.file import FileSource
@@ -101,10 +103,11 @@ from sentinel_ai.adapters.storage.minio_clips import MinioClipWriter
 from sentinel_ai.adapters.trackers.bytetrack import ByteTrackTracker
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.app import create_app
-from sentinel_ai.config import Settings, get_settings
+from sentinel_ai.config import NotifierKind, Settings, get_settings
 from sentinel_ai.domain.welfare import ConcernKind
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, EventSubscription
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import VlmScheduler
@@ -120,6 +123,7 @@ from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.event_publisher import FailedEventSink
 from sentinel_ai.ports.frame_source import FrameSource
 from sentinel_ai.ports.model_runtime import HealthReport
+from sentinel_ai.ports.notifier import Notifier
 from sentinel_ai.ports.vision_llm import VisionLanguageModel
 
 logger = logging.getLogger(__name__)
@@ -137,6 +141,7 @@ __all__ = [
     "build_clip_writer",
     "build_dead_letter",
     "build_models",
+    "build_notifier",
     "build_publisher",
     "build_source",
     "compose",
@@ -181,6 +186,12 @@ class Composition:
     read. Held here rather than inside `EngineService` because the engine owns
     running cameras and this owns the record of configured ones; `ComposedService`
     is the only thing that needs both, and it is the only thing that has both."""
+
+    notifier: Notifier
+    """The welfare notifier, held for the same reason `publisher` is: it owns
+    process-wide state `EngineService` knows nothing about and cannot unwind — a
+    pooled HTTP client, and a filter attached to the process's `httpx` logger. See
+    `ComposedService.stop`."""
 
 
 # -- adapter construction -----------------------------------------------------------
@@ -259,8 +270,57 @@ def build_publisher(settings: Settings) -> RabbitMQPublisher:
     )
 
 
-def build_dead_letter(settings: Settings) -> FailedEventSink:
+def build_dead_letter(settings: Settings) -> DeadLetterSpool:
+    """The concrete spool, not the `FailedEventSink` port it satisfies.
+
+    Two things depend on it and they need different halves: `VlmScheduler` wants
+    the port (an `Event` sink), while `WebhookNotifier` wants the wider
+    `store(Event | WelfareNote, ...)` this class actually offers. Returning the
+    concrete type lets one directory serve both without a second spool — see
+    `build_notifier`.
+    """
     return DeadLetterSpool(Path(settings.dead_letter_dir))
+
+
+def build_notifier(settings: Settings, dead_letter: DeadLetterSpool) -> Notifier:
+    """The welfare notifier this deployment delivers through (T10).
+
+    `LoggingNotifier` is the default and needs nothing configured, so there is no
+    composition in which welfare notification is simply absent — a route that
+    reaches nobody and a site with nothing to report look identical from outside,
+    and only one of them is acceptable.
+
+    A `webhook` kind with no URL **raises** rather than falling back. The fallback
+    is the tempting choice and the wrong one: an operator who set
+    `SENTINEL_NOTIFIER_KIND=webhook` and mistyped the URL variable would get a
+    process that starts cleanly, logs cheerfully, and never sends the one alert the
+    whole feature exists for. Failing at startup is the only outcome they can act
+    on.
+
+    **`install_httpx_log_redaction()` is called here, and only here.** Task 6
+    exposed it as an explicit named function so it would not be a hidden side
+    effect of constructing an adapter — which left it with no caller at all.
+    httpx logs `HTTP Request: POST <url>` at INFO on the process-wide `httpx`
+    logger, independently of anything `WebhookNotifier` logs itself, and a webhook
+    URL routinely carries a credential in its path (ntfy's topic token, Slack's
+    incoming-webhook token). Without this call every deployment that configures a
+    webhook writes that credential into its own logs. The composition root is the
+    right caller precisely because the filter is process-wide state: this is the
+    one object that owns the process, and `ComposedService.stop()` is what takes it
+    back off again.
+    """
+    if settings.notifier_kind is NotifierKind.WEBHOOK:
+        if not settings.notifier_webhook_url:
+            raise ValueError(
+                "notifier_kind is 'webhook' but notifier_webhook_url is not set; "
+                "set SENTINEL_NOTIFIER_WEBHOOK_URL or choose notifier_kind='logging'"
+            )
+        notifier = WebhookNotifier(settings.notifier_webhook_url, dead_letter)
+        notifier.install_httpx_log_redaction()
+        # Deliberately no URL in this line, for the reason the redaction exists.
+        logger.info("welfare notifications will be delivered by webhook")
+        return notifier
+    return LoggingNotifier()
 
 
 def build_clip_writer(settings: Settings) -> ClipWriter:
@@ -383,18 +443,26 @@ def compose(
     publisher: RabbitMQPublisher,
     clip_writer: ClipWriter | None,
     dead_letter: FailedEventSink,
+    notifier: Notifier | None = None,
 ) -> Composition:
     """Wire everything into one `EngineService`. Call with a running event loop.
 
     The adapters are passed in rather than built here so that a caller can compose
     the same graph over stand-ins — which is what makes this function, rather than a
     hand-written script, the thing CI can exercise.
+
+    `notifier` is the one adapter with a default, and the default is
+    `LoggingNotifier()`: it needs no configuration and touches no network, so
+    "composed without a notifier" is a state that cannot exist rather than one every
+    caller has to remember to avoid. A composition that notified nobody would be
+    indistinguishable, from outside, from a site with nothing to report.
     """
     resident_set = ResidentSet(
         models.registry,
         total_mib=settings.vram_total_mib,
         reserved_mib=settings.vram_reserved_mib,
     )
+    notifier = notifier if notifier is not None else LoggingNotifier()
     scheduler = VlmScheduler(
         models.vlm,
         publisher,
@@ -405,6 +473,14 @@ def compose(
         resident_set=resident_set,
         vlm_model_key=models.vlm_key,
         dead_letter=dead_letter,
+        # The dispatcher is built here, next to its only submitter, rather than
+        # passed in: nothing outside this function has a use for one, and
+        # `EngineService` reaches the same object back through
+        # `VlmScheduler.notifications` to own its worker task, so there is no way to
+        # end up running a *different* dispatcher than the one receiving notes.
+        notifications=NotificationDispatcher(
+            notifier, timeout_seconds=settings.notifier_timeout_seconds
+        ),
         maxsize=settings.vlm_queue_maxsize,
         timeout_seconds=settings.vlm_timeout_seconds,
         # Real elapsed time, deliberately: `AdmissionGate` spaces admissions with
@@ -479,7 +555,28 @@ def compose(
         # the operator who mounted this file can still edit it by hand, and the
         # console must not silently overwrite what they wrote.
         camera_store=CameraFileStore(Path(settings.cameras_file)),
+        notifier=notifier,
     )
+
+
+async def _close_notifier(notifier: Notifier) -> None:
+    """Release whatever process-wide state a notifier took, if it took any.
+
+    `isinstance` rather than a method on the port: `Notifier` is one method wide on
+    purpose, and `LoggingNotifier` genuinely has nothing to release — widening the
+    port to give it an empty `aclose()` would make every future adapter implement a
+    no-op to satisfy a need only one of them has. Same reasoning, and same shape, as
+    `RabbitMQPublisher.close()` being the composition root's business rather than
+    `EventPublisher`'s.
+
+    Redaction first, then the client: removing the filter can never fail, while
+    `aclose()` touches a real connection pool, and losing the filter would leave a
+    credential-bearing closure attached to the process's `httpx` logger for the rest
+    of its life.
+    """
+    if isinstance(notifier, WebhookNotifier):
+        notifier.remove_httpx_log_redaction()
+        await notifier.aclose()
 
 
 def _rendered_kinds(kinds: frozenset[ConcernKind]) -> str:
@@ -565,6 +662,13 @@ class ComposedService:
                 # `EngineService._cancel`, which is reachable here for the same reason.
                 await asyncio.gather(broker_task, return_exceptions=True)
             await composition.publisher.close()
+            # Last, and after `service.stop()` has drained the notification queue:
+            # closing the HTTP client first would fail the very deliveries that
+            # drain exists to complete. Losing this to a cut-short shutdown costs a
+            # socket the exiting process closes anyway — and the redaction filter,
+            # which dies with the process too. Both are cheaper than anything above
+            # them here, which is why they go last.
+            await _close_notifier(composition.notifier)
 
     def cameras(self) -> tuple[CameraTelemetry, ...]:
         return () if self._composition is None else self._composition.service.cameras()
@@ -686,13 +790,18 @@ def create_default_app() -> FastAPI:
     def build() -> Composition:
         cameras = load_cameras(Path(settings.cameras_file))
         logger.info("composing engine for %d camera(s)", len(cameras))
+        dead_letter = build_dead_letter(settings)
         return compose(
             settings,
             cameras,
             build_models(settings),
             build_publisher(settings),
             build_clip_writer(settings),
-            build_dead_letter(settings),
+            dead_letter,
+            # The same spool the scheduler dead-letters events to. One directory,
+            # two record shapes: `DeadLetterSpool.store` already accepts either, and
+            # a second spool would only split the "nothing else worked" pile in two.
+            notifier=build_notifier(settings, dead_letter),
         )
 
     if settings.enable_camera_writes:

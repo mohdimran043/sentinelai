@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -285,11 +286,14 @@ class TestWelfareOnTheWire:
                     "kind": "collapse",
                     "confidence": "likely",
                     "evidence": "person lying motionless on the floor, not responding",
+                    # Task 10 widened the wire shape; see `TestEvidenceStatedOnTheWire`.
+                    "evidence_stated": True,
                 },
                 {
                     "kind": "distress",
                     "confidence": "possible",
                     "evidence": "raised voice, arms waving",
+                    "evidence_stated": True,
                 },
             ],
             "basis": "single_frame_vlm",
@@ -349,3 +353,65 @@ class TestWelfareOnTheWire:
         payload = {**encode_event(make_event()), "welfare": {}}
         with pytest.raises(ValidationError):
             validate_payload(payload)
+
+
+class TestEvidenceStatedOnTheWire:
+    """Task 10: `WelfareConcern.evidence_stated` reaches a consumer.
+
+    Task 3 added the flag to the domain to tell "the model named a concern and
+    described nothing" from a real evidenced one, but scoped it to the adapter and
+    the domain — the codec never encoded it. In-process dispatch reads `Event`
+    directly and works either way, which is exactly what makes the gap invisible:
+    a Phase 1C consumer reading a round-tripped event would see every concern as
+    evidenced, and would render a placeholder ("reported, not described") as
+    though the model had actually described what it saw. That is a confident-
+    looking alarm built from nothing, which is the failure the flag exists to
+    prevent.
+    """
+
+    @staticmethod
+    def _event(evidence_stated: bool) -> Event:
+        return make_event(
+            welfare=WelfareAssessment(
+                concerns=(
+                    WelfareConcern(
+                        kind=ConcernKind.COLLAPSE,
+                        confidence=Confidence.LIKELY,
+                        evidence="reported, not described",
+                        evidence_stated=evidence_stated,
+                    ),
+                )
+            )
+        )
+
+    @pytest.mark.parametrize("evidence_stated", [True, False])
+    def test_evidence_stated_survives_a_round_trip(self, evidence_stated: bool) -> None:
+        """Both states, because only the pair discriminates. A codec that hardcoded
+        `True` (or simply let the dataclass default supply it) passes the `True` case
+        and fails the `False` one, which is the direction that actually loses
+        information."""
+        original = self._event(evidence_stated)
+        payload = encode_event(original)
+        assert payload["welfare"] == {
+            "concerns": [
+                {
+                    "kind": "collapse",
+                    "confidence": "likely",
+                    "evidence": "reported, not described",
+                    "evidence_stated": evidence_stated,
+                }
+            ],
+            "basis": "single_frame_vlm",
+        }
+        assert decode_event(payload).welfare == original.welfare
+
+    def test_a_concern_written_before_this_field_existed_decodes_as_evidenced(self) -> None:
+        """The disk spool holds payloads from an older build whose concerns carry no
+        `evidence_stated` key. They must replay rather than raise, and the honest
+        reading of a build that could not distinguish the two is the dataclass's own
+        default: the evidence text is the model's own."""
+        payload = encode_event(self._event(True))
+        concerns = cast(list[dict[str, Any]], cast(dict[str, Any], payload["welfare"])["concerns"])
+        concerns[0].pop("evidence_stated")
+        validate_payload(payload)
+        assert decode_event(payload).welfare.concerns[0].evidence_stated is True

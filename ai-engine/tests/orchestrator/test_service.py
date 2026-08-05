@@ -11,7 +11,10 @@ import pytest
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, SceneState
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
@@ -20,13 +23,16 @@ from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
 from sentinel_ai.ports.model_runtime import LifecycleState
+from sentinel_ai.ports.notifier import Notifier, WelfareNote
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 from tests.fakes.io import (
     FakeClipHandle,
     FakeClipWriter,
     FakeFailedEventSink,
+    FakeNotifier,
     FakePublisher,
     FakeSource,
+    HangingNotifier,
 )
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeTracker, FakeVisionLLM
 
@@ -57,6 +63,7 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -82,6 +89,44 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         clock=clock,
     )
     return service, publisher
+
+
+def a_welfare_note() -> WelfareNote:
+    return WelfareNote(
+        event_id=uuid4(),
+        camera_id="cam-1",
+        label="Front Door",
+        zone="corridor",
+        occurred_at=1_700_000_000.0,
+        severity="critical",
+        description="A person is lying motionless on the floor.",
+        concerns=(
+            WelfareConcern(
+                kind=ConcernKind.COLLAPSE,
+                confidence=Confidence.LIKELY,
+                evidence="prone near the wall, not moving",
+            ),
+        ),
+        clip_uri="s3://sentinel-clips/cam-1/evt.mp4",
+    )
+
+
+class SlowNotifier(Notifier):
+    """Suspends several times before it records, the way a real delivery does.
+
+    A `FakeNotifier` completes inside one loop pass, so a shutdown that cancelled
+    the worker instead of draining it would still deliver by luck and the test
+    would pass against the bug. This one cannot: cancel it mid-flight and the note
+    is lost, which is exactly what the drain exists to prevent.
+    """
+
+    def __init__(self) -> None:
+        self.notes: list[WelfareNote] = []
+
+    async def notify(self, note: WelfareNote) -> None:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.notes.append(note)
 
 
 async def _run_to_quiescence() -> None:
@@ -331,6 +376,7 @@ async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -392,6 +438,7 @@ async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> N
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -470,6 +517,9 @@ def an_escalation_request() -> EscalationRequest:
         camera_label="Front Door",
         history=(),
         clip=None,
+        zone=Zone.CORRIDOR,
+        notify_on=frozenset(ConcernKind),
+        notify_min_confidence=Confidence.LIKELY,
     )
 
 
@@ -512,6 +562,7 @@ async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=ticking_clock,
@@ -620,6 +671,7 @@ async def test_one_cameras_decode_error_does_not_abort_the_rest_of_shutdown(
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=8,
         timeout_seconds=5.0,
         clock=clock,
@@ -733,6 +785,7 @@ async def test_a_drain_that_runs_out_of_budget_dead_letters_instead_of_losing_ev
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=dead_letter,
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -820,6 +873,7 @@ async def test_stop_drains_the_queue_rather_than_cancelling_the_worker_on_top_of
         resident_set=resident_set,
         vlm_model_key="qwen25vl3b",
         dead_letter=dead_letter,
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=4,
         timeout_seconds=5.0,
         clock=clock,
@@ -901,6 +955,7 @@ class TestStopUnderExternalCancellation:
             resident_set=resident_set,
             vlm_model_key="qwen25vl3b",
             dead_letter=dead_letter,
+            notifications=NotificationDispatcher(FakeNotifier()),
             maxsize=4,
             timeout_seconds=5.0,
             clock=clock,
@@ -1075,3 +1130,117 @@ class TestStopUnderExternalCancellation:
             f"the race the cancel-then-await exists to close; published {published}"
         )
         assert published == set(), "the worker was cancelled before it could publish"
+
+
+class TestTheNotificationWorkersLifecycle:
+    """T10: the engine owns the notification worker, and shutdown drains it.
+
+    `NotificationDispatcher` is a queue and a loop with no lifecycle of its own —
+    exactly like `VlmScheduler`, and for the same reason it is `EngineService` that
+    starts and stops it. What these tests pin is that it is *actually* started (an
+    unrun worker means notes queue forever and nothing ever notices) and that
+    `stop()` drains it rather than cancelling it, without letting a dead endpoint
+    hold shutdown open.
+    """
+
+    def _build(
+        self, monkeypatch: pytest.MonkeyPatch, notifier: Notifier, drain_timeout: float = 10.0
+    ) -> tuple[EngineService, NotificationDispatcher]:
+        from sentinel_ai.config import Settings
+        from sentinel_ai.pipeline import runner as runner_module
+
+        monkeypatch.setattr(
+            runner_module, "get_settings", lambda: Settings(clip_postroll_seconds=1.0)
+        )
+        registry = ModelRegistry()
+        registry.register(DETECTOR_SPEC, FakeModelRuntime("yolo11s", vram_mib=900))
+        registry.register(VLM_SPEC, FakeModelRuntime("qwen25vl3b", vram_mib=4400))
+        resident_set = ResidentSet(registry, total_mib=8192, reserved_mib=2048)
+        dispatcher = NotificationDispatcher(notifier)
+        scheduler = VlmScheduler(
+            vlm=FakeVisionLLM(),
+            publisher=FakePublisher(),
+            admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+            resident_set=resident_set,
+            vlm_model_key="qwen25vl3b",
+            dead_letter=FakeFailedEventSink(),
+            notifications=dispatcher,
+            maxsize=4,
+            timeout_seconds=5.0,
+            clock=clock,
+        )
+        service = EngineService(
+            cameras={},
+            registry=registry,
+            resident_set=resident_set,
+            scheduler=scheduler,
+            required_model_keys=("yolo11s", "qwen25vl3b"),
+            clock=clock,
+            shutdown_drain_timeout_seconds=drain_timeout,
+        )
+        return service, dispatcher
+
+    async def test_the_worker_delivers_while_the_engine_is_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unstarted worker is invisible: `submit()` returns True either way and
+        the queue simply fills. This is what proves `start()` runs the loop."""
+        notifier = FakeNotifier()
+        service, dispatcher = self._build(monkeypatch, notifier)
+        await service.start()
+        dispatcher.submit(a_welfare_note())
+        await _run_to_quiescence()
+        assert len(notifier.notes) == 1
+        await service.stop()
+
+    async def test_stop_delivers_a_note_that_was_still_queued(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shutdown-leak case. `SlowNotifier` suspends several times inside
+        `notify`, so a `stop()` that cancelled the worker instead of draining it
+        would abandon the delivery mid-flight — and the note this system exists to
+        send is exactly the one a shutdown is most likely to be racing."""
+        notifier = SlowNotifier()
+        service, dispatcher = self._build(monkeypatch, notifier)
+        await service.start()
+        dispatcher.submit(a_welfare_note())
+        await service.stop()
+
+        assert len(notifier.notes) == 1, (
+            "shutdown cancelled a pending notification instead of draining it"
+        )
+        assert dispatcher.delivered == 1
+
+    async def test_stop_does_not_wait_forever_for_a_hanging_notifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: draining must be bounded. A dead endpoint holding a
+        socket open must not be able to hold a `docker compose down` open with it —
+        the same reason the escalation drain in `_unwind` is capped."""
+        notifier = HangingNotifier()
+        service, dispatcher = self._build(monkeypatch, notifier, drain_timeout=0.0)
+        await service.start()
+        dispatcher.submit(a_welfare_note())
+        await _run_to_quiescence()
+        try:
+            await asyncio.wait_for(service.stop(), timeout=5.0)
+        except TimeoutError:
+            pytest.fail("a hanging notifier held shutdown open: the drain is unbounded")
+
+        assert notifier.started.is_set(), "test setup: the note must have reached the notifier"
+        assert notifier.cancelled is True, "the hung delivery must be cancelled, not leaked"
+
+    async def test_stop_leaves_no_notification_task_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker left alive past `stop()` is a leaked task holding a reference to
+        every object the composition built."""
+        before = asyncio.all_tasks()
+        service, _dispatcher = self._build(monkeypatch, FakeNotifier())
+        await service.start()
+        await _run_to_quiescence()
+        await service.stop()
+        await _run_to_quiescence()
+
+        leaked = {task for task in asyncio.all_tasks() - before if not task.done()}
+        assert leaked == set(), f"tasks outlived stop(): {leaked}"

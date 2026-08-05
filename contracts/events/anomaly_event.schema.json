@@ -89,6 +89,10 @@
                 "type": "string",
                 "minLength": 1,
                 "description": "The model's own words about what in the frame prompted this concern. Never a substance name, dose, or clinical judgement for kind=medication — only what was observed."
+              },
+              "evidence_stated": {
+                "type": "boolean",
+                "description": "Whether `evidence` is the model's own text. False means the model named this concern and described nothing, and `evidence` then holds a fixed placeholder rather than an observation — render it as such, never as though the model had described what it saw. Optional and absent on payloads written before this field existed: treat an absent value as true, matching the producer's own default, since a build that could not make the distinction always wrote the model's own text."
               }
             }
           }

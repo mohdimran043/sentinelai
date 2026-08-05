@@ -26,7 +26,7 @@ spelling.
 | Setting | Default | Effect |
 |---|---|---|
 | `SENTINEL_CAMERAS_FILE` | `./cameras.json` | Path to the camera list. See [below](#camerasjson). |
-| `SENTINEL_ENABLE_CAMERA_WRITES` | `false` | Whether `PATCH /cameras/{id}` may edit a camera's `label`, `zone` and per-camera welfare policy (`notify_on`, `notify_min_confidence`, the clip and summary overrides) and write the change back to this file. The welfare fields persist but are not yet honoured by the running pipeline. **Off by default: the engine has no authentication**, so an enabled write endpoint is reconfigurable by anything that can reach the port. Read [Operations → Editing cameras from the console](operations.md#editing-cameras-from-the-console) before turning it on. |
+| `SENTINEL_ENABLE_CAMERA_WRITES` | `false` | Whether `PATCH /cameras/{id}` may edit a camera's `label`, `zone` and per-camera welfare policy (`notify_on`, `notify_min_confidence`, the clip and summary overrides) and write the change back to this file. The welfare fields take effect on that camera's next escalation. **Off by default: the engine has no authentication**, so an enabled write endpoint is reconfigurable by anything that can reach the port. Read [Operations → Editing cameras from the console](operations.md#editing-cameras-from-the-console) before turning it on. |
 | `SENTINEL_DEVICE` | *(unset)* | Torch device for **both** models. Unset auto-detects via `yolo11.select_device()` — CUDA when visible, else CPU. Set it to pin a device, or to force CPU on a box that has a GPU. |
 
 ## VRAM budget
@@ -138,6 +138,24 @@ in the delivered clip — **always more context, never less**.
 | `SENTINEL_BROKER_REPLAY_INTERVAL_SECONDS` | `30.0` | How often `main.BrokerLink` re-drains the spool while the broker is up. A disk buffer is only half a guarantee without something replaying it; this is that something's period. |
 | `SENTINEL_DEAD_LETTER_DIR` | `./var/spool/dead-letter` | Last resort for events that failed for a reason replay cannot fix — a schema violation, an unwritable spool, a transport bug — **and** welfare notes the webhook notifier could not deliver (a non-2xx/3xx response, a connection failure or timeout after retries were exhausted). Each record carries `record_type` (`"Event"` or `"WelfareNote"`) so a repair script can tell the two shapes apart. **Deliberately separate** from the spool: mixing them would put a permanently-unacceptable payload at the front of the replay queue. |
 
+## Welfare notifications
+
+Who gets told when the vision model reports a welfare concern. The routing rule
+itself is per camera and lives in `cameras.json` (`notify_on`,
+`notify_min_confidence`); these settings choose the channel it goes out on.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_NOTIFIER_KIND` | `logging` | `logging` \| `webhook`. `logging` writes one line per routed note and touches no network, so a deployment that configures nothing still leaves a trail. There is no "off" — muting is per camera, via `notify_on: []`. |
+| `SENTINEL_NOTIFIER_WEBHOOK_URL` | *(unset)* | Where `kind=webhook` POSTs. **Required** by that kind: `webhook` with no URL fails at startup rather than falling back to logging, because an operator who mistyped this would otherwise get a process that starts cleanly and never sends the one alert it exists for. **Treat it as a credential** — ntfy and Slack both carry a token in the path, so the engine never logs it, never follows a redirect that could re-send it elsewhere, and installs a redaction filter over httpx's own request logging for as long as the notifier lives. |
+| `SENTINEL_NOTIFIER_TIMEOUT_SECONDS` | `20.0` | Wall-clock ceiling on **one whole notification, retries included** — not the per-request HTTP timeout, which stays at the webhook adapter's own 5 s. That adapter retries a transient failure (5xx, 429, 408, connection error) up to three times with backoff, a worst case of 18 s, so a ceiling below that would cancel the retries midway and turn every transient 429 into a lost note. |
+
+Delivery runs on its own worker, off the escalation path: a hanging endpoint
+costs the note it belongs to and nothing else — never the GPU admission slot,
+never the next describe, never a clip. Notes queue up to 32 deep behind a slow
+notifier and are dropped (counted and logged) beyond that. A shutdown drains the
+queue, bounded by the same cap as the escalation drain.
+
 ## Object storage
 
 | Setting | Default | Effect |
@@ -194,10 +212,13 @@ With `SENTINEL_ENABLE_CAMERA_WRITES=true`, `PATCH /cameras/{id}` edits `label`,
 `summary_interval_seconds`) **in this file** — write-then-rename, with the whole
 document re-validated before anything is written. Consequences worth knowing:
 
-- The welfare-policy fields are written and **survive a restart**, but are not
-  yet honoured by the running pipeline. So an edit to them is not a no-op that
-  can be left lying around: `notify_on: []` looks like it did nothing today and
-  mutes that camera from the moment a later version starts reading these.
+- The welfare-policy fields are written, **survive a restart**, and take effect
+  on that camera's **next escalation** — never retroactively, and never on an
+  escalation already in flight. `notify_on: []` is the mute switch: that camera
+  stops notifying anyone about anything, while still detecting, still recording
+  clips and still publishing events. Nothing about a muted camera looks different
+  from a quiet one, which is why the engine writes an audit line naming the old
+  and the new policy on every edit.
 - Comment keys (`_comment`, `_note`), profiles, URLs, other cameras and any
   field a later version adds are all preserved; the file is edited, not
   regenerated. Formatting is normalised to 2-space JSON, so expect a reflow on

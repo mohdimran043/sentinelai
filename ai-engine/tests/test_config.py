@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from sentinel_ai.config import Mode, Settings
+from sentinel_ai.config import Mode, NotifierKind, Settings
 
 
 def defaults() -> Settings:
@@ -75,6 +75,31 @@ def test_rtsp_reconnect_backoff_defaults() -> None:
 
 def test_clip_temp_dir_default() -> None:
     assert defaults().clip_temp_dir == "./var/clips"
+
+
+def test_notifications_default_to_the_logging_notifier() -> None:
+    """A deployment that configures nothing must still get an observable trail —
+    and no deployment may end up with no notifier at all, since a welfare system
+    whose alerts go nowhere looks exactly like a site with nothing to report."""
+    settings = defaults()
+    assert settings.notifier_kind is NotifierKind.LOGGING
+    assert settings.notifier_webhook_url is None
+
+
+def test_the_notification_timeout_accommodates_the_webhook_adapters_own_retries() -> None:
+    """`WebhookNotifier`'s documented worst case is 3 attempts at 5s plus 1s+2s of
+    backoff — 18.0s. A dispatch ceiling below that would cancel the adapter partway
+    through the retries it exists to perform, which is worse than not retrying at
+    all: every transient 429 would end as a cancelled delivery."""
+    assert defaults().notifier_timeout_seconds == 20.0
+
+
+def test_a_webhook_url_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SENTINEL_NOTIFIER_KIND", "webhook")
+    monkeypatch.setenv("SENTINEL_NOTIFIER_WEBHOOK_URL", "https://ntfy.sh/secret-topic")
+    settings = Settings()
+    assert settings.notifier_kind is NotifierKind.WEBHOOK
+    assert settings.notifier_webhook_url == "https://ntfy.sh/secret-topic"
 
 
 def test_env_prefix_overrides_mode(monkeypatch: pytest.MonkeyPatch) -> None:

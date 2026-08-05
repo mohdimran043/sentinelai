@@ -275,7 +275,9 @@ class CameraRunner:
         # this loop watches one.
         self._zone = zone
         # Carried for the same reason and read by the same nobody: welfare notification
-        # routing happens downstream of the published event, not in this loop.
+        # routing happens downstream of the published event, not in this loop. Since
+        # T10 they also ride out on every `EscalationRequest` (see `_escalate`) — still
+        # carried, still never branched on here.
         self._notify_on = notify_on
         self._notify_min_confidence = notify_min_confidence
         self._source = source
@@ -419,8 +421,16 @@ class CameraRunner:
           assembly, and either read simply returns whichever value is current.
         * `notify_on` and `notify_min_confidence` are policy, but not *this*
           component's: nothing here branches on them. They are carried to
-          `telemetry()` so the console can read back what it wrote, and consumed
-          downstream of the published event.
+          `telemetry()` so the console can read back what it wrote, and — since
+          T10 — onto the `EscalationRequest`, still unread by this loop, for
+          `VlmScheduler` to route on downstream of the published event. Both are
+          read once per escalation, in `_escalate`, before its first await, and
+          the escalation that is already in flight keeps the policy it was decided
+          under: a note routed half on the old `notify_on` and half on the new one
+          is the same indefensible split the post-roll snapshot exists to avoid,
+          except that here one of the halves is an operator's decision to mute a
+          camera. The edit governs the next escalation, per this method's opening
+          promise.
         * `summary_interval_seconds` is read by the gate, once per frame, inside
           `decide()`. Swapping `_profile` between frames is safe because no gate
           state is derived from the interval: `GateState` remembers *when* the last
@@ -706,6 +716,15 @@ class CameraRunner:
         # meaning. See `apply_metadata` for the field-by-field argument.
         profile = self._profile
         postroll_seconds = self._clip_postroll_seconds
+        # Snapshotted here for the same reason, and it matters more for these two
+        # than for the durations above: `notify_on` is the operator's mute switch,
+        # and an escalation that read it after an `apply_metadata` landed mid-clip
+        # would notify under a policy that was never in force when the scene was
+        # judged. Still not a branch — nothing in this loop reads either value; they
+        # ride to `VlmScheduler`, which routes downstream of the published event.
+        zone = self._zone
+        notify_on = self._notify_on
+        notify_min_confidence = self._notify_min_confidence
 
         def request_with(clip: ClipHandle | None) -> EscalationRequest:
             return EscalationRequest(
@@ -719,6 +738,9 @@ class CameraRunner:
                 camera_label=self._camera_label,
                 history=history,
                 clip=clip,
+                zone=zone,
+                notify_on=notify_on,
+                notify_min_confidence=notify_min_confidence,
             )
 
         if self._clip_writer is None:

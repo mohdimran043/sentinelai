@@ -22,8 +22,10 @@ from sentinel_ai.domain.entities import (
     Track,
 )
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment, WelfareConcern
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import RECENT_EVENTS_PER_CAMERA
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import (
@@ -34,8 +36,16 @@ from sentinel_ai.orchestrator.scheduler import (
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.model_runtime import LifecycleState
+from sentinel_ai.ports.notifier import Notifier, WelfareNote
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
-from tests.fakes.io import FakeClipWriter, FakeFailedEventSink, FakePublisher, FakeSource
+from tests.fakes.io import (
+    FakeClipWriter,
+    FakeFailedEventSink,
+    FakeNotifier,
+    FakePublisher,
+    FakeSource,
+    HangingNotifier,
+)
 from tests.fakes.models import FakeModelRuntime, FakeVisionLLM
 
 BOX = BBox(0.0, 0.0, 10.0, 10.0)
@@ -98,6 +108,34 @@ class Worker:
             await self._task
 
 
+class NotificationWorker:
+    """Runs the notification dispatcher's worker for the duration of an `async with`.
+
+    A second, separate task from `Worker` above, deliberately: that separation is
+    the property these tests exist to check, and a helper that ran both loops in one
+    task would make it untestable.
+    """
+
+    def __init__(self, dispatcher: NotificationDispatcher) -> None:
+        self._dispatcher = dispatcher
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> NotificationDispatcher:
+        self._task = asyncio.create_task(self._dispatcher.run())
+        return self._dispatcher
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        assert self._task is not None
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+
+
 class HangingVisionLLM(VisionLanguageModel):
     """A `describe` that never returns — the only shape that reaches the timeout.
 
@@ -137,6 +175,9 @@ def a_request(
     tracks: tuple[Track, ...] = (),
     timestamp: float = 12.5,
     camera_id: str = "cam-1",
+    zone: Zone | None = None,
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
+    notify_min_confidence: Confidence = Confidence.LIKELY,
 ) -> EscalationRequest:
     scene = SceneState(
         camera_id=camera_id,
@@ -158,6 +199,9 @@ def a_request(
         camera_label="Front Door",
         history=(),
         clip=clip,
+        zone=zone,
+        notify_on=notify_on,
+        notify_min_confidence=notify_min_confidence,
     )
 
 
@@ -202,6 +246,7 @@ def new_scheduler(
     clock: Callable[[], float] = clock,
     wall_clock: Callable[[], float] = wall_clock,
     recent_events_per_camera: int = RECENT_EVENTS_PER_CAMERA,
+    notifications: NotificationDispatcher | None = None,
 ) -> VlmScheduler:
     return VlmScheduler(
         vlm=vlm
@@ -217,6 +262,7 @@ def new_scheduler(
         resident_set=resident_set or RecordingResidentSet(),
         vlm_model_key=VLM_KEY,
         dead_letter=dead_letter or FakeFailedEventSink(),
+        notifications=notifications or NotificationDispatcher(FakeNotifier()),
         maxsize=maxsize,
         timeout_seconds=timeout_seconds,
         clock=clock,
@@ -1189,3 +1235,188 @@ class TestTheRecentEventHistory:
 
         assert len(scheduler.event_history("cam-quiet").events) == 1
         assert len(scheduler.event_history("cam-busy").events) == 3
+
+
+class TestWelfareNotification:
+    """Task 10: a published event's welfare concerns reach a human.
+
+    Everything before this task produced an `Event` and stopped. These tests are
+    about the last hop — which concerns route (the rule itself is pinned in
+    `tests/domain/policy/test_notification.py`), what the note carries, and the two
+    things a welfare notifier must never do: block the pipeline, or fail it.
+    """
+
+    @staticmethod
+    def _vlm(
+        confidence: Confidence = Confidence.LIKELY,
+        threat_value: float = 0.9,
+        kind: ConcernKind = ConcernKind.COLLAPSE,
+    ) -> FakeVisionLLM:
+        return FakeVisionLLM(
+            response=SceneDescription(
+                description="A person is lying motionless on the floor.",
+                threat_value=threat_value,
+                suggested_action="Dispatch a responder now.",
+                welfare=WelfareAssessment(
+                    concerns=(
+                        WelfareConcern(
+                            kind=kind,
+                            confidence=confidence,
+                            evidence="prone near the wall, not moving",
+                        ),
+                    )
+                ),
+            )
+        )
+
+    async def _run(
+        self,
+        vlm: VisionLanguageModel,
+        notifier: Notifier,
+        request: EscalationRequest,
+        publisher: EventPublisher | None = None,
+    ) -> NotificationDispatcher:
+        """One escalation, all the way through both workers.
+
+        `drain()` on each, in the pipeline's own order, so the assertions afterwards
+        run against a settled system rather than a race. The `wait_for` is the
+        failure path only: a scheduler that never dispatches leaves the note queue
+        empty and drains instantly, so it is the *hanging* implementations these
+        tests must not deadlock the suite over.
+        """
+        dispatcher = NotificationDispatcher(notifier)
+        scheduler = new_scheduler(vlm=vlm, publisher=publisher, notifications=dispatcher)
+        async with Worker(scheduler), NotificationWorker(dispatcher):
+            scheduler.submit(request)
+            await asyncio.wait_for(scheduler.drain(), timeout=5.0)
+            await asyncio.wait_for(dispatcher.drain(), timeout=5.0)
+        return dispatcher
+
+    async def test_a_likely_concern_notifies_once_with_the_clip_uri(self) -> None:
+        """The whole path, end to end: describe -> welfare -> clip finished ->
+        publish -> one note carrying the clip the responder will want."""
+        writer = FakeClipWriter()
+        handle = await writer.open("cam-1", uuid4(), fps=10.0)
+        notifier = FakeNotifier()
+        await self._run(self._vlm(), notifier, a_request(clip=handle))
+
+        assert len(notifier.notes) == 1, "one note per event, not one per concern"
+        note = notifier.notes[0]
+        assert note.clip_uri == await handle.finish(), (
+            "the note must carry the clip's uri, which only exists after finish() — "
+            "a note built before _attach_clip would carry None"
+        )
+        assert note.concerns[0].kind is ConcernKind.COLLAPSE
+        assert note.severity == "critical"
+
+    async def test_a_possible_concern_below_the_caution_band_does_not_notify(self) -> None:
+        notifier = FakeNotifier()
+        await self._run(
+            self._vlm(confidence=Confidence.POSSIBLE, threat_value=0.1),
+            notifier,
+            a_request(notify_min_confidence=Confidence.POSSIBLE),
+        )
+        assert notifier.notes == []
+
+    async def test_a_camera_that_notifies_about_nothing_never_notifies(self) -> None:
+        """`notify_on: []` is the operator's mute switch. A `likely` collapse at a
+        critical threat score is the loudest thing this system can produce, and it
+        still must not leave the process for a camera configured this way."""
+        notifier = FakeNotifier()
+        await self._run(self._vlm(), notifier, a_request(notify_on=frozenset()))
+        assert notifier.notes == []
+
+    async def test_an_event_with_no_welfare_concerns_notifies_nobody(self) -> None:
+        notifier = FakeNotifier()
+        await self._run(
+            FakeVisionLLM(
+                response=SceneDescription(
+                    description="A person is standing near the door.",
+                    threat_value=0.9,
+                    suggested_action="Monitor.",
+                )
+            ),
+            notifier,
+            a_request(),
+        )
+        assert notifier.notes == [], (
+            "a high threat score is not a welfare concern; only the model's own "
+            "welfare opinion may notify"
+        )
+
+    async def test_the_note_carries_the_cameras_label_and_zone(self) -> None:
+        """A note reaches a person who is not looking at a console, so it has to say
+        where to go in that person's own vocabulary — not a camera id."""
+        notifier = FakeNotifier()
+        await self._run(self._vlm(), notifier, a_request(zone=Zone.CORRIDOR))
+
+        note = notifier.notes[0]
+        assert note.label == "Front Door"
+        assert note.zone == "corridor"
+        assert note.camera_id == "cam-1"
+
+    async def test_a_notifier_that_raises_does_not_fail_the_pipeline(self) -> None:
+        """The port asks implementations to raise so this caller can decide what a
+        failure means. It means nothing to the pipeline: the event is published, the
+        admission slot is released, and the worker lives to serve the next
+        escalation."""
+        publisher = FakePublisher()
+        notifier = FakeNotifier(error=RuntimeError("endpoint refused"))
+        dispatcher = await self._run(self._vlm(), notifier, a_request(), publisher=publisher)
+
+        assert len(publisher.events) == 1, "§9: a dead notifier must not cost the event"
+        assert dispatcher.failures == 1
+
+    async def test_the_notification_is_dispatched_after_the_event_is_published(self) -> None:
+        """Spec's order, pinned. `SlowPublisher` yields to the loop several times
+        inside `publish()`, so a dispatch queued *before* the publish would have
+        every opportunity to be delivered first and this test would see it."""
+        order: list[str] = []
+
+        class SlowPublisher(EventPublisher):
+            async def publish(self, event: Event) -> None:
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                order.append("publish")
+
+            async def close(self) -> None: ...
+
+        class OrderingNotifier(FakeNotifier):
+            async def notify(self, note: WelfareNote) -> None:
+                order.append("notify")
+                await super().notify(note)
+
+        notifier = OrderingNotifier()
+        dispatcher = NotificationDispatcher(notifier)
+        scheduler = new_scheduler(
+            vlm=self._vlm(), publisher=SlowPublisher(), notifications=dispatcher
+        )
+        async with Worker(scheduler), NotificationWorker(dispatcher):
+            scheduler.submit(a_request())
+            await scheduler.drain()
+            await asyncio.wait_for(dispatcher.drain(), timeout=5.0)
+
+        assert order == ["publish", "notify"]
+
+    async def test_a_hanging_notifier_does_not_delay_the_next_escalation(self) -> None:
+        """The reason dispatch is not awaited where the event is published. With one
+        GPU admission slot, awaiting a notifier that never returns would park the
+        escalation worker forever and no camera would be described again. Both
+        escalations must publish while the first note is still hanging."""
+        notifier = HangingNotifier()
+        dispatcher = NotificationDispatcher(notifier)
+        publisher = FakePublisher()
+        scheduler = new_scheduler(vlm=self._vlm(), publisher=publisher, notifications=dispatcher)
+        async with Worker(scheduler), NotificationWorker(dispatcher):
+            scheduler.submit(a_request(timestamp=1.0))
+            scheduler.submit(a_request(timestamp=2.0))
+            try:
+                await asyncio.wait_for(scheduler.drain(), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(
+                    "the escalation worker awaited the notifier: a dead webhook now "
+                    "stops every camera in the process"
+                )
+
+        assert len(publisher.events) == 2
+        assert notifier.started.is_set(), "test setup: the note must have reached the notifier"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
 
@@ -124,6 +125,32 @@ class FakeNotifier(Notifier):
         if self._error is not None:
             raise self._error
         self.notes.append(note)
+
+
+class HangingNotifier(Notifier):
+    """A `notify` that never returns.
+
+    `FakeNotifier(error=TimeoutError(...))` looks like a hang and is not one: it
+    raises on the first `await` and never reaches a caller's deadline at all. A
+    dead endpoint holding a socket open is the failure the dispatch timeout
+    exists for, and it does not raise — it simply never completes. Shared
+    between the dispatcher's own tests and the scheduler's, which need the same
+    shape to prove notification is off the escalation worker's path.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self._never_set = asyncio.Event()
+
+    async def notify(self, note: WelfareNote) -> None:
+        self.started.set()
+        try:
+            await self._never_set.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable: the event is never set")  # pragma: no cover
 
 
 class FakeFailedEventSink(FailedEventSink):

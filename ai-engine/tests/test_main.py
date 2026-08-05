@@ -25,13 +25,15 @@ from fastapi import FastAPI
 
 from sentinel_ai import main
 from sentinel_ai.adapters.detectors.yolo11 import Yolo11Detector
+from sentinel_ai.adapters.notifiers.logging import LoggingNotifier
+from sentinel_ai.adapters.notifiers.webhook import WebhookNotifier
 from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
 from sentinel_ai.adapters.serialization.event_codec import validate_payload
 from sentinel_ai.adapters.sources.file import FileSource
 from sentinel_ai.adapters.sources.rtsp import RtspSource
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.routes import EngineServiceProtocol
-from sentinel_ai.config import Settings
+from sentinel_ai.config import NotifierKind, Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, Event, ThreatScore
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
@@ -54,6 +56,8 @@ from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.service import UnknownCameraError
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.ports.model_runtime import ModelRuntime
+from sentinel_ai.ports.notifier import Notifier
+from tests.fakes.io import FakeNotifier
 from tests.fakes.models import FakeDetector, FakeModelRuntime, FakeVisionLLM
 
 ASSET = Path(__file__).resolve().parent / "assets" / "synthetic_clip.mp4"
@@ -491,7 +495,11 @@ def fake_models() -> Models:
 
 
 def composed(
-    tmp_path: Path, *, broker: BrokerLink | None = None, **overrides: object
+    tmp_path: Path,
+    *,
+    broker: BrokerLink | None = None,
+    notifier: Notifier | None = None,
+    **overrides: object,
 ) -> tuple[Composition, Settings]:
     settings = Settings(
         source_realtime=False,
@@ -508,6 +516,7 @@ def composed(
         main.build_publisher(settings),
         None,
         main.build_dead_letter(settings),
+        notifier=notifier,
     )
     # The one thing CI may not have: a broker. `compose` builds a real `BrokerLink`
     # over the real publisher (asserted structurally in `TestCompose`); here it is
@@ -1183,3 +1192,111 @@ class TestTheAssembledSystemRuns:
         assert history.latest is not None
         assert history.latest.description, "the live panel needs a description to show"
         assert history.capacity == RECENT_EVENTS_PER_CAMERA
+
+
+class TestTheNotifierIsComposed:
+    """T10: the notifier a deployment configures is the one the engine notifies
+    through — and the credential in a webhook URL does not reach the log stream.
+
+    Everything before this task built notifiers nobody called. These are the wiring
+    tests: an unwired adapter here is invisible in every other test in the suite,
+    because a system that notifies nobody looks exactly like a site with nothing to
+    report.
+    """
+
+    def test_a_deployment_that_configures_nothing_gets_the_logging_notifier(self) -> None:
+        notifier = main.build_notifier(Settings(), main.build_dead_letter(Settings()))
+        assert isinstance(notifier, LoggingNotifier)
+
+    def test_a_webhook_deployment_gets_the_webhook_notifier(self, tmp_path: Path) -> None:
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url="https://ntfy.sh/secret-topic",
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        notifier = main.build_notifier(settings, main.build_dead_letter(settings))
+        assert isinstance(notifier, WebhookNotifier)
+        try:
+            assert notifier.timeout_seconds == 5.0, (
+                "the per-attempt HTTP timeout stays the adapter's own; "
+                "notifier_timeout_seconds is the outer dispatch ceiling"
+            )
+        finally:
+            notifier.remove_httpx_log_redaction()
+
+    def test_a_webhook_kind_with_no_url_fails_at_startup(self, tmp_path: Path) -> None:
+        """Silently falling back to logging would leave an operator who configured a
+        webhook believing alerts are going out. A welfare notifier that quietly
+        notifies nobody is the one failure this whole feature cannot have."""
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK, dead_letter_dir=str(tmp_path / "dl")
+        )
+        with pytest.raises(ValueError, match="notifier_webhook_url"):
+            main.build_notifier(settings, main.build_dead_letter(settings))
+
+    def test_building_a_webhook_notifier_redacts_its_url_from_httpx_own_logging(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Task 6 exposed `install_httpx_log_redaction` as an explicit named function
+        precisely so it would not be a hidden side effect of constructing an adapter
+        — which left it inert, with no caller anywhere. httpx logs
+        `HTTP Request: POST <url>` at INFO on the process-wide `httpx` logger, and
+        that URL routinely embeds a token (ntfy's topic, Slack's incoming-webhook
+        path). Without this call every deployment that configures a webhook writes
+        its credential into its own logs.
+        """
+        url = "https://ntfy.sh/secret-topic"
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url=url,
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        notifier = main.build_notifier(settings, main.build_dead_letter(settings))
+        assert isinstance(notifier, WebhookNotifier)
+        try:
+            with caplog.at_level(logging.INFO, logger="httpx"):
+                logging.getLogger("httpx").info('HTTP Request: POST %s "200 OK"', url)
+            assert caplog.records, "test setup: the log line must have been emitted"
+            assert all(url not in record.getMessage() for record in caplog.records)
+            assert any("<webhook url redacted>" in r.getMessage() for r in caplog.records)
+        finally:
+            notifier.remove_httpx_log_redaction()
+
+    def test_the_composed_scheduler_notifies_through_the_configured_notifier(
+        self, tmp_path: Path
+    ) -> None:
+        """The wire that makes every other notification test mean anything in
+        production: the object `compose` was handed is the object the scheduler's
+        dispatcher delivers to."""
+        notifier = FakeNotifier()
+        composition, _ = composed(tmp_path, notifier=notifier)
+        assert composition.notifier is notifier
+        assert composition.service._scheduler.notifications._notifier is notifier
+
+    def test_a_composition_given_no_notifier_still_has_one(self, tmp_path: Path) -> None:
+        composition, _ = composed(tmp_path)
+        assert isinstance(composition.notifier, LoggingNotifier)
+
+    async def test_stop_removes_the_httpx_redaction_filter_and_closes_the_client(
+        self, tmp_path: Path
+    ) -> None:
+        """The filter is attached to the process-wide `httpx` logger, so leaving it
+        there after the notifier it belongs to is gone leaks a closure holding a
+        credential for the lifetime of the process — and, in a test process that
+        composes repeatedly, one filter per composition."""
+        settings = Settings(
+            notifier_kind=NotifierKind.WEBHOOK,
+            notifier_webhook_url="https://ntfy.sh/secret-topic",
+            dead_letter_dir=str(tmp_path / "dl"),
+        )
+        notifier = main.build_notifier(settings, main.build_dead_letter(settings))
+        assert isinstance(notifier, WebhookNotifier)
+        assert logging.getLogger("httpx").filters, "test setup: the filter must be installed"
+
+        composition, _ = composed(tmp_path, notifier=notifier)
+        service = ComposedService(lambda: composition)
+        await service.start()
+        await service.stop()
+
+        assert logging.getLogger("httpx").filters == []
+        assert notifier._client.is_closed, "the pooled HTTP client is the composition's to close"

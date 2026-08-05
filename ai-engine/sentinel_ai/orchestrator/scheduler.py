@@ -85,7 +85,9 @@ from uuid import UUID
 
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, ThreatScore
-from sentinel_ai.domain.welfare import WelfareAssessment
+from sentinel_ai.domain.policy.notification import concerns_to_notify
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment
+from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
 from sentinel_ai.orchestrator.event_history import (
     RECENT_EVENTS_PER_CAMERA,
@@ -93,10 +95,12 @@ from sentinel_ai.orchestrator.event_history import (
     EventSubscription,
     RecentEventLog,
 )
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.ports.clip_writer import ClipHandle
 from sentinel_ai.ports.event_publisher import EventPublisher, FailedEventSink
 from sentinel_ai.ports.frame_source import FrameData
+from sentinel_ai.ports.notifier import WelfareNote
 from sentinel_ai.ports.vision_llm import SceneDescription, VisionLanguageModel, VisionRequest
 
 logger = logging.getLogger(__name__)
@@ -123,6 +127,32 @@ class EscalationRequest:
     camera_label: str
     history: tuple[str, ...]
     clip: ClipHandle | None
+
+    zone: Zone | None
+    """Where this camera watches, for the note a human reads (T10).
+
+    Carried here rather than looked up: this object is the runner's whole
+    handover, and a scheduler that reached back for a camera's zone would have to
+    hold a reference to the pipeline it exists to be decoupled from.
+    """
+
+    notify_on: frozenset[ConcernKind]
+    notify_min_confidence: Confidence
+    """This camera's welfare-notification policy, read off the runner at the moment
+    the escalation was decided (T10).
+
+    Snapshotted with the rest of the request rather than consulted at notify time,
+    for `_escalate`'s stated reason: an escalation half on the old policy and half
+    on the new one has no defensible meaning, and `apply_metadata` can land at any
+    await between here and the published event. `CameraRunner` still branches on
+    neither — the frame loop carries them, and the rule that reads them
+    (`domain/policy/notification.py`) runs here, downstream of the publish.
+
+    No defaults, like every other field on this record: a request that silently
+    defaulted to "notify about everything" would notify about a camera an operator
+    had muted, and one that defaulted to the empty set would mute a camera nobody
+    muted. Both are wrong, and neither is visible without a test that looks for it.
+    """
 
 
 _UNAVAILABLE_THREAT_VALUE = 0.5
@@ -178,6 +208,7 @@ class VlmScheduler:
         resident_set: ResidentSet,
         vlm_model_key: str,
         dead_letter: FailedEventSink,
+        notifications: NotificationDispatcher,
         maxsize: int,
         timeout_seconds: float,
         clock: Callable[[], float],
@@ -193,6 +224,13 @@ class VlmScheduler:
         # unwired last resort is indistinguishable from no last resort, and the
         # failure it guards against is silent by construction.
         self._dead_letter = dead_letter
+        # Required for the same reason `dead_letter` is. A deployment that
+        # configures nothing still gets `LoggingNotifier` (see `main.build_notifier`),
+        # so "no notifier" is never a real state — and an optional parameter here
+        # would make an unwired dispatch indistinguishable from a site where nothing
+        # was worth notifying about, which is the one failure a welfare system may
+        # not have.
+        self._notifications = notifications
         self._timeout_seconds = timeout_seconds
         self._clock = clock
         # Injected rather than taken from `time` directly so no test needs a real
@@ -320,6 +358,17 @@ class VlmScheduler:
         await self._queue.join()
 
     @property
+    def notifications(self) -> NotificationDispatcher:
+        """The dispatcher this scheduler hands routed notes to.
+
+        Exposed so `EngineService` can own its worker task and drain it in the same
+        shutdown phase ordering it already applies to the escalation queue, without
+        a second constructor parameter that could be wired to a *different*
+        dispatcher than the one actually receiving notes.
+        """
+        return self._notifications
+
+    @property
     def dropped(self) -> int:
         return self._dropped
 
@@ -376,6 +425,11 @@ class VlmScheduler:
             event = await self._describe(request)
             event = await self._attach_clip(event, request)
             await self._publish(event)
+            # Spec's order: describe -> clip finalised -> publish -> notify. Last,
+            # and only after `_attach_clip`, so the note carries the clip uri the
+            # responder will want; and non-blocking, so the endpoint on the other
+            # end of it cannot hold the admission slot this `finally` releases.
+            self._notify(event, request)
         finally:
             self._admission.release(self._clock())
 
@@ -393,6 +447,49 @@ class VlmScheduler:
         except Exception as error:
             self._publish_failures += 1
             await self._dead_letter.store(event, error)
+
+    def _notify(self, event: Event, request: EscalationRequest) -> None:
+        """Route this event's welfare concerns to a human, if any of them qualify.
+
+        Synchronous on purpose. Everything expensive happens on the dispatcher's own
+        worker (`orchestrator/notifications.py`); what runs here is the rule and a
+        `put_nowait`, so the escalation worker never awaits a network it does not
+        control. `submit()` cannot raise and its return value is deliberately
+        ignored — a full queue is already counted and logged there, and there is
+        nothing this frame could do about it that would not cost the pipeline more
+        than the note is worth.
+
+        Deliberately runs even when `_publish` fell back to the dead-letter sink. A
+        broker outage is the case *most* worth reaching a person over: the event is
+        safe on disk, nobody is looking at a console that has stopped receiving, and
+        muting the alert because the wrong pipe broke would be exactly backwards.
+        """
+        concerns = concerns_to_notify(
+            event.welfare,
+            severity=event.threat.severity,
+            notify_on=request.notify_on,
+            min_confidence=request.notify_min_confidence,
+        )
+        if not concerns:
+            return
+        self._notifications.submit(
+            WelfareNote(
+                event_id=event.event_id,
+                camera_id=event.camera_id,
+                label=request.camera_label,
+                zone=None if request.zone is None else request.zone.value,
+                occurred_at=event.occurred_at,
+                # The band this note was routed at, as a plain string an adapter
+                # serialises verbatim rather than reasons about — see `WelfareNote`.
+                severity=event.threat.severity.value,
+                description=event.description,
+                # Only the concerns that routed, never the whole assessment: a note
+                # naming a kind the operator muted would leak exactly what
+                # `notify_on` exists to suppress.
+                concerns=concerns,
+                clip_uri=event.clip_uri,
+            )
+        )
 
     async def _ensure_vlm_resident(self) -> None:
         """Reload an evicted VLM, and freshen its idle clock so it is not evicted again

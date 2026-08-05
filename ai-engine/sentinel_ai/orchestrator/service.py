@@ -123,6 +123,7 @@ class EngineService:
         self._scheduler_task: asyncio.Task[None] | None = None
         self._camera_tasks: list[asyncio.Task[None]] = []
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._notifications_task: asyncio.Task[None] | None = None
         self._idle_sweeper = _IdleSweeper(
             resident_set.sweep_idle,
             interval_seconds=idle_sweep_interval_seconds,
@@ -131,10 +132,17 @@ class EngineService:
         )
 
     async def start(self) -> None:
-        """Load the required models, then start the VLM worker, every camera, and the
-        periodic idle sweep (spec §5.4's 600s VLM idle-unload, S7-deferred to here)."""
+        """Load the required models, then start the VLM worker, the notification
+        worker, every camera, and the periodic idle sweep (spec §5.4's 600s VLM
+        idle-unload, S7-deferred to here)."""
         await self._resident_set.ensure(self._required_model_keys, self._clock())
         self._scheduler_task = asyncio.create_task(self._scheduler.run())
+        # Started here rather than left to whoever built the dispatcher: an unrun
+        # notification worker is silent by construction — `submit()` still returns
+        # True, the queue simply fills, and nothing anywhere reports that no note
+        # has left the process. Reached through the scheduler so it is necessarily
+        # the same dispatcher that receives the notes (T10).
+        self._notifications_task = asyncio.create_task(self._scheduler.notifications.run())
         self._camera_tasks = [
             asyncio.create_task(runner.run()) for runner in self._cameras.values()
         ]
@@ -186,6 +194,14 @@ class EngineService:
             task.cancel()
             with contextlib.suppress(BaseException):
                 await task
+        # The notification worker goes too, and synchronously: `cancel()` cannot
+        # itself be interrupted, so it holds even if the spill below never returns.
+        # It is cancelled rather than drained because we are already being cancelled
+        # — there is no time budget left to spend on a remote endpoint, and the
+        # events themselves are what §9 protects, not the notes about them.
+        notifications, self._notifications_task = self._notifications_task, None
+        if notifications is not None:
+            notifications.cancel()
         await self._scheduler.abandon_pending(reason)
 
     async def _unwind(self) -> None:
@@ -207,7 +223,9 @@ class EngineService:
           3. then the drain, bounded, so a wedged VLM cannot hold shutdown open;
           4. then the worker itself;
           5. and if the cap in (3) expired, whatever the worker never got to is
-             dead-lettered instead of evaporating with it.
+             dead-lettered instead of evaporating with it;
+          6. then, last, the notification queue those publishes filled — see
+             `_drain_notifications` for why it can only be last.
 
         Step 5 exists because the cap in step 3 reproduced the very defect steps 1-4
         were added to fix. `suppress(TimeoutError)` followed by cancelling the worker
@@ -244,6 +262,42 @@ class EngineService:
             # the queue, so running it against a live worker would race it for the same
             # request and could publish and dead-letter the same event.
             await self._scheduler.abandon_pending(expiry)
+
+        await self._drain_notifications()
+
+    async def _drain_notifications(self) -> None:
+        """Phase 6: deliver the notes the last escalations produced, then stop the
+        worker.
+
+        After step 5 and not before. The escalation worker is what *creates* notes,
+        so draining this queue while it still lives would drain a queue that is still
+        being filled; and `abandon_pending()` publishes nothing — its events are the
+        §9 degraded kind, which carry no welfare opinion and so route to nobody —
+        so nothing is added after it either.
+
+        Bounded by the same cap as the escalation drain, for the same reason: the
+        thing on the other end of a notification is somebody else's HTTP endpoint,
+        and a dead one holding a socket open must not be able to hold a
+        `docker compose down` open with it. Past the cap the delivery is cancelled
+        rather than waited on — unlike an escalation there is no §9 last resort to
+        spill to here, and there should not be: `WebhookNotifier` already
+        dead-letters its own undeliverable notes, and a second spool in this layer
+        would duplicate every one it wrote.
+        """
+        task, self._notifications_task = self._notifications_task, None
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(
+                    self._scheduler.notifications.drain(),
+                    timeout=self._shutdown_drain_timeout_seconds,
+                )
+            except TimeoutError:
+                logger.error(
+                    "welfare notifications did not drain within %.1fs; "
+                    "abandoning whatever is still in flight",
+                    self._shutdown_drain_timeout_seconds,
+                )
+        await self._cancel(task)
 
     @staticmethod
     async def _cancel(*tasks: asyncio.Task[None] | None) -> None:

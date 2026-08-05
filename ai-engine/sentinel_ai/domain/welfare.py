@@ -75,6 +75,18 @@ class Confidence(StrEnum):
     POSSIBLE = "possible"
     LIKELY = "likely"
 
+    def meets(self, minimum: Confidence) -> bool:
+        """Whether this tier is at least `minimum`.
+
+        A method rather than leaving every caller to compare members directly:
+        `Confidence` is a `StrEnum`, so `Confidence.POSSIBLE >= Confidence.LIKELY`
+        compiles, runs, and answers by *alphabetical* order of the values —
+        `"possible" > "likely"` is True, which is the exact inversion of what a
+        caller writing that comparison means. The rank table below is the only
+        ordering this type has, and this is the only way to reach it.
+        """
+        return _CONFIDENCE_RANK[self] >= _CONFIDENCE_RANK[minimum]
+
 
 _CONFIDENCE_RANK: dict[Confidence, int] = {
     Confidence.POSSIBLE: 0,

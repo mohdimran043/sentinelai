@@ -17,9 +17,10 @@ from sentinel_ai.domain.entities import BBox, Detection
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
-from sentinel_ai.orchestrator.scheduler import VlmScheduler
+from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.pipeline import runner as runner_module
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
@@ -28,6 +29,7 @@ from tests.fakes.io import (
     FakeClipHandle,
     FakeClipWriter,
     FakeFailedEventSink,
+    FakeNotifier,
     FakePublisher,
     FakeSource,
 )
@@ -259,10 +261,40 @@ def new_scheduler(
         resident_set=new_resident_set(),
         vlm_model_key=VLM_KEY,
         dead_letter=FakeFailedEventSink(),
+        notifications=NotificationDispatcher(FakeNotifier()),
         maxsize=maxsize,
         timeout_seconds=5.0,
         clock=lambda: 0.0,
     )
+
+
+class RecordingScheduler(VlmScheduler):
+    """The real scheduler, recording every request the runner hands it.
+
+    A subclass rather than a stub: these tests are about what the *runner* puts on
+    the request, and everything downstream of `submit` — the describe, the publish,
+    the drain the test awaits — has to keep working for the recording to be taken
+    at a realistic moment.
+    """
+
+    def __init__(self, publisher: FakePublisher) -> None:
+        super().__init__(
+            vlm=FakeVisionLLM(),
+            publisher=publisher,
+            admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+            resident_set=new_resident_set(),
+            vlm_model_key=VLM_KEY,
+            dead_letter=FakeFailedEventSink(),
+            notifications=NotificationDispatcher(FakeNotifier()),
+            maxsize=4,
+            timeout_seconds=5.0,
+            clock=lambda: 0.0,
+        )
+        self.submitted: list[EscalationRequest] = []
+
+    def submit(self, request: EscalationRequest) -> bool:
+        self.submitted.append(request)
+        return super().submit(request)
 
 
 def make_runner(
@@ -276,6 +308,9 @@ def make_runner(
     motion: MotionAnalyzer | None = None,
     preroll: PreRollBuffer | None = None,
     detect_every_n_frames: int = 1,
+    zone: Zone | None = None,
+    notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
+    notify_min_confidence: Confidence = Confidence.LIKELY,
     clip_preroll_seconds: float | None = None,
     clip_postroll_seconds: float | None = None,
     summary_interval_seconds: float | None = None,
@@ -292,6 +327,9 @@ def make_runner(
         clip_writer=clip_writer,
         preroll=preroll or PreRollBuffer(preroll_seconds=3.0),
         detect_every_n_frames=detect_every_n_frames,
+        zone=zone,
+        notify_on=notify_on,
+        notify_min_confidence=notify_min_confidence,
         clip_preroll_seconds=clip_preroll_seconds,
         clip_postroll_seconds=clip_postroll_seconds,
         summary_interval_seconds=summary_interval_seconds,
@@ -1807,3 +1845,63 @@ class TestTheWelfarePolicyOnTelemetry:
         assert telemetry.clip_preroll_seconds == 0.0
         assert telemetry.clip_postroll_seconds == 2.5
         assert telemetry.summary_interval_seconds == 90.0
+
+
+class TestTheWelfarePolicyOnTheEscalationRequest:
+    """T10: the policy the console edits has to reach the code that routes.
+
+    `CameraRunner` still branches on none of it — the routing rule runs in
+    `VlmScheduler`, downstream of the published event. But the scheduler has no
+    reference to any runner, so the policy travels on the request, snapshotted at
+    the moment the escalation was decided. Nothing else in the suite would notice
+    if that snapshot were dropped: every welfare test upstream of here builds an
+    `EscalationRequest` by hand.
+    """
+
+    async def _escalate(self, runner: CameraRunner, scheduler: RecordingScheduler) -> None:
+        async with Worker(scheduler):
+            await runner.run()
+            await scheduler.drain()
+
+    async def test_the_request_carries_the_cameras_zone_and_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patch_postroll(monkeypatch, seconds=1.0)
+        scheduler = RecordingScheduler(FakePublisher())
+        runner = make_runner(
+            source=FakeSource.constant("cam-1", count=1),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+            zone=Zone.DAYROOM,
+            notify_on=frozenset({ConcernKind.COLLAPSE}),
+            notify_min_confidence=Confidence.POSSIBLE,
+        )
+        await self._escalate(runner, scheduler)
+
+        assert len(scheduler.submitted) == 1
+        request = scheduler.submitted[0]
+        assert request.zone is Zone.DAYROOM
+        assert request.notify_on == frozenset({ConcernKind.COLLAPSE})
+        assert request.notify_min_confidence is Confidence.POSSIBLE
+
+    async def test_a_live_edit_reaches_the_next_escalation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`apply_metadata` promises the new values take effect on the next
+        escalation. For `notify_on` that promise is only worth anything if the
+        request is built from the current field rather than from one captured at
+        construction — muting a camera through `PATCH /cameras/{id}` and having it
+        keep notifying is the failure this test exists to catch."""
+        patch_postroll(monkeypatch, seconds=1.0)
+        scheduler = RecordingScheduler(FakePublisher())
+        runner = make_runner(
+            source=FakeSource.constant("cam-1", count=1),
+            detector=FakeDetector(script=[()]),
+            scheduler=scheduler,
+        )
+        apply_policy(runner, zone=Zone.ROOM, notify_on=frozenset())
+        await self._escalate(runner, scheduler)
+
+        assert len(scheduler.submitted) == 1
+        assert scheduler.submitted[0].notify_on == frozenset()
+        assert scheduler.submitted[0].zone is Zone.ROOM
