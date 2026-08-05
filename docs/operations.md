@@ -59,8 +59,8 @@ nor a `cameras.json` present.
 |---|---|
 | `GET /health` | Per-model `state`, `detail`, `vram_mib` |
 | `GET /cameras` | `CameraStatus` for every camera, plus `config_writable` — whether the PATCH below will do anything on this deployment |
-| `GET /cameras/{id}/telemetry` | One camera's counters, its `label` and its `zone`. 404 if unknown |
-| `PATCH /cameras/{id}` | **Write.** Edits `label` and `zone`, persisted to `cameras.json`. **Off by default** — 403 unless `SENTINEL_ENABLE_CAMERA_WRITES=true`. See [Editing cameras from the console](#editing-cameras-from-the-console) |
+| `GET /cameras/{id}/telemetry` | One camera's counters, its `label`, its `zone` and its stored welfare policy. 404 if unknown |
+| `PATCH /cameras/{id}` | **Write.** Edits `label`, `zone` and the per-camera welfare policy, persisted to `cameras.json`. **Off by default** — 403 unless `SENTINEL_ENABLE_CAMERA_WRITES=true`. See [Editing cameras from the console](#editing-cameras-from-the-console) |
 | `POST /cameras/{id}/describe` | Forces a `user_requested` escalation, returns `event_id` |
 | `GET /cameras/{id}/events` | A bounded ring of that camera's recent events, capped at 200, plus `latest` and `latest_description_state` (`none`/`available`/`unavailable`). Volatile — this is the console's view, not the event store. RabbitMQ plus the Go consumer is the durable record. 404 if unknown |
 | `GET /events/stream` | `text/event-stream`. Opens with `event: backlog` carrying a JSON array, then streams live events. A sequence watermark makes the backlog-to-live handover gapless and duplicate-free; the same `event_id` at a higher sequence is a legitimate new version, not a repeat — that is how a clip URI back-fills onto an event a client already displayed. The ring is bounded, so a long disconnect genuinely loses history |
@@ -129,9 +129,143 @@ Reconcile the file and restart rather than letting the console overwrite it.
 
 In the console, this is the **Camera record** panel on a camera's own page. When
 `config_writable` is false the panel still shows the stored record, read-only,
-and names the environment variable — hiding it would leave a camera's label and
-zone with nowhere in the console they can be read. `url` and `profile` are listed
-as restart-required with no value, because no endpoint returns one.
+and names the environment variable — hiding it would leave a camera's label,
+zone and welfare policy with nowhere in the console they can be read. `url` and
+`profile` are listed as restart-required with no value, because no endpoint
+returns one.
+
+## Welfare notifications
+
+When the gate escalates and the VLM describes the keyframe, the same prompt also
+asks it to look for five specific things and say plainly whether it sees them:
+
+- a person collapsed, fallen, lying on the ground or apparently unresponsive;
+- a physical altercation between people;
+- apparent self-harm;
+- an apparent medication or unlabelled-container ingestion;
+- any other apparent distress or harm — restraint, dragging, a clutched injury,
+  a raised weapon.
+
+What it says comes back as a list of `{kind, confidence, evidence}` concerns
+carried on the event, and — if it clears the camera's bar — is sent to somebody
+who is not watching the console.
+
+### Read this before you rely on it
+
+**This asks a vision-language model about single still frames. It is not a fall
+detector, and nothing downstream may treat it as one.**
+
+- **One frame, no memory.** The model sees the keyframe of an escalation the
+  gate already chose to spend a GPU slot on, and the token bucket and cooldown
+  bound that to one escalation per 10 s per camera in steady state (a burst of
+  2, then refill). Something that begins and ends between two escalations is
+  never looked at by anything. The forced-look interval —
+  `summary_interval_seconds`, 45 s by default — is the only thing that guarantees
+  a camera is looked at at all when nothing trips a trigger.
+- **No pose or action recognition exists in this phase.** The detector reports
+  that a `person` box is present, never what that person is doing. There is no
+  limb tracking and no action classifier behind any of this.
+- **It misses things.** In prior measurement on real footage, **a stretcher
+  carry was missed entirely** — a person carried out of a room on a stretcher,
+  and the system said nothing. Absence of a notification is not evidence that
+  nothing happened, and must never be used as one.
+- **Fallible in both directions.** A single frame cannot reliably separate
+  someone lying down from someone who has collapsed, or horseplay from an
+  assault, and the model will confidently assert either.
+- **There are two confidence tiers and there is no `certain`.** `possible` and
+  `likely` are the whole scale, because one still frame cannot honestly earn
+  more. A `likely collapse` is the model saying what it saw clearly supports
+  that reading — not that it happened.
+- **The medication check is deliberately narrow.** The prompt does not ask the
+  model to name a substance, estimate a dose, or judge whether medication was
+  prescribed, and the evidence it returns describes only what was visible.
+  Clinical judgement is not something a single-frame VLM may be asked for in a
+  custodial setting.
+
+Treat a notification as a reason to go and look at the clip. Never as a finding.
+
+### When a notification actually goes out
+
+A concern notifies when **all three** hold:
+
+1. its `kind` is in that camera's `notify_on` (default: every kind), **and**
+2. its `confidence` meets that camera's `notify_min_confidence` (default:
+   `likely`), **and**
+3. if the concern is only `possible`, the event's threat score is already in the
+   **caution band or above** — `medium`, `high` or `critical`, i.e. a threat
+   score of 0.4 or more.
+
+The third clause holds even for a camera that lowered its own bar to `possible`.
+Asking to be told about maybes is not the same as asking to be told about every
+maybe in an otherwise unremarkable scene, and a notifier that cries wolf is one
+an operator learns to ignore — which is a muted notifier with extra steps.
+
+The note carries **only the concerns that routed**, never the whole assessment:
+including a kind the operator muted would leak exactly what `notify_on` exists
+to suppress.
+
+Per-camera policy lives in `cameras.json` and is editable at runtime — see
+[Editing cameras from the console](#editing-cameras-from-the-console) and
+[Configuration](configuration.md#the-per-camera-welfare-policy).
+
+### Choosing the channel
+
+| `SENTINEL_NOTIFIER_KIND` | What it does |
+|---|---|
+| `logging` *(default)* | One structured INFO line per routed note. No network, no configuration. A deployment that has decided nothing still leaves a trail an operator can `grep` |
+| `webhook` | POSTs the note as JSON to `SENTINEL_NOTIFIER_WEBHOOK_URL` |
+
+There is no `off`. Muting is per camera, via `notify_on: []` — which is a
+deliberate, auditable, per-camera decision rather than a global switch somebody
+flips during a noisy week and nobody re-flips.
+
+`webhook` with no URL **fails at startup**. It does not fall back to logging: an
+operator who mistyped the variable would otherwise get a process that starts
+cleanly and never sends the one alert it exists for.
+
+**Treat the webhook URL as a credential.** ntfy and Slack both put a
+per-recipient token in the URL path. The engine never logs it, never follows a
+redirect that could re-send it to another host, and installs a redaction filter
+over httpx's own request logging for as long as the notifier lives — httpx logs
+`HTTP Request: POST <url>` at INFO by default, which would otherwise put that
+token in the logs of every deployment that configures one.
+
+Delivery runs on its own worker, off the escalation path. One attempt is bounded
+at 5 s; a transient failure (5xx, 429, 408, connection error) is retried up to
+three times with backoff, a worst case of 18 s. A **4xx is not retried** — a 400
+will be 400 again, and retrying a 401 just replays a rejected credential.
+`SENTINEL_NOTIFIER_TIMEOUT_SECONDS` (default 20 s) is the outer ceiling on all of
+that, and a webhook deployment whose value does not clear the adapter's 18 s
+**refuses to start**. A note that still cannot be delivered is written to
+`SENTINEL_DEAD_LETTER_DIR` with `record_type: "WelfareNote"` rather than dropped.
+
+A hanging endpoint costs the note it belongs to and nothing else — never the GPU
+admission slot, never the next describe, never a clip. Notes queue up to 32 deep
+behind a slow notifier and are dropped beyond that, counted and logged.
+
+### The clip travels as a URL, and it may not open
+
+The note carries `clip_uri`, a MinIO object URL — not the bytes. Whoever
+receives the notification needs credentials for that bucket and a route to it,
+and **may have neither**. The webhook body therefore carries a literal
+`clip_uri_note` field saying exactly that, always present rather than only when
+there is a clip: a responder who cannot open the link needs to know that
+immediately, not after two minutes of clicking.
+
+`clip_uri` is also legitimately `null`: a clip that failed to write does not
+suppress the notification. A note with no clip is still worth sending.
+
+### Latency is bounded below by the post-roll
+
+The order is fixed: describe → clip finalised → publish → **notify**. The clip is
+finalised when its post-roll deadline passes, so a notification cannot go out any
+sooner than `clip_postroll_seconds` after the keyframe — 5 s by default, and
+per-camera overridable.
+
+That is a real trade-off and it points both ways: **a shorter post-roll is a
+faster alert and less evidence.** Notifying before the clip was finalised would
+send a note whose `clip_uri` pointed at nothing, which is why the order is what
+it is.
 
 ## Running the console
 

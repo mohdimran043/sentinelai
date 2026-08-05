@@ -144,6 +144,10 @@ Who gets told when the vision model reports a welfare concern. The routing rule
 itself is per camera and lives in `cameras.json` (`notify_on`,
 `notify_min_confidence`); these settings choose the channel it goes out on.
 
+Read [Operations → Welfare notifications](operations.md#welfare-notifications)
+before turning this on anywhere real. It asks a vision-language model about
+single still frames, it is not a fall detector, and it misses things.
+
 | Setting | Default | Effect |
 |---|---|---|
 | `SENTINEL_NOTIFIER_KIND` | `logging` | `logging` \| `webhook`. `logging` writes one line per routed note and touches no network, so a deployment that configures nothing still leaves a trail. There is no "off" — muting is per camera, via `notify_on: []`. |
@@ -203,6 +207,54 @@ credentials in them.
   it and the camera is ungrouped, which is a legitimate deployment. Give it a
   value the engine does not know and **startup fails**: a typo'd zone is a
   camera the operator meant to group and silently did not.
+
+### The per-camera welfare policy
+
+Five more optional fields per camera. Every one of them has a default, so an
+existing `cameras.json` that mentions none of them keeps loading and behaves
+exactly as it did.
+
+| Field | Default when absent | Meaning |
+|---|---|---|
+| `notify_on` | **every kind** | Which welfare concern kinds this camera notifies a human about. An array of `collapse` \| `altercation` \| `self_harm` \| `medication` \| `distress` \| `other` |
+| `notify_min_confidence` | `likely` | The lowest tier that may notify: `possible` or `likely`. There is no `certain` — one still frame cannot earn it |
+| `clip_preroll_seconds` | `SENTINEL_CLIP_PREROLL_SECONDS` (3.0) | This camera's own pre-roll. `>= 0`; `0` means no lead-in at all |
+| `clip_postroll_seconds` | `SENTINEL_CLIP_POSTROLL_SECONDS` (5.0) | This camera's own post-roll. `> 0` |
+| `summary_interval_seconds` | the camera **profile's** `summary_interval_seconds` | This camera's forced-look interval. `> 0`. Distinct from `profile.summary_interval_seconds`, which is restart-only; this is the runtime-editable override, and it wins where both are set |
+
+```json
+{
+  "id": "cell_14",
+  "url": "rtsp://localhost:8554/cell_14",
+  "zone": "room",
+  "notify_on": ["collapse", "self_harm", "medication"],
+  "notify_min_confidence": "possible",
+  "clip_postroll_seconds": 12.0
+}
+```
+
+Two things about this that are easy to get backwards:
+
+- **Absent and empty are different**, exactly as `zone` already distinguishes
+  them. `notify_on` absent means *every kind*; `notify_on: []` means *never
+  notify from this camera*. Get this the wrong way round and either a camera the
+  operator silenced starts alerting, or one they meant to route goes quiet.
+- **An unknown concern kind fails at startup**, the same way an unknown `zone`
+  does. A typo'd kind is a concern the operator meant to be told about and
+  silently would not be.
+
+`notify_min_confidence: possible` still does not notify on a `possible` concern
+unless the event's threat score is already in the caution band or above — see
+[Operations → Welfare notifications](operations.md#when-a-notification-actually-goes-out)
+for the full rule, and
+[what this is and is not](operations.md#read-this-before-you-rely-on-it) before
+relying on any of it. It asks a vision-language model about single frames; it is
+not a fall detector, and a stretcher carry was missed entirely in measurement.
+
+Note the direct trade-off in `clip_postroll_seconds`: the notification is
+dispatched after the clip is finalised, so this value is the floor on how long
+it takes to reach a person. **A shorter post-roll is a faster alert and less
+evidence.**
 
 ### This file is written as well as read
 
