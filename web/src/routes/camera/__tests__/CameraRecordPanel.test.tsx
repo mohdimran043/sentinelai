@@ -3,7 +3,7 @@ import { beforeEach, vi } from 'vitest'
 import { screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
-import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
+import { CameraRecordPanel, type StoredCameraRecord } from '@/routes/camera/CameraRecordPanel'
 import * as engineClient from '@/api/engineClient'
 import { EngineHttpError, type CameraEditResponse } from '@/api/engineClient'
 
@@ -14,15 +14,23 @@ vi.mock('@/api/engineClient', async (importOriginal) => {
 
 const updateCamera = vi.mocked(engineClient.updateCamera)
 
+const ALL_KINDS = [
+  'altercation',
+  'collapse',
+  'distress',
+  'medication',
+  'other',
+  'self_harm',
+] as const
+
 const storedResponse: CameraEditResponse = {
   camera_id: 'avenue_01',
   label: 'East door',
   zone: 'corridor',
   zone_kind: 'common_area',
-  // The welfare notification policy the engine now echoes back on every edit. This
-  // panel neither renders nor edits it yet, but the response always carries it, and
-  // a fixture missing these fields would be a shape the engine never sends.
-  notify_on: ['altercation', 'collapse', 'distress', 'medication', 'other', 'self_harm'],
+  // The welfare notification policy the engine echoes back on every edit, in the
+  // sorted whole-list form it stores.
+  notify_on: [...ALL_KINDS],
   notify_min_confidence: 'likely',
   clip_preroll_seconds: null,
   clip_postroll_seconds: null,
@@ -31,7 +39,16 @@ const storedResponse: CameraEditResponse = {
   restart_required_fields: ['url', 'profile'],
 }
 
-const record = { label: 'Avenue entrance', zone: 'corridor' as const, zone_kind: 'common_area' as const }
+const record: StoredCameraRecord = {
+  label: 'Avenue entrance',
+  zone: 'corridor',
+  zone_kind: 'common_area',
+  notify_on: [...ALL_KINDS],
+  notify_min_confidence: 'likely',
+  clip_preroll_seconds: null,
+  clip_postroll_seconds: null,
+  summary_interval_seconds: null,
+}
 
 describe('CameraRecordPanel, read-only', () => {
   it('shows the stored record even when writes are disabled', () => {
@@ -46,6 +63,7 @@ describe('CameraRecordPanel, read-only', () => {
 
     expect(screen.queryByLabelText(/label/i)).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /save/i })).not.toBeInTheDocument()
   })
 
@@ -62,7 +80,7 @@ describe('CameraRecordPanel, read-only', () => {
     renderWithProviders(
       <CameraRecordPanel
         cameraId="avenue_01"
-        record={{ label: 'Loose camera', zone: null, zone_kind: null }}
+        record={{ ...record, zone: null, zone_kind: null, label: 'Loose camera' }}
         writable={false}
       />,
     )
@@ -82,6 +100,72 @@ describe('CameraRecordPanel, read-only', () => {
   })
 })
 
+describe('CameraRecordPanel, the welfare policy read-only', () => {
+  it('shows every routed kind rather than a count, so the list can be checked', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={false} />)
+
+    const routed = screen.getByTestId('camera-record-notify-on')
+    for (const kind of ['Collapse', 'Altercation', 'Self harm', 'Medication', 'Distress', 'Other']) {
+      expect(routed).toHaveTextContent(kind)
+    }
+  })
+
+  it('reads a muted camera as muted, not as unconfigured', () => {
+    // `notify_on: []` is a stored choice — somebody silenced this camera. An
+    // empty row would read as "nobody has set this up yet", which is the
+    // opposite: a muted camera keeps detecting and recording and tells no one.
+    renderWithProviders(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, notify_on: [] }}
+        writable={false}
+      />,
+    )
+
+    expect(screen.getByTestId('camera-record-notify-on')).toHaveTextContent(/muted/i)
+  })
+
+  it('shows the threshold and says the durations follow a default when unset', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={false} />)
+
+    expect(screen.getByTestId('camera-record-min-confidence')).toHaveTextContent('Likely')
+    // Null is "what is stored", not the effective value — the panel must not
+    // resolve a default it was never told.
+    expect(screen.getByTestId('camera-record-clip-preroll')).toHaveTextContent(/default/i)
+    expect(screen.getByTestId('camera-record-clip-postroll')).toHaveTextContent(/default/i)
+    expect(screen.getByTestId('camera-record-summary-interval')).toHaveTextContent(/default/i)
+  })
+
+  it('shows a stored duration override as the number it is', () => {
+    renderWithProviders(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{
+          ...record,
+          clip_preroll_seconds: 0,
+          clip_postroll_seconds: 8.5,
+          summary_interval_seconds: 30,
+        }}
+        writable={false}
+      />,
+    )
+
+    // Zero is an override, not an absent one: it means no lead-in at all.
+    expect(screen.getByTestId('camera-record-clip-preroll')).toHaveTextContent('0')
+    expect(screen.getByTestId('camera-record-clip-preroll')).not.toHaveTextContent(/default/i)
+    expect(screen.getByTestId('camera-record-clip-postroll')).toHaveTextContent('8.5')
+    expect(screen.getByTestId('camera-record-summary-interval')).toHaveTextContent('30')
+  })
+
+  it('says what these fields actually route, so nobody reads them as a detector', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={false} />)
+
+    const note = screen.getByTestId('camera-record-welfare-note')
+    expect(note).toHaveTextContent(/single frame/i)
+    expect(note).toHaveTextContent(/not a detector/i)
+  })
+})
+
 describe('CameraRecordPanel, editing', () => {
   beforeEach(() => {
     updateCamera.mockReset()
@@ -90,8 +174,8 @@ describe('CameraRecordPanel, editing', () => {
   it('offers a label input and a zone select when writes are enabled', () => {
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
 
-    expect(screen.getByLabelText(/label/i)).toHaveValue('Avenue entrance')
-    expect(screen.getByLabelText(/zone/i)).toHaveValue('corridor')
+    expect(screen.getByLabelText(/^label$/i)).toHaveValue('Avenue entrance')
+    expect(screen.getByLabelText(/^zone$/i)).toHaveValue('corridor')
     expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument()
   })
 
@@ -101,7 +185,7 @@ describe('CameraRecordPanel, editing', () => {
 
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
 
-    await user.type(screen.getByLabelText(/label/i), '!')
+    await user.type(screen.getByLabelText(/^label$/i), '!')
 
     expect(screen.getByRole('button', { name: /save/i })).toBeEnabled()
   })
@@ -111,7 +195,7 @@ describe('CameraRecordPanel, editing', () => {
     const user = userEvent.setup()
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
 
-    const input = screen.getByLabelText(/label/i)
+    const input = screen.getByLabelText(/^label$/i)
     await user.clear(input)
     await user.type(input, 'East door')
     await user.click(screen.getByRole('button', { name: /save/i }))
@@ -124,7 +208,7 @@ describe('CameraRecordPanel, editing', () => {
     const user = userEvent.setup()
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
 
-    await user.selectOptions(screen.getByLabelText(/zone/i), '')
+    await user.selectOptions(screen.getByLabelText(/^zone$/i), '')
     await user.click(screen.getByRole('button', { name: /save/i }))
 
     expect(updateCamera).toHaveBeenCalledWith('avenue_01', { zone: null })
@@ -134,7 +218,7 @@ describe('CameraRecordPanel, editing', () => {
     const user = userEvent.setup()
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
 
-    await user.clear(screen.getByLabelText(/label/i))
+    await user.clear(screen.getByLabelText(/^label$/i))
 
     expect(screen.getByText(/cannot be empty/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
@@ -146,7 +230,7 @@ describe('CameraRecordPanel, editing', () => {
     const user = userEvent.setup()
     renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
 
-    const input = screen.getByLabelText(/label/i)
+    const input = screen.getByLabelText(/^label$/i)
     await user.clear(input)
     await user.type(input, 'East door')
     await user.click(screen.getByRole('button', { name: /save/i }))
@@ -161,7 +245,7 @@ describe('CameraRecordPanel, editing', () => {
       <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
     )
 
-    const input = screen.getByLabelText(/label/i)
+    const input = screen.getByLabelText(/^label$/i)
     await user.clear(input)
     await user.type(input, 'Half-typed name')
 
@@ -174,7 +258,7 @@ describe('CameraRecordPanel, editing', () => {
       />,
     )
 
-    expect(screen.getByLabelText(/label/i)).toHaveValue('Half-typed name')
+    expect(screen.getByLabelText(/^label$/i)).toHaveValue('Half-typed name')
   })
 
   it('does not revert a field changed elsewhere while the operator edits a different one', async () => {
@@ -185,7 +269,7 @@ describe('CameraRecordPanel, editing', () => {
     )
 
     // Operator touches only the zone.
-    await user.selectOptions(screen.getByLabelText(/zone/i), 'room')
+    await user.selectOptions(screen.getByLabelText(/^zone$/i), 'room')
 
     // A 5s poll lands mid-edit: someone else renamed the camera. The operator
     // never touched the label, so this should not end up in the save request.
@@ -219,7 +303,202 @@ describe('CameraRecordPanel, editing', () => {
       />,
     )
 
-    expect(screen.getByLabelText(/label/i)).toHaveValue('Renamed by someone else')
+    expect(screen.getByLabelText(/^label$/i)).toHaveValue('Renamed by someone else')
+  })
+})
+
+describe('CameraRecordPanel, editing the welfare policy', () => {
+  beforeEach(() => {
+    updateCamera.mockReset()
+  })
+
+  it('offers a checkbox per concern kind, checked as stored', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    expect(screen.getAllByRole('checkbox')).toHaveLength(6)
+    for (const name of ['Collapse', 'Altercation', 'Self harm', 'Medication', 'Distress', 'Other']) {
+      expect(screen.getByRole('checkbox', { name })).toBeChecked()
+    }
+  })
+
+  it('shows a kind the camera does not route as unchecked', () => {
+    renderWithProviders(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, notify_on: ['collapse'] }}
+        writable={true}
+      />,
+    )
+
+    expect(screen.getByRole('checkbox', { name: 'Collapse' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Distress' })).not.toBeChecked()
+  })
+
+  it('sends [] when every kind is unchecked, since that is the mute switch', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, notify_on: [] })
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    for (const box of screen.getAllByRole('checkbox')) {
+      await user.click(box)
+    }
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { notify_on: [] })
+  })
+
+  it('sends the whole remaining list when one kind is unchecked', async () => {
+    updateCamera.mockResolvedValue(storedResponse)
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.click(screen.getByRole('checkbox', { name: 'Medication' }))
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', {
+      notify_on: ['altercation', 'collapse', 'distress', 'other', 'self_harm'],
+    })
+  })
+
+  it('omits notify_on entirely when the operator never touches it', async () => {
+    updateCamera.mockResolvedValue(storedResponse)
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    const input = screen.getByLabelText(/^label$/i)
+    await user.clear(input)
+    await user.type(input, 'East door')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { label: 'East door' })
+    expect(updateCamera).not.toHaveBeenCalledWith(
+      'avenue_01',
+      expect.objectContaining({ notify_on: expect.anything() }),
+    )
+  })
+
+  it('sends only the threshold when only the threshold changed', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, notify_min_confidence: 'possible' })
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.selectOptions(screen.getByLabelText(/minimum confidence/i), 'possible')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { notify_min_confidence: 'possible' })
+  })
+
+  it('offers no "certain" tier, because one still frame cannot earn it', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    const options = screen.getByLabelText(/minimum confidence/i).querySelectorAll('option')
+    expect([...options].map((option) => option.getAttribute('value'))).toEqual([
+      'possible',
+      'likely',
+    ])
+  })
+
+  it('sends a duration override as a number', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, clip_postroll_seconds: 9 })
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.type(screen.getByLabelText(/post-roll/i), '9')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { clip_postroll_seconds: 9 })
+  })
+
+  it('sends null when a stored override is cleared, reverting to the default', async () => {
+    updateCamera.mockResolvedValue(storedResponse)
+    const user = userEvent.setup()
+    renderWithProviders(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, summary_interval_seconds: 30 }}
+        writable={true}
+      />,
+    )
+
+    await user.clear(screen.getByLabelText(/summary interval/i))
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { summary_interval_seconds: null })
+  })
+
+  it('accepts a zero pre-roll, which means no lead-in at all', async () => {
+    updateCamera.mockResolvedValue({ ...storedResponse, clip_preroll_seconds: 0 })
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.type(screen.getByLabelText(/pre-roll/i), '0')
+    await user.click(screen.getByRole('button', { name: /save/i }))
+
+    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { clip_preroll_seconds: 0 })
+  })
+
+  it('refuses a zero post-roll without calling the engine', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.type(screen.getByLabelText(/post-roll/i), '0')
+
+    expect(screen.getByText(/greater than zero/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
+    expect(updateCamera).not.toHaveBeenCalled()
+  })
+
+  it('refuses a negative pre-roll without calling the engine', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.type(screen.getByLabelText(/pre-roll/i), '-1')
+
+    expect(screen.getByText(/negative/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
+    expect(updateCamera).not.toHaveBeenCalled()
+  })
+
+  it('refuses text that is not a number rather than silently discarding it', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    await user.type(screen.getByLabelText(/summary interval/i), 'soon')
+
+    // The operator's text survives; a number input would have eaten it and shown
+    // an empty box, which reads as "cleared" and means something else entirely.
+    expect(screen.getByLabelText(/summary interval/i)).toHaveValue('soon')
+    expect(screen.getByRole('button', { name: /save/i })).toBeDisabled()
+    expect(updateCamera).not.toHaveBeenCalled()
+  })
+
+  it('warns when the welfare policy changed elsewhere while an edit was in progress', async () => {
+    const user = userEvent.setup()
+    const { rerender } = renderWithProviders(
+      <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
+    )
+
+    await user.type(screen.getByLabelText(/^label$/i), '!')
+
+    // Someone muted this camera from another console mid-edit.
+    rerender(
+      <CameraRecordPanel
+        cameraId="avenue_01"
+        record={{ ...record, notify_on: [] }}
+        writable={true}
+      />,
+    )
+
+    const warning = await screen.findByTestId('camera-record-stale')
+    expect(warning).toHaveTextContent(/notify_on/i)
+  })
+
+  it('says what these fields actually route, so nobody reads them as a detector', () => {
+    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
+
+    const note = screen.getByTestId('camera-record-welfare-note')
+    expect(note).toHaveTextContent(/single frame/i)
+    expect(note).toHaveTextContent(/not a detector/i)
   })
 })
 
@@ -230,7 +509,7 @@ describe('CameraRecordPanel, failures', () => {
 
   async function editAndSave() {
     const user = userEvent.setup()
-    const input = screen.getByLabelText(/label/i)
+    const input = screen.getByLabelText(/^label$/i)
     await user.clear(input)
     await user.type(input, 'East door')
     await user.click(screen.getByRole('button', { name: /save/i }))
@@ -257,7 +536,7 @@ describe('CameraRecordPanel, failures', () => {
     await editAndSave()
 
     await screen.findByTestId('camera-record-error')
-    expect(screen.getByLabelText(/label/i)).toHaveValue('East door')
+    expect(screen.getByLabelText(/^label$/i)).toHaveValue('East door')
   })
 
   it('explains a 403 as writes having been turned off', async () => {
@@ -288,7 +567,7 @@ describe('CameraRecordPanel, failures', () => {
       <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
     )
 
-    await user.type(screen.getByLabelText(/label/i), '!')
+    await user.type(screen.getByLabelText(/^label$/i), '!')
 
     rerender(
       <CameraRecordPanel
@@ -302,7 +581,7 @@ describe('CameraRecordPanel, failures', () => {
     expect(warning).toHaveTextContent(/changed elsewhere/i)
     expect(warning).toHaveTextContent(/label/i)
     // The operator's text is informed against, never replaced.
-    expect(screen.getByLabelText(/label/i)).toHaveValue('Avenue entrance!')
+    expect(screen.getByLabelText(/^label$/i)).toHaveValue('Avenue entrance!')
   })
 
   it('does not warn when nothing changed underneath', async () => {
@@ -311,7 +590,7 @@ describe('CameraRecordPanel, failures', () => {
       <CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />,
     )
 
-    await user.type(screen.getByLabelText(/label/i), '!')
+    await user.type(screen.getByLabelText(/^label$/i), '!')
     rerender(<CameraRecordPanel cameraId="avenue_01" record={{ ...record }} writable={true} />)
 
     expect(screen.queryByTestId('camera-record-stale')).not.toBeInTheDocument()

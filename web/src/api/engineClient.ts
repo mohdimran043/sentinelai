@@ -12,6 +12,8 @@ export type CameraEditRequest = components['schemas']['CameraEditRequest']
 export type CameraEditResponse = components['schemas']['CameraEditResponse']
 export type Zone = components['schemas']['Zone']
 export type ZoneKind = components['schemas']['ZoneKind']
+export type ConcernKind = components['schemas']['ConcernKind']
+export type Confidence = components['schemas']['Confidence']
 
 /** The engine did not answer at all — network failure, DNS, connection refused. */
 export class EngineUnreachableError extends Error {
@@ -97,13 +99,14 @@ export function getCameraEvents(cameraId: string): Promise<CameraEventsResponse>
 }
 
 /**
- * Edit a camera's `label` and/or `zone`, persisted to the engine's
- * `cameras.json` before the response is sent.
+ * Edit a camera's `label`, `zone` and welfare notification policy, persisted to
+ * the engine's `cameras.json` before the response is sent.
  *
  * Sends `edit` verbatim, because *which keys are present* is the instruction:
  * an omitted `zone` leaves the grouping alone and an explicit `zone: null`
- * ungroups the camera. Build the body with `buildCameraEdit` rather than
- * assembling it at the call site.
+ * ungroups the camera; an omitted `notify_on` leaves the routing alone while
+ * `notify_on: []` mutes the camera. Build the body with `buildCameraEdit`
+ * rather than assembling it at the call site.
  */
 export function updateCamera(
   cameraId: string,

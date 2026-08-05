@@ -325,6 +325,11 @@ export function CameraPage() {
             label: cameraRecord.label,
             zone: cameraRecord.zone ?? null,
             zone_kind: cameraRecord.zone_kind ?? null,
+            notify_on: cameraRecord.notify_on,
+            notify_min_confidence: cameraRecord.notify_min_confidence,
+            clip_preroll_seconds: cameraRecord.clip_preroll_seconds,
+            clip_postroll_seconds: cameraRecord.clip_postroll_seconds,
+            summary_interval_seconds: cameraRecord.summary_interval_seconds,
           }}
           writable={camerasQuery.data?.config_writable ?? false}
         />
