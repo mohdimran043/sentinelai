@@ -13,7 +13,7 @@ npm run dev         # http://localhost:5173; proxies /engine/* to :8000 and /rec
 npm run build        # tsc -b && vite build
 npm run test          # vitest run
 npm run typecheck     # tsc -b
-npm run gen           # regenerate src/api/engine.types.ts and src/events/anomalyEvent.types.ts
+npm run gen           # regenerate src/api/engine.types.ts from contracts/openapi/
 ```
 
 ## Two products, two API clients

@@ -310,7 +310,7 @@ AST walk.
 
 **Why this is not style.** It is what makes the escalation gate and the VRAM
 planner testable on CPU in CI without a GPU — the project's central bet. The
-full CPU suite is **500+ tests in a few seconds**. "What does the gate do 601
+full CPU suite is **896 tests in a few seconds**. "What does the gate do 601
 seconds later, with a spent bucket, on a camera whose signature bin count just
 changed?" is a one-line test because `now` is an argument, not a clock read.
 Without the rule those become integration tests with sleeps, or they do not get
@@ -329,25 +329,31 @@ another catches `importlib.import_module` / `__import__`. Import analysis is an
 AST walk, so prose in a docstring mentioning `sentinel_ai.adapters` is
 documentation while a relative `from ..adapters import x` is a violation.
 
-**The positive controls are the point.** The same file carries 15 known-bad
+**The positive controls are the point.** The same file carries 16 known-bad
 module sources — the aliased clock read, the `perf_counter`, the relative
 outer-layer import, the `from sentinel_ai.config import get_settings`, the
 `import numpy` — and asserts the detectors flag each one, plus one clean module
-asserting there are no false positives. 23 tests. It also raises if a pure layer
+asserting there are no false positives. 24 tests. It also raises if a pure layer
 is missing or empty, so the checks cannot pass vacuously against zero files. A
 fitness function that has never been observed to fail is a hypothesis, not a
 guard.
 
-That standard is not fully met yet, and the exception is worth knowing.
-**The `clock-read` matcher is unpinned.** No known-bad case expects a
-`clock-read` offence — every "clock" case is satisfied by the
-`forbidden-import:time` detector instead — and the real-module scan passes
-vacuously because there are no violations to find. Gutting `_clock_reads` to
-`return []` survives the whole suite; that mutation has been run and confirmed.
-The matcher is live and does work, but nothing would catch a refactor that
-broke it. One `KNOWN_BAD_MODULES` entry using a non-banned module
-(`import asyncio` + `await asyncio.sleep(1)`, expecting `clock-read`) closes
-it. This is a known outstanding item, not a discovery.
+**The sixteenth control is the interesting one, and it is worth knowing why it
+exists.** For a long time the `clock-read` matcher was unpinned: every "clock"
+known-bad case *also* imported a banned module, the assertion is an
+`any(startswith(...))`, so `forbidden-import:time` satisfied it and the clock
+matcher was never under test. The real-module scan passed vacuously alongside
+it, having no violations to find. Gutting `_clock_reads` to `return []` survived
+the whole suite — that mutation was run, and it confirmed the hole.
+
+The fix was one entry: `import asyncio` plus `await asyncio.sleep(1.0)`,
+expecting `clock-read:asyncio.sleep`. `asyncio` is deliberately *not* on the
+forbidden-import list — the pure layers may not read a clock, but they are
+allowed to be asynchronous — which makes it the only case whose sole available
+offence is the clock read. The same mutation now fails, and fails only there.
+
+The general lesson outlived the specific bug: **a positive control that trips
+two detectors pins neither.** When adding one, check what else it would set off.
 
 **What it cost.** Small, real ergonomic friction. `FrameData.pixels` is typed
 `object` rather than `np.ndarray`, and adapters `isinstance`-check at the

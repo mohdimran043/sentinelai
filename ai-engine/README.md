@@ -63,6 +63,16 @@ field names, so a typo fails at startup instead of silently doing nothing. A
 else is taken as a path to a video file and builds a `FileSource`, so a
 replay over recorded footage is the same code path as a live camera.
 
+Six more optional per-camera fields exist, all with defaults, so a file that
+mentions none of them keeps loading: `zone` (`room`/`corridor`/`dayroom`, for
+grouping), and the welfare notification policy — `notify_on`,
+`notify_min_confidence`, `clip_preroll_seconds`, `clip_postroll_seconds` and
+`summary_interval_seconds`. An unknown `zone` or an unknown concern kind
+**fails at startup** rather than being ignored, on the same reasoning as a
+typo'd profile field. Full reference, with defaults and the absent-vs-`[]`
+distinction that decides whether a camera notifies anyone, is in
+[docs/configuration.md](../docs/configuration.md#the-per-camera-welfare-policy).
+
 A file rather than more `SENTINEL_*` variables because a camera is a nested
 record with a nested profile, and flattening a list of those into environment
 names is a worse interface than one small document that can be diffed,

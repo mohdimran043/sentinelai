@@ -6,7 +6,7 @@ later between both and the Phase 1C Go backend. Two files:
 | File | What it defines | Consumed by |
 |---|---|---|
 | `openapi/ai-engine.yaml` | The engine's HTTP API | `web/src/api/engine.types.ts` (generated) |
-| `events/anomaly_event.schema.json` | The anomaly event wire format | `web/src/events/anomalyEvent.types.ts` (generated); validated on every publish |
+| `events/anomaly_event.schema.json` | The anomaly event wire format | `ai-engine`'s `event_codec`, which validates every payload before it is published; and the Phase 1C consumer, when it exists |
 
 ## The rule
 
@@ -34,10 +34,17 @@ accident.
 ## Generating types
 
 ```bash
-cd web && npm run gen      # both of the below
-# npm run gen:api          # openapi-typescript -> src/api/engine.types.ts
-# npm run gen:events       # json-schema-to-typescript -> src/events/anomalyEvent.types.ts
+cd web && npm run gen      # openapi-typescript -> src/api/engine.types.ts
 ```
+
+**The event schema has no TypeScript generation, and the console does not
+consume it.** `json-schema-to-typescript` is in `web/`'s devDependencies from an
+earlier intent, but there is no `gen:events` script and no `src/events/`. What
+the console renders is `RecentEventEntry` from the *OpenAPI* types — the engine's
+bounded in-memory ring entry, which is a deliberately smaller shape than the
+published event and carries neither `welfare` nor `schema_version`. Do not read
+console code as evidence of what goes on the wire; the wire is the JSON schema
+and the Phase 1C consumer is its first real reader.
 
 Generated output is **committed**, so a fresh checkout builds without running
 codegen. Never hand-edit a generated file; regenerate it.

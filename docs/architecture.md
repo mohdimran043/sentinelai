@@ -11,9 +11,9 @@ The bet is that **those decisions can be pure functions**, and therefore tested
 exhaustively on a CPU in CI, in milliseconds, with no GPU and no model weights.
 
 That bet is why `domain/` and `ports/` are pure, and it pays: the full CPU suite
-runs **500+ tests in a few seconds** (`make test`). The escalation gate, the
-VRAM planner, the token bucket and all seven triggers are covered without CUDA
-ever initialising.
+runs **896 tests in a few seconds** (`make test`). The escalation gate, the
+VRAM planner, the token bucket, the welfare routing rule and all seven triggers
+are covered without CUDA ever initialising.
 The 19 tests that genuinely need a GPU or running infrastructure are marked
 `gpu` / `integration` and deselected.
 
@@ -70,36 +70,37 @@ a substring grep — prose in a docstring mentioning `sentinel_ai.adapters` is
 documentation, and a relative `from ..adapters import x` is a violation even
 though that string never appears.
 
-**Most of it has been proven to fail when violated.** The same file carries 15
+**All of it has been proven to fail when violated.** The same file carries 16
 known-bad module sources — an aliased `import time as t`, a
 `from ...adapters import`, an `importlib.import_module("torch")`,
 `from sentinel_ai.config import get_settings` — and asserts the detectors flag
-each one, plus one clean module asserting no false positives. 23 tests in that
+each one, plus one clean module asserting no false positives. 24 tests in that
 file. A fitness function nobody has watched fail is a hypothesis, not a guard.
 
 The suite also raises if a pure layer is missing or empty, so the checks can
 never pass vacuously against zero files.
 
-**One gap, verified.** The `clock-read` matcher is *not* pinned by any positive
-control. All 15 known-bad cases expect a `forbidden-import:*`, `dynamic-import`
-or `outer-layer:*` offence; none expects `clock-read`, and the assertion is an
-`any(startswith(...))`, so the import detector alone satisfies every "clock"
-case. Meanwhile `test_pure_layers_do_not_read_the_clock` scans real modules that
-currently have zero violations, so it passes vacuously. Replacing
-`_clock_reads`'s body with `return []` survives the entire suite — confirmed by
-running exactly that mutation.
+**The `clock-read` matcher is pinned too, and that took a second attempt.** The
+first fifteen known-bad cases all expected a `forbidden-import:*`,
+`dynamic-import` or `outer-layer:*` offence, and the assertion is an
+`any(startswith(...))` — so on every "clock" case the *import* ban satisfied it
+and `_clock_reads` was never the thing under test. Meanwhile
+`test_pure_layers_do_not_read_the_clock` scans real modules with zero
+violations, so it passed vacuously. Replacing `_clock_reads`'s body with
+`return []` survived the entire suite.
 
-The matcher does work today (a manual control injecting `await
-asyncio.sleep(1.0)` into `domain/entities.py` was correctly caught, and
-`asyncio` is deliberately *not* on the forbidden-import list, so only the clock
-matcher could have caught it). The risk is that a future refactor could
-silently gut it. **Fixing this is a one-line addition**: a `KNOWN_BAD_MODULES`
-entry using a module that is not itself banned, expecting `clock-read` —
-for example `import asyncio` plus `await asyncio.sleep(1)`.
+The sixteenth case closes it: `import asyncio` plus `await asyncio.sleep(1.0)`,
+expecting `clock-read:asyncio.sleep`. `asyncio` is deliberately *not* on the
+forbidden-import list — the pure layers may not read a clock but may be async —
+so it is the one case whose **only** available offence is the clock read. The
+same mutation now fails exactly that case and nothing else.
+
+Worth keeping in mind when adding a control: a positive control that trips two
+detectors pins neither of them.
 
 ## The ports
 
-Seven abstract interfaces in `ai-engine/sentinel_ai/ports/`. Everything
+Eight abstract interfaces in `ai-engine/sentinel_ai/ports/`. Everything
 replaceable is replaceable through one of them.
 
 | Port | File | Contract |
@@ -110,9 +111,19 @@ replaceable is replaceable through one of them.
 | `VisionLanguageModel` | `vision_llm.py` | `describe(VisionRequest) -> SceneDescription` |
 | `EventPublisher` / `FailedEventSink` | `event_publisher.py` | `publish(event)`. Must **raise** on failure, never swallow |
 | `ClipWriter` / `ClipHandle` | `clip_writer.py` | `open()` returns a handle; `append`/`finish`/`abort` stream packets |
+| `Notifier` | `notifier.py` | `notify(WelfareNote)`. Must **never raise** — the exact opposite of `EventPublisher` |
 | `ModelRuntime` | `model_runtime.py` | Lifecycle: `initialize`, `warmup`, `predict`, `shutdown`, `mark_unhealthy`, `health`, `version`, `capabilities` |
 
-Two shapes worth understanding:
+Three shapes worth understanding:
+
+**`EventPublisher` must raise; `Notifier` must never.** They look alike — both
+take one record and send it somewhere — and their failure contracts are
+opposites. A publisher that swallows an error loses an event that nothing else
+will ever write down, so `publish()` raising is what hands it to
+`FailedEventSink`. A notifier is best-effort commentary on a pipeline that has
+already published; one that raised would take down the thing it exists to
+observe. Implement the wrong one of these and the failure is silent in both
+directions.
 
 **`FrameSource` is dual-stream.** One demux pass produces both decoded frames
 (for detection, sampled) and encoded packets (for the pre-roll buffer and clip
@@ -182,6 +193,13 @@ One asyncio task per camera (`pipeline/runner.py`, `CameraRunner`).
     seconds via the per-camera anchor. `event_codec` validates it against
     `contracts/events/anomaly_event.schema.json`, then `EventPublisher.publish()`
     sends it. A publisher that raises hands the event to `FailedEventSink`.
+11. **Notify.** Last, and only after the publish: if the VLM reported a welfare
+    concern this camera routes, a `WelfareNote` is handed to `Notifier` — by
+    `put_nowait` onto a separate worker, never awaited here, so a hanging
+    webhook cannot hold the GPU admission slot the step above is still inside.
+    Deliberately runs even when the publish fell back to the dead-letter sink: a
+    broker outage is the case *most* worth reaching a person over. See
+    [operations](operations.md#welfare-notifications).
 
 ### The three governors
 

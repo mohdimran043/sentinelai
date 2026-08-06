@@ -15,6 +15,7 @@ does, that is a signal the port is wrong, not that you should edit the domain.
 | A vision model (Gemini, GPT, LLaVA, Gemma Vision) | `VisionLanguageModel` (+ `ModelRuntime`) | `adapters/vision/` |
 | A tracker | `Tracker` | `adapters/trackers/` |
 | An event publisher (Kafka, webhook, NATS) | `EventPublisher` | `adapters/publishers/` |
+| A welfare notifier (SMS, pager, Matrix, ntfy) | `Notifier` | `adapters/notifiers/` |
 | A clip store (S3, local disk, NAS) | `ClipWriter` + `ClipHandle` | `adapters/storage/` |
 | An escalation trigger | a pure predicate | `domain/policy/triggers.py` |
 | A console section | an entry + a page | `web/src/routes/recorder/` |
@@ -202,7 +203,7 @@ alone, because deciding it is what avoids paying for the expensive ones. If your
 trigger needs pixels, it belongs in the pipeline stage that computes
 `motion_energy` and `scene_signature`, not in the gate.
 
-## Adding a publisher or clip store
+## Adding a publisher, notifier, or clip store
 
 **Publisher** (`EventPublisher`): the one rule that matters is **every failure
 must raise**. `VlmScheduler` treats a raise as "the publisher did not take this
@@ -211,6 +212,31 @@ drops the event past the last component able to save it. If your transport can
 be merely *down* (as opposed to rejecting), spool to disk and replay — see
 `adapters/publishers/rabbitmq.py`, and note that a spool is only half a
 guarantee without something replaying it (`main.BrokerLink`).
+
+**Notifier** (`Notifier`): the rule is the exact **opposite** of the publisher's
+— `notify()` must **never raise**. Read that twice before writing one, because
+the two ports look alike and their failure contracts are inverted. A publisher
+that swallows an error loses the only durable record of an event; a notifier
+that raises takes down the pipeline it exists to observe. Best-effort commentary
+is the whole job.
+
+Concretely, from `adapters/notifiers/webhook.py`, which is the worked example:
+
+- **Bound every attempt, and bound the whole call.** A hanging endpoint must not
+  park the single dispatch worker. Retry transient failures (5xx, 429, 408,
+  connection errors) with backoff; **never retry a 4xx** — a 400 will be 400
+  again, and retrying a 401 just replays a rejected credential.
+- **Spool, do not drop.** A note that cannot be delivered goes to the existing
+  dead-letter writer with `record_type: "WelfareNote"`, not into a log line and
+  oblivion. Reuse `adapters/publishers/dead_letter.py`; do not write a second one.
+- **Treat a destination URL as a credential.** ntfy and Slack put tokens in the
+  path. Do not log it, do not follow redirects (a redirect target could re-send
+  it to another host), and if your client library logs request URLs, expose an
+  explicit redaction installer for the composition root to call — a hidden side
+  effect of constructing the adapter is one nobody can find later.
+- **Send only what routed.** `concerns_to_notify` has already filtered to the
+  kinds this camera is configured for; forwarding the whole assessment would
+  leak exactly what `notify_on` exists to suppress.
 
 **Clip store** (`ClipWriter`/`ClipHandle`): `open()` returns a handle, then
 `append`/`finish`/`abort` stream packets through. Do not buffer the clip in

@@ -4,7 +4,7 @@ Two mechanisms, and the split is deliberate:
 
 - **`SENTINEL_*` environment variables** (or a `.env` file in `ai-engine/`) for
   everything that is a process-wide scalar. Defined in
-  `ai-engine/sentinel_ai/config.py` — 36 settings, all listed below.
+  `ai-engine/sentinel_ai/config.py` — 40 settings, all listed below.
 - **`cameras.json`** for the camera list, because a camera is a nested record
   with a nested per-camera profile. Flattening a list of those into environment
   names is a worse interface than one small document you can diff, review and
