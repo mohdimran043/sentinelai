@@ -14,6 +14,7 @@ export type Zone = components['schemas']['Zone']
 export type ZoneKind = components['schemas']['ZoneKind']
 export type ConcernKind = components['schemas']['ConcernKind']
 export type Confidence = components['schemas']['Confidence']
+export type WelfareConcernEntry = components['schemas']['WelfareConcernEntry']
 
 /** The engine did not answer at all — network failure, DNS, connection refused. */
 export class EngineUnreachableError extends Error {

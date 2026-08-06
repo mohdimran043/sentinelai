@@ -84,6 +84,7 @@ from dataclasses import dataclass, replace
 from uuid import UUID
 
 from sentinel_ai.domain.entities import EscalationReason, Event, Severity
+from sentinel_ai.domain.welfare import WelfareConcern
 
 __all__ = [
     "EVENT_STREAM_QUEUE_MAXSIZE",
@@ -185,6 +186,25 @@ class RecentEvent:
     labels: tuple[str, ...]
     track_ids: tuple[int, ...]
 
+    welfare_concerns: tuple[WelfareConcern, ...] = ()
+    """Every welfare concern the event carried, unfiltered.
+
+    **Not filtered by the camera's `notify_on`.** That setting decides which
+    concerns are *pushed* to somebody who is not watching the console; it has no
+    business deciding what an operator looking straight at the camera page may
+    see. A camera muted for `medication` still detects, still records and still
+    publishes — and the person reading that event needs the whole assessment,
+    not the subset somebody chose to be paged about. This projection has no
+    access to the camera's policy, which is what makes the filtering impossible
+    to add here by accident. Contrast `WelfareNote.concerns`, which is
+    deliberately narrowed, because that one leaves the building.
+
+    Empty when the model reported nothing. The assessment's `basis` is not
+    projected: it has exactly one value today, and a second one (spec: a
+    multi-frame or pose-based source) is a deliberate change that rewrites the
+    routing rule and the console's caveat together — see ADR 10.
+    """
+
     @classmethod
     def from_event(cls, event: Event, sequence: int) -> RecentEvent:
         return cls(
@@ -205,6 +225,7 @@ class RecentEvent:
             description_unavailable=event.description_unavailable,
             labels=event.labels,
             track_ids=event.track_ids,
+            welfare_concerns=event.welfare.concerns,
         )
 
 

@@ -20,7 +20,7 @@ from sentinel_ai.adapters.config.camera_file import (
 from sentinel_ai.api.app import create_app
 from sentinel_ai.domain.camera_profile import CameraProfile
 from sentinel_ai.domain.entities import EscalationReason, Severity
-from sentinel_ai.domain.welfare import ConcernKind, Confidence
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.event_history import (
     CameraEventHistory,
@@ -368,6 +368,7 @@ def _recent_event(
     description_unavailable: bool = False,
     clip_uri: str | None = None,
     sequence: int = 1,
+    welfare_concerns: tuple[WelfareConcern, ...] = (),
 ) -> RecentEvent:
     return RecentEvent(
         event_id=uuid4(),
@@ -384,6 +385,7 @@ def _recent_event(
         description_unavailable=description_unavailable,
         labels=("person",),
         track_ids=(7,),
+        welfare_concerns=welfare_concerns,
     )
 
 
@@ -1097,3 +1099,91 @@ def test_lifespan_starts_and_stops_the_service() -> None:
     with TestClient(create_app(service)):
         assert service.started is True
     assert service.stopped is True
+
+
+class TestWelfareConcernsOnTheEventRing:
+    """The console's own view of what the model said about a person's wellbeing.
+
+    Distinct from a notification, which goes to somebody who is *not* looking at
+    the console and is narrowed to the kinds that camera routes. What lands here
+    is the whole assessment.
+    """
+
+    def test_an_events_response_carries_each_concern_the_model_reported(self) -> None:
+        concerns = (
+            WelfareConcern(
+                kind=ConcernKind.COLLAPSE,
+                confidence=Confidence.LIKELY,
+                evidence="A person is lying motionless by the door.",
+            ),
+        )
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),),
+            events=(_recent_event(welfare_concerns=concerns),),
+        )
+        with TestClient(create_app(service)) as client:
+            response = client.get("/cameras/cam-1/events")
+
+        assert response.status_code == 200
+        assert response.json()["events"][0]["welfare_concerns"] == [
+            {
+                "kind": "collapse",
+                "confidence": "likely",
+                "evidence": "A person is lying motionless by the door.",
+                "evidence_stated": True,
+            }
+        ]
+
+    def test_an_event_with_nothing_reported_carries_an_empty_list(self) -> None:
+        """An empty list, not a missing key. The console renders nothing either way,
+        but a consumer that has to branch on presence to read a list is a consumer
+        that will eventually get the branch wrong."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), events=(_recent_event(),))
+        with TestClient(create_app(service)) as client:
+            response = client.get("/cameras/cam-1/events")
+
+        assert response.json()["events"][0]["welfare_concerns"] == []
+
+    def test_a_concern_the_model_never_evidenced_says_so_on_the_wire(self) -> None:
+        """Otherwise the console renders a fixed placeholder as though the model had
+        said it, which is the one thing `evidence_stated` exists to prevent."""
+        concerns = (
+            WelfareConcern(
+                kind=ConcernKind.DISTRESS,
+                confidence=Confidence.POSSIBLE,
+                evidence="not stated",
+                evidence_stated=False,
+            ),
+        )
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),),
+            events=(_recent_event(welfare_concerns=concerns),),
+        )
+        with TestClient(create_app(service)) as client:
+            response = client.get("/cameras/cam-1/events")
+
+        entry = response.json()["events"][0]["welfare_concerns"][0]
+        assert entry["evidence_stated"] is False
+        assert entry["confidence"] == "possible"
+
+    def test_the_ring_is_not_filtered_by_the_camera_notify_on_policy(self) -> None:
+        """A camera muted for a kind still shows that kind here. `notify_on` decides
+        who gets *paged*; it must not decide what an operator looking at the camera
+        page is allowed to see, or muting a camera would quietly blind the console
+        as well as the pager."""
+        muted = _telemetry("cam-1", notify_on=frozenset({ConcernKind.COLLAPSE}))
+        concerns = (
+            WelfareConcern(
+                kind=ConcernKind.MEDICATION,
+                confidence=Confidence.LIKELY,
+                evidence="Tipping an unlabelled bottle towards the mouth.",
+            ),
+        )
+        service = _FakeEngineService(
+            cameras=(muted,), events=(_recent_event(welfare_concerns=concerns),)
+        )
+        with TestClient(create_app(service)) as client:
+            response = client.get("/cameras/cam-1/events")
+
+        kinds = [c["kind"] for c in response.json()["events"][0]["welfare_concerns"]]
+        assert kinds == ["medication"]

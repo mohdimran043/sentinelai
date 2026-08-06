@@ -64,6 +64,7 @@ function makeEvent(overrides: Partial<RecentEventEntry> = {}): RecentEventEntry 
     description_unavailable: false,
     labels: ['person'],
     track_ids: [1],
+    welfare_concerns: [],
     ...overrides,
   }
 }
@@ -431,5 +432,69 @@ describe('CameraPage camera record', () => {
     expect(within(panel).getByText('List label')).toBeInTheDocument()
     expect(within(panel).getByText('Corridor')).toBeInTheDocument()
     expect(within(panel).queryByText('Telemetry label')).not.toBeInTheDocument()
+  })
+})
+
+describe('CameraPage — welfare concerns on an event', () => {
+  it('shows what the model said about a person, with its confidence', async () => {
+    getCameraTelemetry.mockResolvedValue(telemetry)
+    const event = makeEvent({
+      welfare_concerns: [
+        {
+          kind: 'collapse',
+          confidence: 'likely',
+          evidence: 'A person is lying motionless by the door.',
+          evidence_stated: true,
+        },
+      ],
+    })
+    getCameraEvents.mockResolvedValue(
+      makeEventsResponse({ returned: 1, latest: event, events: [event] }),
+    )
+
+    renderCameraPage()
+
+    const concern = await screen.findByTestId('welfare-concern')
+    expect(concern).toHaveTextContent('Collapse')
+    expect(concern).toHaveTextContent(/likely/i)
+    expect(concern).toHaveTextContent('A person is lying motionless by the door.')
+  })
+
+  it('shows a kind this camera is muted for, because muting is about paging', async () => {
+    // `notify_on` here excludes `medication`; the operator is looking at the page
+    // anyway, and hiding what the model saw from them would be the wrong trade.
+    getCameraTelemetry.mockResolvedValue({ ...telemetry, notify_on: ['collapse'] })
+    const event = makeEvent({
+      welfare_concerns: [
+        {
+          kind: 'medication',
+          confidence: 'possible',
+          evidence: 'Tipping an unlabelled bottle towards the mouth.',
+          evidence_stated: true,
+        },
+      ],
+    })
+    getCameraEvents.mockResolvedValue(
+      makeEventsResponse({ returned: 1, latest: event, events: [event] }),
+    )
+
+    renderCameraPage()
+
+    expect(await screen.findByTestId('welfare-concern')).toHaveTextContent('Medication')
+  })
+
+  it('shows no welfare block for an event the model reported nothing on', async () => {
+    getCameraTelemetry.mockResolvedValue(telemetry)
+    const event = makeEvent({ welfare_concerns: [] })
+    getCameraEvents.mockResolvedValue(
+      makeEventsResponse({ returned: 1, latest: event, events: [event] }),
+    )
+
+    renderCameraPage()
+
+    // The description still renders, so the row itself is on screen — this asserts
+    // the absence of a welfare block, not the absence of the event.
+    expect(await screen.findByText('A person walks across the frame.')).toBeInTheDocument()
+    expect(screen.queryByTestId('welfare-concern')).not.toBeInTheDocument()
   })
 })

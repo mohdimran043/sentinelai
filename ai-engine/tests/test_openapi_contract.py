@@ -150,6 +150,29 @@ def test_the_404_a_client_will_actually_meet_is_in_the_contract() -> None:
     assert "200" in responses
 
 
+def test_the_event_ring_always_carries_a_welfare_list_never_an_absent_one() -> None:
+    """`welfare_concerns` is required, so a consumer reads a list unconditionally.
+
+    Optional-with-a-default would generate `welfare_concerns?: Concern[]` in every
+    downstream client, forcing each one to branch on presence before it can branch
+    on emptiness. Two states that mean the same thing ("the model reported
+    nothing") is one state too many, and the branch that conflates them with
+    "assessed and found something" is the bug this system cannot afford.
+    """
+    entry = openapi_document()["components"]["schemas"]["RecentEventEntry"]
+    assert "welfare_concerns" in entry["required"]
+
+
+def test_the_event_ring_says_it_is_not_filtered_by_the_camera_notify_policy() -> None:
+    """A Phase 1C consumer reading this endpoint must not assume it mirrors what was
+    notified. `notify_on` narrows the note that leaves the building; it does not
+    narrow this."""
+    entry = openapi_document()["components"]["schemas"]["RecentEventEntry"]
+    text = entry["properties"]["welfare_concerns"]["description"].lower()
+    assert "notify_on" in text
+    assert "not filtered" in text
+
+
 def test_the_committed_document_matches_the_running_app() -> None:
     if not OPENAPI_PATH.exists():
         pytest.fail(f"{OPENAPI_PATH} is missing — run `{REGENERATE}`")

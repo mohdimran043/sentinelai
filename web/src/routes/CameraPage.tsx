@@ -3,6 +3,7 @@ import { useCameraEvents, useCameraTelemetry, useCameras, useDescribeCameraNow }
 import type { RecentEventEntry } from '@/api/engineClient'
 import { HlsPlayer } from '@/live/HlsPlayer'
 import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
+import { WelfareConcerns } from '@/routes/camera/WelfareConcerns'
 import { Panel } from '@/components/ui/Panel'
 import { Reading } from '@/components/ui/Reading'
 import { Pill } from '@/components/ui/Pill'
@@ -109,6 +110,7 @@ function NotificationRow({ event }: { event: RecentEventEntry }) {
       ) : (
         <p className="m-0 text-[13px] text-fg">{event.description}</p>
       )}
+      <WelfareConcerns concerns={event.welfare_concerns} />
       <p className="muted mt-1">
         Suggested: {event.suggested_action} · threat {formatThreatScore(event.threat_score)}
         {event.labels.length > 0 ? ` · ${event.labels.join(', ')}` : ''}

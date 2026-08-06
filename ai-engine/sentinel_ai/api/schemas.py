@@ -16,7 +16,7 @@ from sentinel_ai.adapters.config.camera_file import (
     CameraConfig,
     CameraEdit,
 )
-from sentinel_ai.domain.welfare import ConcernKind, Confidence
+from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.domain.zone import Zone, ZoneKind
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, RecentEvent
 from sentinel_ai.pipeline.runner import CameraTelemetry
@@ -485,6 +485,51 @@ LatestDescriptionState = Literal["none", "available", "unavailable"]
 """
 
 
+class WelfareConcernEntry(BaseModel):
+    """One welfare concern as the console reads it.
+
+    The wire form of `domain.welfare.WelfareConcern`, minus the assessment's
+    `basis` — which has exactly one value today, so repeating it on every concern
+    would be noise. A second basis is a deliberate change that rewrites the
+    routing rule and the console's wording together (ADR 10), not something a
+    consumer should be silently reading for.
+    """
+
+    kind: ConcernKind = Field(
+        description="Which of the five things the prompt asks about, or `other`."
+    )
+    confidence: Confidence = Field(
+        description=(
+            "The model's own uncertainty, not a thresholded score. There are exactly "
+            "two tiers and there is no `certain`: one still frame cannot earn it."
+        )
+    )
+    evidence: str = Field(
+        description=(
+            "What the model says it actually saw, in its own words — **unless** "
+            "`evidence_stated` is false, in which case this is a fixed placeholder "
+            "and the model described nothing. Never render one as the other."
+        )
+    )
+    evidence_stated: bool = Field(
+        description=(
+            "False when the model named this concern but described nothing. The "
+            "concern still routes and still displays — a concern without a stated "
+            "reason is not a concern that did not happen — but a reader weighing it "
+            "needs to know the difference."
+        )
+    )
+
+    @classmethod
+    def from_concern(cls, concern: WelfareConcern) -> WelfareConcernEntry:
+        return cls(
+            kind=concern.kind,
+            confidence=concern.confidence,
+            evidence=concern.evidence,
+            evidence_stated=concern.evidence_stated,
+        )
+
+
 class RecentEventEntry(BaseModel):
     """One event as the console sees it — a projection of the published anomaly event,
     not the event itself.
@@ -556,6 +601,19 @@ class RecentEventEntry(BaseModel):
     )
     labels: list[str]
     track_ids: list[int]
+    welfare_concerns: list[WelfareConcernEntry] = Field(
+        description=(
+            "What the vision model said about a person's wellbeing in this frame — "
+            "**an opinion about one still frame, not a detector's finding.** Empty "
+            "means it reported nothing, which is not evidence that nothing happened; "
+            "when `description_unavailable` is true it means the model could not "
+            "answer at all. Always a list, never absent.\n\n"
+            "**Not filtered by the camera's `notify_on`.** That policy decides which "
+            "concerns are pushed to somebody who is *not* watching the console; every "
+            "concern the model reported appears here, so muting a camera silences its "
+            "notifications without also blinding the operator reading its events."
+        ),
+    )
 
     @classmethod
     def from_recent_event(cls, event: RecentEvent) -> RecentEventEntry:
@@ -574,6 +632,9 @@ class RecentEventEntry(BaseModel):
             description_unavailable=event.description_unavailable,
             labels=list(event.labels),
             track_ids=list(event.track_ids),
+            welfare_concerns=[
+                WelfareConcernEntry.from_concern(concern) for concern in event.welfare_concerns
+            ],
         )
 
 

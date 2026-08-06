@@ -540,6 +540,18 @@ components:
             type: integer
           title: Track Ids
           type: array
+        welfare_concerns:
+          description: "What the vision model said about a person's wellbeing in this frame \u2014 **an\
+            \ opinion about one still frame, not a detector's finding.** Empty means it reported nothing,\
+            \ which is not evidence that nothing happened; when `description_unavailable` is true it means\
+            \ the model could not answer at all. Always a list, never absent.\n\n**Not filtered by the\
+            \ camera's `notify_on`.** That policy decides which concerns are pushed to somebody who is\
+            \ *not* watching the console; every concern the model reported appears here, so muting a camera\
+            \ silences its notifications without also blinding the operator reading its events."
+          items:
+            $ref: '#/components/schemas/WelfareConcernEntry'
+          title: Welfare Concerns
+          type: array
       required:
       - event_id
       - camera_id
@@ -555,6 +567,7 @@ components:
       - description_unavailable
       - labels
       - track_ids
+      - welfare_concerns
       title: RecentEventEntry
       type: object
     ValidationError:
@@ -582,6 +595,39 @@ components:
       - msg
       - type
       title: ValidationError
+      type: object
+    WelfareConcernEntry:
+      description: "One welfare concern as the console reads it.\n\nThe wire form of `domain.welfare.WelfareConcern`,\
+        \ minus the assessment's\n`basis` \u2014 which has exactly one value today, so repeating it on\
+        \ every concern\nwould be noise. A second basis is a deliberate change that rewrites the\nrouting\
+        \ rule and the console's wording together (ADR 10), not something a\nconsumer should be silently\
+        \ reading for."
+      properties:
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+          description: 'The model''s own uncertainty, not a thresholded score. There are exactly two tiers
+            and there is no `certain`: one still frame cannot earn it.'
+        evidence:
+          description: "What the model says it actually saw, in its own words \u2014 **unless** `evidence_stated`\
+            \ is false, in which case this is a fixed placeholder and the model described nothing. Never\
+            \ render one as the other."
+          title: Evidence
+          type: string
+        evidence_stated:
+          description: "False when the model named this concern but described nothing. The concern still\
+            \ routes and still displays \u2014 a concern without a stated reason is not a concern that\
+            \ did not happen \u2014 but a reader weighing it needs to know the difference."
+          title: Evidence Stated
+          type: boolean
+        kind:
+          $ref: '#/components/schemas/ConcernKind'
+          description: Which of the five things the prompt asks about, or `other`.
+      required:
+      - kind
+      - confidence
+      - evidence
+      - evidence_stated
+      title: WelfareConcernEntry
       type: object
     Zone:
       description: 'The space a camera watches. The recorder''s `space_type` vocabulary, exactly.

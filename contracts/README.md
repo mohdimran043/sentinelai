@@ -42,9 +42,10 @@ consume it.** `json-schema-to-typescript` is in `web/`'s devDependencies from an
 earlier intent, but there is no `gen:events` script and no `src/events/`. What
 the console renders is `RecentEventEntry` from the *OpenAPI* types — the engine's
 bounded in-memory ring entry, which is a deliberately smaller shape than the
-published event and carries neither `welfare` nor `schema_version`. Do not read
-console code as evidence of what goes on the wire; the wire is the JSON schema
-and the Phase 1C consumer is its first real reader.
+published event: no `schema_version`, and its `welfare_concerns` is a flattened
+list rather than the event's `welfare` object (the assessment's `basis` is not
+projected). Do not read console code as evidence of what goes on the wire; the
+wire is the JSON schema and the Phase 1C consumer is its first real reader.
 
 Generated output is **committed**, so a fresh checkout builds without running
 codegen. Never hand-edit a generated file; regenerate it.

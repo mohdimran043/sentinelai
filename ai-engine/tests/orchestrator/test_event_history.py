@@ -10,11 +10,18 @@ camera.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
 
 from sentinel_ai.domain.entities import EscalationReason, Event, Severity, ThreatScore
+from sentinel_ai.domain.welfare import (
+    ConcernKind,
+    Confidence,
+    WelfareAssessment,
+    WelfareConcern,
+)
 from sentinel_ai.orchestrator.event_history import (
     RECENT_EVENTS_PER_CAMERA,
     RecentEventLog,
@@ -255,3 +262,81 @@ def test_the_shipped_default_bound_is_finite_and_documented() -> None:
     assert isinstance(RECENT_EVENTS_PER_CAMERA, int)
     assert 50 <= RECENT_EVENTS_PER_CAMERA <= 1000
     assert RecentEventLog().capacity == RECENT_EVENTS_PER_CAMERA
+
+
+def _concern(
+    kind: ConcernKind = ConcernKind.COLLAPSE,
+    confidence: Confidence = Confidence.LIKELY,
+    evidence: str = "A person is lying motionless by the door.",
+    evidence_stated: bool = True,
+) -> WelfareConcern:
+    return WelfareConcern(
+        kind=kind, confidence=confidence, evidence=evidence, evidence_stated=evidence_stated
+    )
+
+
+def test_the_console_projection_carries_the_welfare_concerns_the_event_held() -> None:
+    """The console is where a human looks. An event that carried a concern and a
+    projection that dropped it would leave the operator's own screen the one place
+    the model's opinion is invisible."""
+    event = _event("cam-1")
+    concern = _concern()
+    log = RecentEventLog(capacity=3)
+
+    log.record(replace(event, welfare=WelfareAssessment(concerns=(concern,))))
+
+    (entry,) = log.history("cam-1").events
+    assert entry.welfare_concerns == (concern,)
+
+
+def test_an_event_with_no_concerns_projects_an_empty_tuple_not_a_missing_field() -> None:
+    log = RecentEventLog(capacity=3)
+    log.record(_event("cam-1"))
+
+    (entry,) = log.history("cam-1").events
+    assert entry.welfare_concerns == ()
+
+
+def test_every_concern_is_projected_including_ones_the_camera_would_not_notify_on() -> None:
+    """`notify_on` governs which concerns are *pushed* to somebody who is not
+    watching. It must not decide what an operator at the console may see: a camera
+    muted for `medication` still records the frame, still publishes the event, and
+    the person reading that event needs the whole assessment. The projection has no
+    access to the camera's policy, and that is the point — filtering could only
+    happen here by adding one.
+    """
+    log = RecentEventLog(capacity=3)
+    concerns = (
+        _concern(ConcernKind.MEDICATION, Confidence.POSSIBLE, "Hand raised towards mouth."),
+        _concern(ConcernKind.COLLAPSE, Confidence.LIKELY),
+    )
+
+    log.record(replace(_event("cam-1"), welfare=WelfareAssessment(concerns=concerns)))
+
+    assert log.history("cam-1").events[0].welfare_concerns == concerns
+
+
+def test_a_concern_the_model_never_evidenced_stays_marked_as_such_through_the_projection() -> None:
+    """`evidence_stated=False` means the evidence string is a placeholder, not
+    something the model said. Losing the flag here would render a fixed stand-in as
+    though it were an observation."""
+    log = RecentEventLog(capacity=3)
+    concern = _concern(evidence="not stated", evidence_stated=False)
+
+    log.record(replace(_event("cam-1"), welfare=WelfareAssessment(concerns=(concern,))))
+
+    assert log.history("cam-1").events[0].welfare_concerns[0].evidence_stated is False
+
+
+def test_attaching_a_clip_preserves_the_welfare_concerns() -> None:
+    """The clip back-fill rewrites the ring entry. A rewrite that dropped the
+    concerns would make them vanish moments after they appeared."""
+    log = RecentEventLog(capacity=3)
+    event = replace(_event("cam-1"), welfare=WelfareAssessment(concerns=(_concern(),)))
+    log.record(event)
+
+    assert log.attach_clip("cam-1", event.event_id, "s3://clips/a.mp4") is True
+
+    (entry,) = log.history("cam-1").events
+    assert entry.clip_uri == "s3://clips/a.mp4"
+    assert entry.welfare_concerns == (_concern(),)

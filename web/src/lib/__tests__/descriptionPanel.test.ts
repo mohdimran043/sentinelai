@@ -18,6 +18,7 @@ function makeEvent(overrides: Partial<RecentEventEntry> = {}): RecentEventEntry 
     description_unavailable: false,
     labels: ['person'],
     track_ids: [1],
+    welfare_concerns: [],
     ...overrides,
   }
 }

@@ -204,6 +204,13 @@ The note carries **only the concerns that routed**, never the whole assessment:
 including a kind the operator muted would leak exactly what `notify_on` exists
 to suppress.
 
+**The console is the exception, deliberately.** `GET /cameras/{id}/events` and
+the camera page show *every* concern the model reported, unfiltered by
+`notify_on`. That policy decides who gets paged; it has no business deciding
+what an operator looking straight at the camera page may see. Muting a camera
+silences its notifications without also blinding its console — so a muted camera
+still looks quiet on the pager and still tells the truth on screen.
+
 Per-camera policy lives in `cameras.json` and is editable at runtime — see
 [Editing cameras from the console](#editing-cameras-from-the-console) and
 [Configuration](configuration.md#the-per-camera-welfare-policy).
