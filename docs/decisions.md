@@ -20,6 +20,7 @@ patching the code; ADR 4 is an example of exactly that.
 | [7](#7-the-escalation-gate-exists-at-all) | The escalation gate exists at all | Accepted — this is the thesis |
 | [8](#8-contracts-is-the-only-engine--ui-coupling) | `contracts/` is the only engine ↔ UI coupling | Accepted, partly unenforced |
 | [9](#9-a-file-for-cameras-environment-variables-for-scalars) | A file for cameras, environment variables for scalars | Accepted |
+| [10](#10-welfare-concerns-are-an-opinion-not-a-detection) | Welfare concerns are an opinion, not a detection | Accepted |
 
 ---
 
@@ -483,3 +484,81 @@ which is what makes replay and live capture the same code path.
 **What would change it.** A real control plane owning camera configuration
 (Phase 1C's Go backend and Postgres) would make the file a bootstrap default
 rather than the source of truth.
+
+---
+
+## 10. Welfare concerns are an opinion, not a detection
+
+**Decided.** What the VLM reports about a person's wellbeing is stored as
+`WelfareConcern{kind, confidence, evidence, evidence_stated}`, gathered into a
+`WelfareAssessment` carrying a mandatory `basis: Literal["single_frame_vlm"]`.
+`Confidence` is exactly `possible` | `likely`. There are no booleans, no
+`certain` tier, and **no new `EscalationReason`** — the seven reasons are
+unchanged, and there is deliberately no `fall_detected` among them.
+
+**Why a boolean would have been the whole bug.** `fall_detected: true` reads to
+any downstream consumer — the Phase 1C store, a dashboard, an auditor — as a
+trained classifier's verdict. There is no fall detector in this system. There is
+no pose estimation, no action recognition and no per-limb tracking; there is a
+language model looking at one still frame. A boolean forces that judgment
+through a threshold *before* it reaches storage, and once stored it is
+indistinguishable from a real detector's output by anything reading the payload.
+Keeping `confidence` as data instead lets each consumer choose its own bar
+rather than inheriting one baked in here.
+
+**Why there is no `certain`.** A single frame, sampled at most once per ~10 s by
+the gate, cannot rule out an innocent explanation: someone lying down is not
+necessarily someone who has collapsed, two people standing close are not
+necessarily fighting. The tier is absent so that no caller — and no future
+maintainer padding out an enum "for completeness" — can claim a certainty the
+evidence cannot earn. Leaving it out is the honest option, not a missing one.
+
+**`basis` is mandatory and single-valued** so a consumer reading the payload
+alone, with no side channel and no tribal knowledge of which pipeline produced
+it, can see where the opinion came from and weigh it accordingly.
+
+**The notifier inverts the publisher's failure contract, and that is not an
+oversight.** `EventPublisher.publish()` must **raise** on failure; a raise is
+what hands the event to `FailedEventSink`, and a publisher that logs and returns
+drops it past the last component able to save it. `Notifier.notify()` must
+**never** raise. It is best-effort commentary on a pipeline that has already
+published, dispatched off the escalation path onto its own worker, and one that
+threw would take down the thing it exists to observe. The two ports look alike —
+one record in, one destination — so this is written down here because
+implementing the wrong contract fails silently in both directions.
+
+**What it cost.** Real complexity, in three places:
+
+- **Routing is not a boolean check.** `concerns_to_notify` is three clauses:
+  kind in `notify_on`, confidence meets `notify_min_confidence`, and — if the
+  concern is only `possible` — the event's threat score must already be in the
+  caution band or above. That third clause exists because acting on `possible`
+  alone, with nothing else in the system agreeing, is how a welfare notifier
+  becomes noise an operator learns to ignore. An ignored notifier is a muted one.
+- **`evidence_stated` had to be promoted into the domain, then onto the wire.**
+  It began as an adapter-private placeholder constant, which meant the only way
+  to tell "the model named a concern but described nothing" from a genuinely
+  evidenced one was to string-match a leading-underscore adapter internal from
+  wherever routing lived. It is a domain field for that reason, and a later task
+  had to extend the event schema and codec so a Phase 1C consumer would not read
+  every concern as evidenced.
+- **Absent and empty had to stay distinguishable end to end**, through
+  `cameras.json`, the `UNSET` sentinel in `CameraEdit`, the PATCH body and the
+  console's diff. `notify_on` absent means every kind; `notify_on: []` means this
+  camera notifies nobody. Collapse the two anywhere along that path and either a
+  camera someone silenced starts alerting, or one they meant to route goes quiet.
+
+**Consequences worth knowing.** Duplicate kinds collapse to the highest-
+confidence concern rather than stacking, so a model reporting `collapse` under
+two prompt phrasings does not double-count in any rule reading `len(concerns)`.
+`evidence` is mandatory and rejected when blank, so a concern always points at
+something. And the honest limits belong in operator-facing documentation, not
+only in these docstrings — see
+[operations](operations.md#read-this-before-you-rely-on-it), including that a
+stretcher carry was missed entirely in measurement.
+
+**What would change it.** A second source of welfare judgement — multi-frame
+reasoning, or a purpose-built pose model — does **not** widen
+`basis: "single_frame_vlm"` to cover it. It gets its own `basis` value, and the
+routing rule is rewritten against the pair. Widening this one would retroactively
+relabel every opinion already stored under it.
