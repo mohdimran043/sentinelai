@@ -272,8 +272,11 @@ describe('MasksPage — switching cameras', () => {
     server.use(recorderCamerasHandler(TWO_CAMERAS), recorderMaskHandler(REAL_MASK_ROOM_4B))
     renderWithProviders(<MasksPage />)
 
-    await screen.findByText(/An unmasked frame is not served/i)
-    expect(screen.getByText('toilet', { exact: false })).toBeInTheDocument()
+    // `toilet` is room_4b's own saved region, seeded into the draft by an
+    // effect one commit after the mask response lands — so wait for it
+    // directly. Waiting on anything the response renders in that first commit
+    // (the calibration refusal, say) settles while the draft is still empty.
+    await screen.findByText('toilet', { exact: false })
 
     server.use(recorderMaskHandler(REAL_MASK_EMPTY_CORRIDOR_1))
     await user.selectOptions(screen.getByLabelText('Camera'), 'corridor_1')

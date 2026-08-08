@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { screen, within } from '@testing-library/react'
+import { act, fireEvent, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '@/test/renderWithProviders'
 import { server } from '@/test/mswServer'
@@ -38,8 +38,13 @@ describe('FootagePage — camera and snapshot', () => {
     renderWithProviders(<FootagePage />)
     const image = await screen.findByAltText(/Most recent available frame from room_4b/)
 
+    // The image can be found a render before SnapshotPanel's mount effect has
+    // run, and that effect resets the failure flag — so let pending effects
+    // land first, or the failure signalled below is wiped as soon as they do.
+    await act(async () => {})
+
     // jsdom does not actually fetch <img src>, so the failure path is driven directly.
-    image.dispatchEvent(new Event('error'))
+    fireEvent.error(image)
 
     expect(
       await screen.findByText(/could not produce a frame for room_4b just now/i),

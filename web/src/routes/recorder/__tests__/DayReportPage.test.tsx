@@ -18,16 +18,20 @@ describe('DayReportPage — camera/date picker', () => {
   it('defaults camera to the first in the registry and fills in a date, without being asked', async () => {
     renderWithProviders(<DayReportPage />, { route: '/recorder/report' })
 
-    // Wait for the effect that fills in both defaults together (one
-    // setSearchParams batching camera and date) to have actually landed —
-    // the options appearing is necessary but not sufficient, since that
-    // happens a render before the search-params update commits.
+    // A filled-in date is the only thing that proves the effect writing both
+    // defaults (one setSearchParams batching camera and date) has landed.
+    // Waiting on the camera select instead settles a render too early: while
+    // no `camera` is in the URL the select is controlled to "", which matches
+    // none of its options, so React falls back to marking the first option
+    // selected — it already reads `room_4b` in the commit where the options
+    // appear, before the search-params update commits.
     await waitFor(() => {
-      expect((screen.getByLabelText('Camera') as HTMLSelectElement).value).toBe('room_4b')
+      expect((screen.getByLabelText('Date') as HTMLInputElement).value).toMatch(
+        /^\d{4}-\d{2}-\d{2}$/,
+      )
     })
 
-    const datePicker = screen.getByLabelText('Date') as HTMLInputElement
-    expect(datePicker.value).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect((screen.getByLabelText('Camera') as HTMLSelectElement).value).toBe('room_4b')
   })
 
   it('respects a camera/date already in the URL rather than overwriting it', async () => {
