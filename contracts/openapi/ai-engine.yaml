@@ -3,6 +3,223 @@
 # `tests/test_openapi_contract.py` fails the build when it does.
 components:
   schemas:
+    AcknowledgeRequest:
+      additionalProperties: false
+      properties:
+        by:
+          description: "Who is acknowledging. **This engine has no authentication**, so this is a self-declared\
+            \ label and not an identity \u2014 it records what somebody typed, which is worth having and\
+            \ is not an audit trail. See `docs/operations.md`."
+          maxLength: 120
+          minLength: 1
+          title: By
+          type: string
+      required:
+      - by
+      title: AcknowledgeRequest
+      type: object
+    AlertEntry:
+      description: "One ongoing situation an operator is asked to act on (spec \xA717).\n\n**Not an event.**\
+        \ An event is what happened; an alert is an *episode* that events\naccumulate into. Measured on\
+        \ real footage, forty-five seconds of one corridor\nproduced eleven events and would produce eleven\
+        \ rows \u2014 `occurrences` is what turns\nthat back into one row saying how many times it happened."
+      properties:
+        acknowledged_at:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Acknowledged At
+        acknowledged_by:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Acknowledged By
+        alert_id:
+          format: uuid
+          title: Alert Id
+          type: string
+        camera_id:
+          title: Camera Id
+          type: string
+        camera_label:
+          title: Camera Label
+          type: string
+        clip_uri:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: "The first contributing clip that finished, for the same reason. Null when no clip\
+            \ has finished yet, which is normal early in an episode \u2014 clips complete after their\
+            \ event is assembled. A storage URI, not a URL: it is here so an operator can say which object\
+            \ an alert refers to. To *watch* it, GET /alerts/{alert_id}/clip, which is the only route\
+            \ by which this engine will serve a recording."
+          title: Clip Uri
+        description:
+          description: "The most recent contributing event's description. Most recent rather than first\
+            \ because an episode develops \u2014 what is happening now is more use to somebody deciding\
+            \ whether to go than what was happening a minute ago."
+          title: Description
+          type: string
+        event_ids:
+          description: The **first** contributing events, bounded. First rather than latest because an
+            investigator works backwards from the start of an episode, and the oldest event is the one
+            whose clip shows how it began.
+          items:
+            format: uuid
+            type: string
+          title: Event Ids
+          type: array
+        first_seen:
+          title: First Seen
+          type: number
+        last_seen:
+          description: "Unix epoch seconds, like `occurred_at` \u2014 sortable across cameras."
+          title: Last Seen
+          type: number
+        notify_clip_uri:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: "The same recording trimmed to SENTINEL_NOTIFY_CLIP_SECONDS, when the writer made\
+            \ one \u2014 what a notification carries, and what GET /alerts/{alert_id}/clip returns by\
+            \ default. Null is ordinary: the engine may be configured to make no short copy, and the trim\
+            \ can fail without costing the full clip. Null here while `clip_uri` is set means the short\
+            \ request falls back to the full recording, never to nothing."
+          title: Notify Clip Uri
+        occurrences:
+          description: How many events have folded into this episode. Always exact, even once `event_ids`
+            stops being complete.
+          title: Occurrences
+          type: integer
+        priority:
+          $ref: '#/components/schemas/EventPriority'
+          description: 'How urgently this should be served, known from the reason alone before any model
+            has looked. Distinct from `severity`: severity is how bad the scene appears, priority is how
+            bad it would be to get this one wrong.'
+        reason:
+          $ref: '#/components/schemas/EscalationReason'
+          description: What kind of situation this is. The same vocabulary as an event's.
+        severity:
+          $ref: '#/components/schemas/Severity'
+          description: "The worse of what the model saw and what the reason structurally implies, and\
+            \ it **rises across an episode and never falls** \u2014 one calm frame must not drop an escalating\
+            \ situation down the list."
+        state:
+          $ref: '#/components/schemas/AlertState'
+          description: "`active` \u2014 nobody has looked. `acknowledged` \u2014 a person has seen it\
+            \ and is dealing with it. `resolved` \u2014 a person has said it is finished. **Nothing here\
+            \ changes on its own:** no alert ages out, because an alert that expired quietly would leave\
+            \ no trace that nobody ever went to look."
+        subject:
+          description: Which tracked identity this episode is about, as a comma-separated list of track
+            ids, or `""` for a camera-level finding with nobody to attribute it to (camera tampering).
+            Two events with the same camera, reason and subject are the same episode; a different subject
+            is a different person and a different alert.
+          title: Subject
+          type: string
+        zone:
+          anyOf:
+          - $ref: '#/components/schemas/Zone'
+          - type: 'null'
+          description: Where the camera watches, or null when ungrouped.
+      required:
+      - alert_id
+      - camera_id
+      - camera_label
+      - reason
+      - subject
+      - state
+      - severity
+      - priority
+      - first_seen
+      - last_seen
+      - occurrences
+      - description
+      - event_ids
+      title: AlertEntry
+      type: object
+    AlertState:
+      enum:
+      - active
+      - acknowledged
+      - resolved
+      title: AlertState
+      type: string
+    AlertsResponse:
+      properties:
+        alerts:
+          description: "Worst first, then most recent first. Ordered by the engine rather than left to\
+            \ the client so that every reader agrees about what is at the top of the list \u2014 \xA7\
+            27's requirement that the critical thing is visible immediately is a property of this ordering."
+          items:
+            $ref: '#/components/schemas/AlertEntry'
+          title: Alerts
+          type: array
+        open_count:
+          description: "How many are not yet resolved \u2014 the number worth putting on a badge."
+          title: Open Count
+          type: integer
+      required:
+      - alerts
+      - open_count
+      title: AlertsResponse
+      type: object
+    Body_enroll_face_authorized_persons__person_id__faces_post:
+      properties:
+        image:
+          contentMediaType: application/octet-stream
+          title: Image
+          type: string
+      required:
+      - image
+      title: Body_enroll_face_authorized_persons__person_id__faces_post
+      type: object
+    CameraCreateRequest:
+      additionalProperties: false
+      description: "A new camera, as the console describes one.\n\n`url` is here and is absent from `CameraEditRequest`,\
+        \ and that asymmetry is the\ndesign: changing a running camera's source means tearing down its\
+        \ runner, its\npre-roll and any clip mid-recording, while adding one destroys nothing.\n\n`profile`\
+        \ is absent from both. The escalation policy has live state \u2014 cooldowns, a\npart-filled token\
+        \ bucket \u2014 so a new camera starts on the defaults and tuning it is\nstill `cameras.json`\
+        \ and a restart."
+      properties:
+        camera_id:
+          maxLength: 64
+          minLength: 1
+          title: Camera Id
+          type: string
+        capabilities:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/Capability'
+            type: array
+          - type: 'null'
+          description: "Null takes the engine's defaults. A capability whose model this process never\
+            \ loaded is refused with a 409 naming the restart \u2014 which models exist is decided at\
+            \ startup."
+          title: Capabilities
+        label:
+          default: ''
+          maxLength: 120
+          title: Label
+          type: string
+        url:
+          description: An rtsp(s) URL, an earthcam.com **page** URL, or a local file path. Which source
+            gets built is decided from this and nothing else.
+          maxLength: 2048
+          minLength: 1
+          title: Url
+          type: string
+        zone:
+          anyOf:
+          - $ref: '#/components/schemas/Zone'
+          - type: 'null'
+          description: The group this camera belongs to. Null leaves it ungrouped.
+      required:
+      - camera_id
+      - url
+      title: CameraCreateRequest
+      type: object
     CameraEditRequest:
       additionalProperties: false
       description: "A partial edit to one camera's record: its label, its zone, and its welfare\nnotification\
@@ -14,6 +231,24 @@ components:
         \ reason the model is strict: the failure this endpoint must never\nhave is an operator re-pointing\
         \ a camera at a new stream, being told it\nworked, and watching the old stream for a week."
       properties:
+        capabilities:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/Capability'
+            type: array
+          - type: 'null'
+          description: "Which AI capabilities run on this camera, replacing whatever is configured now\
+            \ \u2014 a whole new list, not an addition to the old one. **`[]` means run nothing on this\
+            \ camera**, which is a real instruction and not an empty edit: the camera stays watched and\
+            \ decoded, and no model is run against it. Omit the field to leave the capabilities alone;\
+            \ `null` is rejected, because `[]` already says the only thing it could mean.\n\n**A capability\
+            \ can only be enabled if this process already loaded the model it needs.** Which models exist\
+            \ is decided once, at startup, from the union over every configured camera (see `GET /cameras`),\
+            \ because loading a 3B vision model is a multi-second download-and-place that cannot happen\
+            \ under an HTTP request without stalling every camera sharing the GPU. Enabling one whose\
+            \ model is absent is a 409 naming the restart, never a 200 that quietly did nothing \u2014\
+            \ the same fail-loud this endpoint applies to `url`. Disabling is always allowed."
+          title: Capabilities
         clip_postroll_seconds:
           anyOf:
           - exclusiveMinimum: 0.0
@@ -100,6 +335,14 @@ components:
         camera_id:
           title: Camera Id
           type: string
+        capabilities:
+          description: "The capabilities now stored for this camera, sorted \u2014 always the full list,\
+            \ never a diff. `[]` means nothing runs on this camera. Identical in meaning to `CameraStatus.capabilities`,\
+            \ so a console can compare what it wrote against what it later reads there."
+          items:
+            $ref: '#/components/schemas/Capability'
+          title: Capabilities
+          type: array
         clip_postroll_seconds:
           anyOf:
           - type: number
@@ -170,12 +413,32 @@ components:
       - label
       - zone
       - zone_kind
+      - capabilities
       - notify_on
       - notify_min_confidence
       - clip_preroll_seconds
       - clip_postroll_seconds
       - summary_interval_seconds
       title: CameraEditResponse
+      type: object
+    CameraEnabledRequest:
+      additionalProperties: false
+      description: 'Which way to move the switch.
+
+
+        A body rather than two verbs (`/enable`, `/disable`) so the request is idempotent
+
+        in the literal sense: it states the state it wants, not the transition, and sending
+
+        it twice asks for the same thing twice.'
+      properties:
+        enabled:
+          description: '`true` to start watching this camera, `false` to stop.'
+          title: Enabled
+          type: boolean
+      required:
+      - enabled
+      title: CameraEnabledRequest
       type: object
     CameraEventsResponse:
       description: 'A **volatile, bounded, in-memory view for the operator console. Not the event
@@ -253,6 +516,17 @@ components:
         camera_id:
           title: Camera Id
           type: string
+        capabilities:
+          description: "Which AI capabilities are running on this camera, as the engine has them \u2014\
+            \ always the full list, never a diff, and sorted so two reads of the same record compare equal.\
+            \ `[]` is a stored choice, not an unset field: the camera is watched and decoded, and nothing\
+            \ is run on it. **Render this as what the engine is doing, not as what the file asked for**\
+            \ \u2014 it is read back off the running camera, which is what makes a capability checkbox\
+            \ honest rather than decorative. A capability absent here is one no model was loaded for."
+          items:
+            $ref: '#/components/schemas/Capability'
+          title: Capabilities
+          type: array
         clip_postroll_seconds:
           anyOf:
           - type: number
@@ -275,11 +549,31 @@ components:
         discontinuities:
           title: Discontinuities
           type: integer
+        enabled:
+          default: true
+          description: "Whether the engine is watching this camera at all. `false` is a camera an operator\
+            \ deliberately stopped: the record is still in `cameras.json`, it still has a label, a zone\
+            \ and a capability set, and no source connection is open. Distinct from a camera with no capabilities,\
+            \ which still pulls and decodes every frame. **The counters on a disabled camera are frozen\
+            \ at the moment it was stopped, not zeroed** \u2014 except after a restart, when they are\
+            \ genuinely zero because nothing has been watched this run."
+          title: Enabled
+          type: boolean
         escalations:
           title: Escalations
           type: integer
         escalations_dropped:
           title: Escalations Dropped
+          type: integer
+        falls_suspected:
+          default: 0
+          description: "How many fall signatures have completed on this camera since the engine started.\
+            \ Always 0 on a camera without the `fall_detection` capability, and 0 is not the same claim\
+            \ as absent \u2014 it means the machine ran and saw nothing. Cumulative and monotonic within\
+            \ one process run; it resets on restart, like every other counter here. **Not a count of falls**:\
+            \ it is a count of times a geometry state machine's signature completed and a vision-language\
+            \ model was asked to confirm. See the camera's events for what the model then said."
+          title: Falls Suspected
           type: integer
         frames_dropped:
           title: Frames Dropped
@@ -302,7 +596,23 @@ components:
           anyOf:
           - type: number
           - type: 'null'
+          description: "When the last frame arrived, on **this camera's own source timeline** \u2014 `time.monotonic()`\
+            \ for a live RTSP camera, seconds-from-start-of-file for a replayed one. It is what correlates\
+            \ telemetry with a clip's pts, and it is **not** a wall-clock time: it resets on restart and\
+            \ two cameras do not share an origin. Never render it as an age \u2014 use `last_frame_epoch`."
           title: Last Frame At
+        last_frame_epoch:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: "When this camera was last **observed** to have delivered a frame, in Unix epoch\
+            \ seconds. This is the field a liveness indicator reads.\n\nSeparate from `last_frame_at`\
+            \ because that one cannot answer the question: reading a source timeline as an epoch put every\
+            \ camera at '20712d ago' and reported '0 of 3 delivering' while all three were. Observational\
+            \ \u2014 it is stamped when a read notices the source timeline has advanced \u2014 so it is\
+            \ as fresh as the last time somebody asked, which for a polling console is every few seconds.\
+            \ Null when this camera has not been seen to deliver anything yet."
+          title: Last Frame Epoch
         notify_min_confidence:
           $ref: '#/components/schemas/Confidence'
           description: 'The stored confidence threshold. Never null: a camera always has one.'
@@ -348,12 +658,30 @@ components:
       - discontinuities
       - last_frame_at
       - last_escalation_at
+      - capabilities
       - notify_on
       - notify_min_confidence
       - clip_preroll_seconds
       - clip_postroll_seconds
       - summary_interval_seconds
       title: CameraStatus
+      type: object
+    CameraStorageModel:
+      properties:
+        bytes_used:
+          title: Bytes Used
+          type: integer
+        camera_id:
+          title: Camera Id
+          type: string
+        clips:
+          title: Clips
+          type: integer
+      required:
+      - camera_id
+      - clips
+      - bytes_used
+      title: CameraStorageModel
       type: object
     CamerasResponse:
       properties:
@@ -375,6 +703,59 @@ components:
       - cameras
       - config_writable
       title: CamerasResponse
+      type: object
+    Capability:
+      description: "What an operator turns on for one camera.\n\n`StrEnum` so it serialises as its own\
+        \ wire value with no encoder \u2014 the same reason\n`Zone` and `ConcernKind` are."
+      enum:
+      - scene_description
+      - anomaly_detection
+      - fall_detection
+      - abandoned_object
+      - camera_tamper
+      - person_authorization
+      - zone_monitoring
+      title: Capability
+      type: string
+    ClipRecordModel:
+      properties:
+        event_id:
+          format: uuid
+          title: Event Id
+          type: string
+        has_short_copy:
+          title: Has Short Copy
+          type: boolean
+        modified_at:
+          description: "Unix epoch seconds, from the object store's record of when the upload finished\
+            \ \u2014 **later than the incident** by the post-roll plus the upload. Sort by it; do not\
+            \ present it as the time something happened."
+          title: Modified At
+          type: number
+        size_bytes:
+          title: Size Bytes
+          type: integer
+      required:
+      - event_id
+      - size_bytes
+      - modified_at
+      - has_short_copy
+      title: ClipRecordModel
+      type: object
+    ClipsResponse:
+      properties:
+        camera_id:
+          title: Camera Id
+          type: string
+        clips:
+          items:
+            $ref: '#/components/schemas/ClipRecordModel'
+          title: Clips
+          type: array
+      required:
+      - camera_id
+      - clips
+      title: ClipsResponse
       type: object
     ConcernKind:
       description: What the VLM's welfare-focused prompt asks the frame to be checked for.
@@ -408,6 +789,78 @@ components:
       required:
       - event_id
       title: DescribeResponse
+      type: object
+    EnrolledFaceEntry:
+      description: "One reference face on a person's record.\n\nMetadata only \u2014 the picture is fetched\
+        \ one at a time from its own endpoint. A list\nthat inlined the images would move every enrolled\
+        \ person's biometric data across the\nnetwork to draw a table of names, which is the opposite\
+        \ of \xA712's \"do not expose\nbiometric information unnecessarily\"."
+      properties:
+        enrolled_at:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: Unix epoch seconds, or null for a face enrolled before this was recorded. Null
+            means unknown, never 1970.
+          title: Enrolled At
+        face_id:
+          format: uuid
+          title: Face Id
+          type: string
+        has_image:
+          description: 'Whether a reference photograph was kept. False is a real answer, not a loading
+            state: enrolment can keep the embedding and no picture.'
+          title: Has Image
+          type: boolean
+      required:
+      - face_id
+      - has_image
+      title: EnrolledFaceEntry
+      type: object
+    EscalationReason:
+      description: "Why a frame was escalated to the vision-language model.\n\nThe seven from spec \xA7\
+        4.1, plus `FALL_SUSPECTED` (\xA77), which is a different kind of\nthing from the rest and is grouped\
+        \ last for that reason. The first six are\n*predicates on one frame* asking \"is this scene worth\
+        \ a look\"; `USER_REQUESTED` is\na person asking directly; `FALL_SUSPECTED` is a **temporal state\
+        \ machine** over\nseveral seconds reporting that a specific signature completed\n(`domain/behaviour/fall.py`)."
+      enum:
+      - new_salient_track
+      - scene_change
+      - dwell_exceeded
+      - speed_anomaly
+      - track_count_spike
+      - periodic_summary
+      - user_requested
+      - fall_suspected
+      - abandoned_object
+      - camera_tamper
+      - zone_intrusion
+      - line_crossing
+      - unauthorized_person
+      title: EscalationReason
+      type: string
+    EventPriority:
+      description: "\xA716's four bands, as an ordered vocabulary.\n\nA `StrEnum` rather than an int so\
+        \ it serialises and reads as itself, with\n`_RANK` below supplying the ordering \u2014 the same\
+        \ arrangement `Confidence.meets`\nuses, and for the same reason: `EventPriority.LOW > EventPriority.CRITICAL`\
+        \ is\n`True` by alphabet, which is the exact inversion of what anyone writing it means."
+      enum:
+      - critical
+      - high
+      - medium
+      - low
+      title: EventPriority
+      type: string
+    FacesResponse:
+      properties:
+        faces:
+          items:
+            $ref: '#/components/schemas/EnrolledFaceEntry'
+          title: Faces
+          type: array
+      required:
+      - faces
+      title: FacesResponse
       type: object
     HTTPValidationError:
       properties:
@@ -453,6 +906,207 @@ components:
       - detail
       - vram_mib
       title: ModelHealth
+      type: object
+    PeopleResponse:
+      properties:
+        people:
+          items:
+            $ref: '#/components/schemas/PersonEntry'
+          title: People
+          type: array
+      required:
+      - people
+      title: PeopleResponse
+      type: object
+    PersonEntry:
+      description: "One enrolled person, as a console lists them (spec \xA723).\n\n**Carries no biometric\
+        \ data.** No embedding, no vector, no image \u2014 those live in\nthe encrypted store and never\
+        \ travel on this API. What a console shows is a name, a\nstatus and where somebody is authorised,\
+        \ and that is deliberately all it can show:\n\xA712 asks that biometric information is not exposed\
+        \ unnecessarily, and the necessary\namount here is none.\n\n`reference_faces` is a count rather\
+        \ than the faces themselves, for the same reason.\nThe faces have their own endpoint, and their\
+        \ photographs one each \u2014 see\n`EnrolledFaceEntry`.\nIt is worth showing because \xA710 asks\
+        \ for multiple references per person and \"1\" is\nusually the reason somebody is not being recognised."
+      properties:
+        camera_ids:
+          description: "Cameras this person is authorised on. **Empty means none, not all** \u2014 a person\
+            \ enrolled with no cameras assigned is authorised nowhere until somebody says where. The opposite\
+            \ default would make forgetting to set this a silent grant."
+          items:
+            type: string
+          title: Camera Ids
+          type: array
+        display_name:
+          title: Display Name
+          type: string
+        expires_at:
+          anyOf:
+          - type: number
+          - type: 'null'
+          description: "Unix epoch seconds after which this authorisation lapses, or null for no expiry.\
+            \ \xA710's temporary authorisation \u2014 without it every temporary grant becomes a permanent\
+            \ one somebody forgot to revoke."
+          title: Expires At
+        external_reference:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: External Reference
+        notes:
+          default: ''
+          title: Notes
+          type: string
+        person_id:
+          format: uuid
+          title: Person Id
+          type: string
+        reference_faces:
+          description: How many reference faces are enrolled. A count, never the faces. One is usually
+            the reason somebody is not being recognised from an angle.
+          title: Reference Faces
+          type: integer
+        status:
+          $ref: '#/components/schemas/PersonStatus'
+        zones:
+          description: Zone names authorised, as an alternative to cameras.
+          items:
+            type: string
+          title: Zones
+          type: array
+      required:
+      - person_id
+      - display_name
+      - status
+      - camera_ids
+      - zones
+      - reference_faces
+      title: PersonEntry
+      type: object
+    PersonRequest:
+      additionalProperties: false
+      description: "Create or replace an authorised person. Carries no biometric data either \u2014\n\
+        faces are enrolled separately, against an existing person."
+      properties:
+        camera_ids:
+          description: Cameras to authorise on. Empty authorises nowhere.
+          items:
+            type: string
+          title: Camera Ids
+          type: array
+        display_name:
+          maxLength: 120
+          minLength: 1
+          title: Display Name
+          type: string
+        expires_at:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Expires At
+        external_reference:
+          anyOf:
+          - maxLength: 120
+            type: string
+          - type: 'null'
+          description: "A site's own identifier \u2014 staff number, badge id. Opaque here and never used\
+            \ for matching; it exists so an operator can reconcile this record with whatever system actually\
+            \ governs employment."
+          title: External Reference
+        notes:
+          default: ''
+          maxLength: 2000
+          title: Notes
+          type: string
+        status:
+          $ref: '#/components/schemas/PersonStatus'
+          default: active
+        zones:
+          items:
+            type: string
+          title: Zones
+          type: array
+      required:
+      - display_name
+      title: PersonRequest
+      type: object
+    PersonStatus:
+      description: "Whether an enrolled person's authorisation is currently in force.\n\n`DISABLED` rather\
+        \ than deletion is the point: \xA712 requires an audit trail and a\ndeletion function, and those\
+        \ are different operations. Disabling revokes access\nwhile keeping the record of who was authorised\
+        \ and when \u2014 which is what an\ninvestigation of a past incident needs. Deleting removes the\
+        \ biometric data, which\nis what a person exercising a data right needs. Conflating them means\
+        \ one of those\ntwo obligations cannot be met."
+      enum:
+      - active
+      - disabled
+      title: PersonStatus
+      type: string
+    ProbeRequest:
+      additionalProperties: false
+      description: Look at a stream before committing to it.
+      properties:
+        url:
+          maxLength: 2048
+          minLength: 1
+          title: Url
+          type: string
+      required:
+      - url
+      title: ProbeRequest
+      type: object
+    ProbeResponse:
+      description: 'What one look at a stream found.
+
+
+        `ok` false is a normal answer, not an error status: the caller is rendering a
+
+        preview either way, and a 4xx would make "this URL is wrong" indistinguishable from
+
+        "the request was malformed".'
+      properties:
+        codec:
+          default: ''
+          title: Codec
+          type: string
+        detail:
+          title: Detail
+          type: string
+        fps:
+          default: 0.0
+          title: Fps
+          type: number
+        height:
+          default: 0
+          title: Height
+          type: integer
+        ok:
+          title: Ok
+          type: boolean
+        source_kind:
+          description: "`earthcam`, `rtsp` or `file` \u2014 which source the engine would build."
+          title: Source Kind
+          type: string
+        thumbnail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: "One decoded frame as a `data:image/jpeg;base64,\u2026` URL, or null. The point\
+            \ of a preview: a stream that opens and decodes green looks identical to a working one in\
+            \ every other field here."
+          title: Thumbnail
+        title:
+          default: ''
+          title: Title
+          type: string
+        width:
+          default: 0
+          title: Width
+          type: integer
+      required:
+      - ok
+      - detail
+      - source_kind
+      title: ProbeResponse
       type: object
     RecentEventEntry:
       description: "One event as the console sees it \u2014 a projection of the published anomaly event,\n\
@@ -570,6 +1224,111 @@ components:
       - welfare_concerns
       title: RecentEventEntry
       type: object
+    SettingEntryModel:
+      description: One configuration value, as the running process holds it.
+      properties:
+        group:
+          title: Group
+          type: string
+        is_default:
+          description: Whether this is the value the engine ships with. False means this deployment moved
+            it.
+          title: Is Default
+          type: boolean
+        name:
+          description: The environment variable an operator would set.
+          title: Name
+          type: string
+        secret:
+          title: Secret
+          type: boolean
+        value:
+          description: "The effective value, rendered for reading. For a credential this is `(set)` or\
+            \ `(unset)` and never the value \u2014 see `config_report.SECRET_FIELDS`."
+          title: Value
+          type: string
+      required:
+      - name
+      - value
+      - is_default
+      - secret
+      - group
+      title: SettingEntryModel
+      type: object
+    SettingsResponse:
+      description: "What this engine is configured to do.\n\nRead-only, and it is worth saying why: almost\
+        \ nothing here can change without a\nrestart \u2014 which models to load, how much VRAM to budget,\
+        \ where the broker is \u2014 and\nan endpoint that accepted a write would have to either lie about\
+        \ taking effect or\nrestart the engine under an operator who asked for a settings change. The\
+        \ two\nthings that *are* live are already editable where they belong, per camera."
+      properties:
+        changed:
+          description: How many settings this deployment has moved off their default. The number worth
+            reading first.
+          title: Changed
+          type: integer
+        settings:
+          items:
+            $ref: '#/components/schemas/SettingEntryModel'
+          title: Settings
+          type: array
+      required:
+      - settings
+      - changed
+      title: SettingsResponse
+      type: object
+    Severity:
+      enum:
+      - info
+      - low
+      - medium
+      - high
+      - critical
+      title: Severity
+      type: string
+    StorageResponse:
+      description: What the clip bucket holds.
+      properties:
+        bucket:
+          title: Bucket
+          type: string
+        bytes_used:
+          title: Bytes Used
+          type: integer
+        clips:
+          description: Recordings, counting a clip and its short copy as one.
+          title: Clips
+          type: integer
+        objects:
+          description: "Objects, which is what the store bills for \u2014 roughly twice `clips`."
+          title: Objects
+          type: integer
+        per_camera:
+          items:
+            $ref: '#/components/schemas/CameraStorageModel'
+          title: Per Camera
+          type: array
+        reachable:
+          description: "False when the object store could not be listed. Every count is then zero and\
+            \ means nothing \u2014 a console must say so rather than draw an empty bucket, which reads\
+            \ as evidence having been deleted."
+          title: Reachable
+          type: boolean
+        retention_days:
+          description: How long a clip survives, enforced by the object store's own lifecycle rule. `0`
+            means nothing expires.
+          title: Retention Days
+          type: integer
+      required:
+      - bucket
+      - reachable
+      - clips
+      - objects
+      - bytes_used
+      - retention_days
+      - per_camera
+      title: StorageResponse
+      type: object
     ValidationError:
       properties:
         ctx:
@@ -663,6 +1422,417 @@ info:
   version: 0.1.0
 openapi: 3.1.0
 paths:
+  /alerts:
+    delete:
+      description: 'Empty the register, and write that emptiness down.
+
+
+        **Throws away triage state, not evidence.** Every event behind these alerts is
+
+        already published to the broker and is still there; what goes is the record of which
+
+        ones a human had looked at. That is a real loss and the console asks twice before
+
+        calling this.
+
+
+        Flushed before answering, like acknowledging and resolving: a 200 that did not
+
+        survive a restart would be the same lie in the other direction.'
+      operationId: clear_alerts_alerts_delete
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  type: integer
+                title: Response Clear Alerts Alerts Delete
+                type: object
+          description: How many alerts were dropped.
+      summary: Clear the whole alert list
+    get:
+      description: "Every alert this process is holding, worst first then most recent first.\n\n**An alert\
+        \ is not an event.** An event is what happened; an alert is an *episode*\nthat events accumulate\
+        \ into, with an occurrence count. Measured on real footage,\nforty-five seconds of one corridor\
+        \ produced eleven events \u2014 and would produce\neleven rows without this. \xA717 requires that\
+        \ twenty seconds of the same person is\none alert saying it happened seventeen times.\n\n**Volatile,\
+        \ and more sharply so than the event ring.** This register lives in\nengine memory and a restart\
+        \ empties it. The durable record is the anomaly event\npublished to RabbitMQ; alert persistence\
+        \ belongs to the Phase 1C store, which is\nnot built. The consequence worth stating plainly: **an\
+        \ acknowledgement does not\nsurvive a restart.** An operator who acknowledged twenty alerts and\
+        \ then saw the\nengine restart is looking at twenty unacknowledged alerts again.\n\nOrdering is\
+        \ the engine's, not the client's, so that every reader agrees about what\nis at the top \u2014\
+        \ \xA727's \"the critical thing must be visible immediately\" is a\nproperty of that ordering\
+        \ rather than of whoever asked."
+      operationId: list_alerts_alerts_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertsResponse'
+          description: Successful Response
+      summary: "The operator's alert list \u2014 episodes, not events (volatile)"
+  /alerts/{alert_id}/acknowledge:
+    post:
+      description: "Move an alert to `acknowledged`.\n\nThe state that matters most on a wall of alerts,\
+        \ because it is the only one that\ndistinguishes \"nobody has looked\" from \"somebody is handling\
+        \ it\".\n\n**`by` is a self-declared label, not an identity.** This engine has no\nauthentication,\
+        \ so an acknowledgement records what somebody typed. That is worth\nhaving and it is not an audit\
+        \ trail; see `docs/operations.md`.\n\nA subsequent recurrence keeps the alert acknowledged rather\
+        \ than re-raising it \u2014\na person already knows, and putting it back in front of them for\
+        \ something they\nare in the middle of dealing with is how an operator learns to ignore the list."
+      operationId: acknowledge_alert_alerts__alert_id__acknowledge_post
+      parameters:
+      - in: path
+        name: alert_id
+        required: true
+        schema:
+          format: uuid
+          title: Alert Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcknowledgeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertEntry'
+          description: Successful Response
+        '404':
+          description: No alert with this id is held by the running engine.
+        '409':
+          description: "This alert is already resolved, so acknowledging it would change nothing \u2014\
+            \ which usually means the operator is acting on a stale list."
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Record that a person has seen this alert
+  /alerts/{alert_id}/clip:
+    get:
+      description: "The evidence clip, as bytes a browser can play.\n\n**This is the only route that serves\
+        \ a recording**, and the alert id is the whole of\nthe authorisation. The object it reads is looked\
+        \ up from the alert, never taken from\nthe request, so no caller can name an object the engine\
+        \ did not itself attach to an\nalert \u2014 and `MinioClipReader` re-checks the bucket rather\
+        \ than trusting that.\n\n`short=true`, the default, returns the notification-length copy\n(`SENTINEL_NOTIFY_CLIP_SECONDS`,\
+        \ three by default) \u2014 the length that is watched\nrather than scrolled past when an operator\
+        \ is triaging a wall of rows. It falls back\nto the full recording when no short copy was made,\
+        \ because \"here is a longer answer\"\nbeats \"there is nothing here\" for somebody asking what\
+        \ happened. `short=false`\nalways returns the full clip: pre-roll, the event, post-roll.\n\n`Cache-Control:\
+        \ private, max-age=60` rather than `no-store`. A clip is fixed once\nwritten, so re-fetching it\
+        \ on every render is waste \u2014 but it is footage of people,\nso it is never a shared-cache\
+        \ entry and never long-lived."
+      operationId: read_alert_clip_alerts__alert_id__clip_get
+      parameters:
+      - in: path
+        name: alert_id
+        required: true
+        schema:
+          format: uuid
+          title: Alert Id
+          type: string
+      - in: query
+        name: short
+        required: false
+        schema:
+          default: true
+          title: Short
+          type: boolean
+      responses:
+        '200':
+          content:
+            video/mp4: {}
+          description: The clip, as MP4.
+        '404':
+          description: "No alert with this id, or no clip to play \u2014 nothing was recorded, the clip\
+            \ has passed its retention window, or this engine has no object store configured."
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Watch the recording behind one alert
+  /alerts/{alert_id}/resolve:
+    post:
+      description: "Move an alert to `resolved`.\n\nIdempotent: two operators closing the same row is\
+        \ an ordinary race, not a mistake\neither of them made.\n\nA resolved alert stops absorbing recurrences\
+        \ \u2014 a person said it was finished, and\nquietly reopening it would erase that judgement.\
+        \ The same situation happening again\nopens a new alert, which is the truthful reading.\n\n**Nothing\
+        \ resolves itself.** There is no timeout and no auto-close anywhere in this\nsubsystem, because\
+        \ an alert that expired quietly would leave no trace that nobody\never went to look."
+      operationId: resolve_alert_alerts__alert_id__resolve_post
+      parameters:
+      - in: path
+        name: alert_id
+        required: true
+        schema:
+          format: uuid
+          title: Alert Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertEntry'
+          description: Successful Response
+        '404':
+          description: No alert with this id is held by the running engine.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Record that a person has finished with this alert
+  /authorized-persons:
+    get:
+      description: "The enrolled roster (spec \xA723).\n\n**Carries no biometric data.** No embeddings,\
+        \ no vectors, no reference images \u2014\nthose live in the encrypted store and never travel on\
+        \ this API. \xA712 asks that\nbiometric information is not exposed unnecessarily, and for a roster\
+        \ listing the\nnecessary amount is none. `reference_faces` is a count, because \xA710 asks for\n\
+        multiple references per person and \"1\" is usually the reason somebody is not being\nrecognised\
+        \ from an angle.\n\nAn engine with no camera enabling `person_authorization` answers an empty\
+        \ list\nrather than an error: nobody is enrolled, which is true."
+      operationId: list_people_authorized_persons_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeopleResponse'
+          description: Successful Response
+      summary: "Everyone enrolled \u2014 names and permissions, never biometric data"
+  /authorized-persons/{person_id}:
+    delete:
+      description: "Remove somebody and **all** of their biometric data (spec \xA712).\n\nNot a soft delete.\
+        \ A record that removed the name while leaving the vectors would\nkeep exactly the part that identifies\
+        \ somebody, which is the opposite of what a\ndeletion request means.\n\nDistinct from disabling:\
+        \ `PUT` with `status: disabled` revokes access while keeping\nthe record, which is what an investigation\
+        \ of a past incident needs. This is what a\nperson exercising a data right needs. Conflating them\
+        \ means one of those two\nobligations cannot be met."
+      operationId: delete_person_authorized_persons__person_id__delete
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: No enrolled person with this id.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: Delete a person and every face enrolled for them
+    put:
+      description: "Enrol somebody, or change what they are authorised for.\n\nCarries no faces \u2014\
+        \ those are enrolled separately, against an existing person, so\nthat creating a record and handing\
+        \ over biometric data are two deliberate acts\nrather than one.\n\n**`camera_ids: []` authorises\
+        \ nowhere.** The opposite default would make forgetting\nto set it a silent grant everywhere,\
+        \ which for an access rule is the failure worth\ndesigning against.\n\n`PUT` rather than `POST`\
+        \ because the id is the caller's to choose and the operation\nis idempotent: replaying it produces\
+        \ the same record rather than a second person."
+      operationId: upsert_person_authorized_persons__person_id__put
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonEntry'
+          description: Successful Response
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: Create or replace an authorised person
+  /authorized-persons/{person_id}/faces:
+    get:
+      description: "Which references exist, how old each is, and whether a photograph was kept.\n\nEnough\
+        \ to draw the roster and to decide which reference to remove when somebody has\nstopped being\
+        \ recognised \u2014 usually the oldest, taken under different lighting."
+      operationId: list_faces_authorized_persons__person_id__faces_get
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FacesResponse'
+          description: Successful Response
+        '404':
+          description: No enrolled person with this id.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: "The reference faces on one person's record \u2014 metadata, not pictures"
+    post:
+      description: "Turn a photograph into a stored face embedding (spec \xA79).\n\nThe flow is detect\
+        \ \u2192 quality check \u2192 align \u2192 embed \u2192 encrypt \u2192 store, and **the\nphotograph\
+        \ is not kept**. What persists is the embedding, sealed with AES-256-GCM.\n\xA712 asks for embeddings\
+        \ over raw biometric images where possible, and here it is\nentirely possible.\n\nThe largest\
+        \ face in the image is used, on the assumption that an enrolment\nphotograph is *of* somebody\
+        \ rather than a crowd scene. Choosing by detector\nconfidence instead would sometimes pick a sharp\
+        \ bystander over a slightly soft\nsubject.\n\n**Enrol more than one.** \xA710 asks for multiple\
+        \ references per person, and a single\nface-on office photograph matches a corridor camera at\
+        \ an angle poorly. The usual\nfix for somebody not being recognised is a second reference, not\
+        \ a lower threshold."
+      operationId: enroll_face_authorized_persons__person_id__faces_post
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_enroll_face_authorized_persons__person_id__faces_post'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonEntry'
+          description: Successful Response
+        '404':
+          description: No enrolled person with this id.
+        '422':
+          description: "No usable face was found in the image. The reason is in the detail \u2014 an enrolment\
+            \ that silently stored nothing is how somebody becomes unrecognisable with nobody able to\
+            \ say why."
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: Enrol one reference face from a photograph
+  /authorized-persons/{person_id}/faces/{face_id}:
+    delete:
+      description: "Drop one reference \u2014 its embedding and its picture together.\n\nFiner-grained\
+        \ than deleting the person, and the difference matters: a reference\ntaken in bad light makes\
+        \ somebody *harder* to recognise, and the fix is to remove\nthat reference, not to un-enrol them\
+        \ and start again."
+      operationId: delete_face_authorized_persons__person_id__faces__face_id__delete
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      - in: path
+        name: face_id
+        required: true
+        schema:
+          format: uuid
+          title: Face Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: No such face on that person's record.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: Remove one reference face and its photograph
+  /authorized-persons/{person_id}/faces/{face_id}/image:
+    get:
+      description: "The face crop stored at enrolment, decrypted for this one request.\n\n**Not the photograph\
+        \ that was uploaded.** What is kept is the detector's own face\nbox with a margin, at most 320\
+        \ px on its longest side \u2014 enough for a person to\nrecognise a person, and deliberately not\
+        \ a copy of whatever else was in the frame\n(\xA712). See `orchestrator/face_crop.py`.\n\n`Cache-Control:\
+        \ no-store`, because a browser cache is a copy of biometric data on\ndisk that nothing in this\
+        \ system knows about or can delete when the person is\ndeleted."
+      operationId: read_face_image_authorized_persons__person_id__faces__face_id__image_get
+      parameters:
+      - in: path
+        name: person_id
+        required: true
+        schema:
+          format: uuid
+          title: Person Id
+          type: string
+      - in: path
+        name: face_id
+        required: true
+        schema:
+          format: uuid
+          title: Face Id
+          type: string
+      responses:
+        '200':
+          content:
+            image/jpeg: {}
+          description: The stored face crop.
+        '404':
+          description: No such face, or no photograph was kept for it.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: No camera on this engine enables person authorization.
+      summary: One reference photograph
   /cameras:
     get:
       operationId: list_cameras_cameras_get
@@ -674,7 +1844,107 @@ paths:
                 $ref: '#/components/schemas/CamerasResponse'
           description: Successful Response
       summary: List Cameras
+    post:
+      description: 'Add a camera to `cameras.json` and start it immediately.
+
+
+        **The point of the write surface.** Every other endpoint here edits a camera
+
+        somebody already put in the file by hand; this is what lets a console stand one up
+
+        without an operator opening an editor and restarting the engine.
+
+
+        Adding takes a `url` where `PATCH` refuses one, and the difference is not arbitrary:
+
+        changing a running camera''s source means tearing down its runner, its pre-roll ring
+
+        and any clip mid-recording. A camera that does not exist yet has none of those.'
+      operationId: create_camera_cameras_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CameraCreateRequest'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraEditResponse'
+          description: Successful Response
+        '403':
+          description: Camera writes are disabled on this engine.
+        '409':
+          description: A camera with this id already exists, or a capability was asked for whose model
+            this process never loaded.
+        '422':
+          description: "The camera could not be built \u2014 the detail says why."
+        '503':
+          description: The engine is still starting.
+      summary: "Add a camera and start watching it \u2014 no restart"
+  /cameras/probe:
+    post:
+      description: "Open a URL once, decode one frame, and report what it found \u2014 with a picture.\n\
+        \nA camera added with a wrong URL fails quietly: it appears in the list and its runner\nretries\
+        \ forever behind exponential backoff, with nothing to see but a `frames_seen`\nthat never moves.\
+        \ This is how an operator learns that *before* saving.\n\n`ok: false` comes back as a 200. The\
+        \ caller renders the outcome either way, and a\n4xx would conflate \"this URL does not play\"\
+        \ with \"your request was malformed\".\n\nBehind the same flag as the writes it precedes, because\
+        \ it makes the engine fetch a\nURL the caller chose \u2014 exactly the capability that flag exists\
+        \ to gate on an\nunauthenticated port."
+      operationId: probe_camera_cameras_probe_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProbeRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeResponse'
+          description: Successful Response
+        '403':
+          description: Camera writes are disabled on this engine.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Look at a stream before adding it
   /cameras/{camera_id}:
+    delete:
+      description: "Stop watching, then remove the record \u2014 in that order.\n\nThe opposite order\
+        \ to `create_camera`, for the same underlying rule: never leave\nsomething running that the file\
+        \ does not describe. Writing first and then failing to\nstop would leave a camera publishing events\
+        \ under an id nothing can look up."
+      operationId: delete_camera_cameras__camera_id__delete
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      responses:
+        '204':
+          description: Successful Response
+        '403':
+          description: Camera writes are disabled on this engine.
+        '404':
+          description: No camera with this id.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Stop a camera and remove it from the file
     patch:
       description: "Change what a camera is called, which zone it is grouped into, and what its\nwelfare\
         \ concerns notify a human about.\n\n### This endpoint is not authenticated\n\n**Phase 1B ships\
@@ -743,9 +2013,10 @@ paths:
         '404':
           description: No camera with this id is configured in the running engine.
         '409':
-          description: "`cameras.json` cannot be edited as it currently stands \u2014 most often because\
-            \ the file has been changed by hand since the engine started and no longer contains this camera.\
-            \ Nothing was written."
+          description: "The edit cannot be taken as things currently stand, and **nothing was written**.\
+            \ Either `cameras.json` no longer admits it \u2014 most often because the file has been changed\
+            \ by hand since the engine started and no longer contains this camera \u2014 or `capabilities`\
+            \ named one whose model this process did not load, which needs a restart rather than a retry."
         '422':
           content:
             application/json:
@@ -756,6 +2027,90 @@ paths:
           description: The camera file could not be written. Nothing was changed.
       summary: "Edit a camera's label, zone and welfare notification policy \u2014 UNAUTHENTICATED, and\
         \ off by default"
+  /cameras/{camera_id}/clips:
+    get:
+      description: "What footage exists for this camera, read from the object store as it is now.\n\n\
+        **Not an index and not a history.** Retention has already removed whatever it has\nremoved, so\
+        \ this is what survives \u2014 which is the honest answer for a browser, and\nis why nothing here\
+        \ has a \"deleted\" state. A camera that has been recording for\nlonger than `SENTINEL_CLIP_RETENTION_DAYS`\
+        \ shows the window, not the run.\n\nAn unknown camera is a 404 rather than an empty list: \"this\
+        \ camera was deleted\" and\n\"this camera has recorded nothing\" are different, and a browser\
+        \ that rendered them\nidentically would let somebody conclude a camera had been silent all week."
+      operationId: list_camera_clips_cameras__camera_id__clips_get
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      - in: query
+        name: limit
+        required: false
+        schema:
+          default: 50
+          title: Limit
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClipsResponse'
+          description: Successful Response
+        '404':
+          description: No camera with this id.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: One camera's recorded clips, newest first
+  /cameras/{camera_id}/clips/{event_id}:
+    get:
+      description: "The recording for one event on one camera.\n\nThe object path is built inside the\
+        \ adapter from two validated components \u2014 a\ncamera this engine has, and a `UUID` \u2014\
+        \ never from a caller's string, and the reader\nre-checks the bucket on top of that.\n\n`short=false`\
+        \ here, unlike the alert route: somebody who has opened a footage\nbrowser and picked a clip is\
+        \ investigating, and the seconds before and after are\nthe reason they came. `short=true` returns\
+        \ the notification trim where one exists."
+      operationId: read_camera_clip_cameras__camera_id__clips__event_id__get
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      - in: path
+        name: event_id
+        required: true
+        schema:
+          format: uuid
+          title: Event Id
+          type: string
+      - in: query
+        name: short
+        required: false
+        schema:
+          default: false
+          title: Short
+          type: boolean
+      responses:
+        '200':
+          content:
+            video/mp4: {}
+          description: The clip, as MP4.
+        '404':
+          description: No such camera, or no clip for that event.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Watch one of a camera's clips
   /cameras/{camera_id}/describe:
     post:
       operationId: describe_camera_now_cameras__camera_id__describe_post
@@ -780,6 +2135,52 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: Describe Camera Now
+  /cameras/{camera_id}/enabled:
+    put:
+      description: "Switch a camera off without losing how it was set up.\n\n**The alternative to deleting\
+        \ it.** A camera taken down for maintenance, a feed\nthat has gone permanently dark, a lens being\
+        \ repositioned \u2014 deleting is the wrong\ntool for all three, because it throws away the zone,\
+        \ the capability set, the\nnotification routing and the clip overrides somebody tuned, and getting\
+        \ them back\nmeans re-entering them from memory.\n\nDisabling closes the source connection and\
+        \ destroys the runner, so a stopped camera\ncosts no socket, no decode and no CPU. What it keeps\
+        \ is the whole record, still\nlisted in `GET /cameras` with `enabled: false`, still editable,\
+        \ one request from\nrunning again with everything as it was.\n\nIts models stay loaded. Which\
+        \ model roles this process holds is fixed at startup\nfrom every configured camera including the\
+        \ stopped ones, so switching one back on\ncan never fail for want of a model that was never loaded\
+        \ \u2014 the cost is VRAM held\nfor a camera that is not using it, which is the right trade for\
+        \ making the switch\nreliable.\n\nIdempotent in both directions."
+      operationId: set_camera_enabled_cameras__camera_id__enabled_put
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CameraEnabledRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraEditResponse'
+          description: Successful Response
+        '404':
+          description: No camera with this id.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: Camera writes are disabled on this engine.
+      summary: Start or stop watching a camera, without deleting it
   /cameras/{camera_id}/events:
     get:
       description: "Recent anomaly events for one camera, plus the latest scene description.\n\n**This\
@@ -821,6 +2222,37 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: "Recent events for one camera (volatile console cache \u2014 NOT the event store)"
+  /cameras/{camera_id}/snapshot:
+    get:
+      description: "A picture of what this camera is seeing right now.\n\n**Not video, and not a replacement\
+        \ for it.** Live video is mediamtx's job and the\nconsole plays it straight from there (`src/live/HlsPlayer.tsx`).\
+        \ But only cameras\n*published to* mediamtx have a playlist, and an EarthCam page or a local file\
+        \ does\nnot \u2014 before this, those cameras showed an empty panel while the engine was\ndemonstrably\
+        \ decoding them.\n\nSo this is the fallback the console uses when there is no playlist: one frame,\
+        \ on\nrequest, which the engine already had. `Cache-Control: no-store`, because the whole\nvalue\
+        \ of the thing is that it is current."
+      operationId: camera_snapshot_cameras__camera_id__snapshot_get
+      parameters:
+      - in: path
+        name: camera_id
+        required: true
+        schema:
+          title: Camera Id
+          type: string
+      responses:
+        '200':
+          content:
+            image/jpeg: {}
+          description: The latest decoded frame.
+        '404':
+          description: No such camera, or no frame has arrived yet.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: The most recent frame from one camera, as a JPEG
   /cameras/{camera_id}/telemetry:
     get:
       operationId: get_camera_telemetry_cameras__camera_id__telemetry_get
@@ -895,3 +2327,39 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
           description: Successful Response
       summary: Get Health
+  /settings:
+    get:
+      description: "Every setting, its effective value, and whether this deployment moved it.\n\n**Read-only.**\
+        \ Almost nothing here can change without a restart \u2014 which models to\nload, how much VRAM\
+        \ to budget, where the broker is \u2014 so a writable version would\nhave to either lie about\
+        \ taking effect or restart the engine under whoever asked.\nThe settings that *are* live are per-camera\
+        \ and editable where they belong.\n\n**Credentials are never reported by value**, only as `(set)`\
+        \ or `(unset)`, which is\nthe fact an operator actually needs: \"this engine has no encryption\
+        \ key\" is a\ndiagnosis and the key itself is never one. Which fields those are is decided in\
+        \ one\nplace, by name rather than by inspecting the value \u2014 see `config_report`."
+      operationId: get_settings_report_settings_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+          description: Successful Response
+      summary: What this engine is configured to do
+  /storage:
+    get:
+      description: "Clip storage: how much, how many, per camera, and how long any of it survives.\n\n\
+        **`reachable: false` is the answer that matters.** When the object store cannot be\nlisted every\
+        \ count here is zero, and zero counts drawn as an empty bucket is how an\noperator concludes their\
+        \ evidence has been deleted. This never fails for an\nunreachable store; it says so instead.\n\
+        \nRetention is a bucket lifecycle rule the object store applies itself, not a sweeper\nin this\
+        \ process \u2014 so clips expire on schedule whether or not the engine is running."
+      operationId: get_storage_storage_get
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageResponse'
+          description: Successful Response
+      summary: What the clip bucket is holding

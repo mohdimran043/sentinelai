@@ -62,6 +62,13 @@ nor a `cameras.json` present.
 | `GET /cameras/{id}/telemetry` | One camera's counters, its `label`, its `zone` and its stored welfare policy. 404 if unknown |
 | `PATCH /cameras/{id}` | **Write.** Edits `label`, `zone` and the per-camera welfare policy, persisted to `cameras.json`. **Off by default** — 403 unless `SENTINEL_ENABLE_CAMERA_WRITES=true`. See [Editing cameras from the console](#editing-cameras-from-the-console) |
 | `POST /cameras/{id}/describe` | Forces a `user_requested` escalation, returns `event_id` |
+| `GET /alerts` | Every alert the running engine holds, worst first then most recent first. **Volatile** — see [Alerts](#alerts) |
+| `POST /alerts/{id}/acknowledge` | Records that a person has seen it. 409 if already resolved |
+| `POST /alerts/{id}/resolve` | Records that a person has finished with it. Idempotent |
+| `GET /authorized-persons` | The enrolled roster: names, permissions, and a **count** of reference faces. **Carries no biometric data of any kind** |
+| `PUT /authorized-persons/{id}` | Create or replace a person. Carries no faces |
+| `POST /authorized-persons/{id}/faces` | Enrol one reference face from a photograph (multipart). 422 with a stated reason if no usable face is found |
+| `DELETE /authorized-persons/{id}` | Delete the person **and every face enrolled for them**. Not a soft delete |
 | `GET /cameras/{id}/events` | A bounded ring of that camera's recent events, capped at 200, plus `latest` and `latest_description_state` (`none`/`available`/`unavailable`). Volatile — this is the console's view, not the event store. RabbitMQ plus the Go consumer is the durable record. 404 if unknown |
 | `GET /events/stream` | `text/event-stream`. Opens with `event: backlog` carrying a JSON array, then streams live events. A sequence watermark makes the backlog-to-live handover gapless and duplicate-free; the same `event_id` at a higher sequence is a legitimate new version, not a repeat — that is how a clip URI back-fills onto an event a client already displayed. The ring is bounded, so a long disconnect genuinely loses history |
 
@@ -162,9 +169,12 @@ detector, and nothing downstream may treat it as one.**
   never looked at by anything. The forced-look interval —
   `summary_interval_seconds`, 45 s by default — is the only thing that guarantees
   a camera is looked at at all when nothing trips a trigger.
-- **No pose or action recognition exists in this phase.** The detector reports
-  that a `person` box is present, never what that person is doing. There is no
-  limb tracking and no action classifier behind any of this.
+- **No action recognition exists anywhere in this system.** The detector reports
+  that a `person` box is present, never what that person is doing, and there is
+  no action classifier behind any of this. A camera with `fall_detection`
+  enabled adds a pose model and a geometry state machine — see the section
+  below, which has limits of its own — but that is still not action
+  recognition, and a camera without it has no temporal reasoning at all.
 - **It misses things.** In prior measurement on real footage, **a stretcher
   carry was missed entirely** — a person carried out of a room on a stretcher,
   and the system said nothing. Absence of a notification is not evidence that
@@ -183,6 +193,62 @@ detector, and nothing downstream may treat it as one.**
   custodial setting.
 
 Treat a notification as a reason to go and look at the clip. Never as a finding.
+
+### Fall detection: read this before you rely on it either
+
+Enabling `fall_detection` on a camera adds something the single-frame check above does
+not have — **memory**. A pure state machine watches each tracked person across seconds
+and raises a concern only when all four of these happen in order: they were upright long
+enough to be believed, they moved downward fast, they ended up horizontal, and they
+stayed down and still. Only then is the vision-language model asked to confirm, and only
+a concern it agrees with carries `basis: "temporal_pose_vlm"` on the published event.
+
+That is materially more evidence than one frame. It is still not a fall detector in the
+sense a clinician or a regulator would mean, and these limits are not hypothetical:
+
+- **It detects falling, not lying.** Someone already on the floor when they enter frame
+  raises nothing, because the machine never observed a transition. A person who
+  collapsed just out of view and crawled into frame is invisible to it.
+- **It has now been measured against real fall footage, and the result needs reading
+  carefully.** On URFall — 30 clips containing a fall, 40 of daily activity — the state
+  machine saw the full temporal signature in **29 of 30 falls**, and at the shipped
+  settings **raised none of them**. URFall clips end about a second after the person
+  lands, and `settle_seconds` is 3.0, so the machine is still waiting for stillness when
+  the footage stops. A real camera keeps recording, so this is not the failure it looks
+  like — but it does mean the detector has **never been validated end to end on footage
+  that runs long enough to validate it**, and no public dataset this harness can consume
+  provides any.
+
+  The other half of that measurement is the one to act on: **23 of the 40
+  daily-activity clips produced the same signature** — sitting down heavily, lying down
+  deliberately, bending to pick something up. The confirmation window is what separates
+  those from a fall. Shortening it to make the detector fire sooner trades directly
+  against a 57.5% false-alarm rate. Reproduce all of this with
+  `python -m sentinel_ai.validation.falls --dataset ../datasets/urfd`, and use
+  `--settle-seconds` to see the trade rather than argue about it.
+
+  Treat the default thresholds as a starting point to be tuned against your own cameras,
+  not as a calibration.
+- **Occlusion defeats it.** A person who falls behind furniture, or whose box merges
+  with another person's, is a person the tracker loses — and a lost track takes its
+  episode with it, silently.
+- **`settle_seconds` is a floor on how late you are told.** At the 3.0 s default,
+  nothing is raised until the person has been down and still for three seconds, and the
+  clip's post-roll adds more. Lowering it trades notice against a stumble raising an
+  alarm.
+- **Movement restarts that timer.** Someone struggling to get up is still down, and the
+  machine keeps waiting rather than cancelling — so a person in distress who keeps
+  moving is reported *later*, not never, and possibly much later.
+- **Pose is an improvement, not a guarantee.** Where a skeleton is unavailable or
+  low-confidence the machine falls back to bounding-box shape, which a crouch, a carried
+  object or a box that grew to include a chair can all confound. The event records which
+  reading was used.
+- **One escalation per frame.** If two people fall in the same instant, one is reported
+  and the other is not — the keyframe is shared, so a second call would describe the
+  same image.
+
+The same rule as above applies, for the same reason: a fall concern is a reason to go
+and look at the clip. Never a finding, and never a medical one.
 
 ### When a notification actually goes out
 
@@ -273,6 +339,155 @@ That is a real trade-off and it points both ways: **a shorter post-roll is a
 faster alert and less evidence.** Notifying before the clip was finalised would
 send a note whose `clip_uri` pointed at nothing, which is why the order is what
 it is.
+
+## Alerts
+
+An event is what happened. An **alert** is an episode that events accumulate into.
+
+The engine keys an alert on `(camera, reason, subject)` and merges every later matching
+event within `SENTINEL_ALERT_MERGE_WINDOW_SECONDS` (120 s) into it, incrementing
+`occurrences` and extending `last_seen_at`. One person walking a corridor for twenty
+seconds is one row saying it happened seventeen times, not seventeen rows. Measured on
+real footage: forty-five seconds of one corridor produced eleven events and would have
+produced eleven rows without this.
+
+Acknowledge records that a person saw it. Resolve records that a person finished with
+it, and a resolved alert stops absorbing recurrences — the same thing happening again
+opens a new alert rather than quietly reopening a closed judgement. **Nothing resolves
+itself**; there is no timeout anywhere in this path.
+
+### Alerts: read this before you rely on them
+
+**The register is in engine memory and a restart empties it.** An acknowledgement is not
+durable. The durable record is the anomaly event published to RabbitMQ. Treat the alert
+list as the view an operator works from right now, not as an audit trail — the absence
+of an alert means "not held by this process run", never "did not happen".
+
+It is bounded at `SENTINEL_ALERT_REGISTER_CAPACITY` (500) and evicts closed alerts
+before open ones, so a very busy site loses old *resolved* rows first.
+
+### Watching an alert's clip
+
+`GET /alerts/{alert_id}/clip` is the **only** route that serves a recording, and the
+console's alert rows play it inline.
+
+```bash
+curl -o clip.mp4 localhost:8000/alerts/<id>/clip              # the short copy
+curl -o full.mp4 'localhost:8000/alerts/<id>/clip?short=false' # pre-roll, event, post-roll
+```
+
+`short=true` is the default and returns the `SENTINEL_NOTIFY_CLIP_SECONDS` trim — three
+seconds, the length somebody watches while deciding where to go rather than scrolls
+past. It falls back to the full recording when no short copy was made, so it never 404s
+for a reason the caller could have avoided.
+
+**The alert id is the whole of the authorisation.** The object is resolved from the
+alert inside the engine and never taken from the request, so no caller can name a clip
+this engine did not itself attach to an alert; the reader re-checks the bucket rather
+than trusting that. There is still **no authentication** on this port — anyone who can
+reach it and knows an alert id can watch that footage. That is the same exposure the
+rest of this API has, and it is footage of people, so treat the port accordingly.
+
+A `404` here means one of three things and does not distinguish them: no clip was ever
+recorded, the clip has passed `SENTINEL_CLIP_RETENTION_DAYS`, or this engine has no
+object store configured. `AlertEntry.clip_uri` tells you whether the first applies.
+
+## Person authorization
+
+Off by default. It is enabled per camera, and enabling it anywhere makes
+`SENTINEL_FACE_ENCRYPTION_KEY` mandatory — the engine **will not start** without it.
+
+```bash
+python -m sentinel_ai.adapters.face.encrypted_store    # prints a fresh base64 key
+export SENTINEL_FACE_ENCRYPTION_KEY=...
+```
+
+Then create a person and give them a reference face:
+
+```bash
+curl -X PUT localhost:8000/authorized-persons/$(uuidgen) \
+  -H 'content-type: application/json' \
+  -d '{"display_name": "A. Operator", "camera_ids": ["front-door"], "status": "active"}'
+
+curl -X POST localhost:8000/authorized-persons/<id>/faces -F 'image=@photo.jpg'
+```
+
+Enrol **several** faces per person, from the angles that camera actually sees. One
+reference is the usual reason somebody is not recognised in profile, which is why the
+roster reports a count rather than hiding it.
+
+### What is stored, and what is not
+
+| | |
+|---|---|
+| Stored | A 512-d ArcFace embedding per reference face, each sealed individually with AES-256-GCM, in a 0600 file written by write-then-rename |
+| **Not stored** | **Any face image.** The photograph is embedded and discarded inside the request that carried it |
+| **Not logged** | Embeddings, similarity scores, or any biometric value. The roster API returns none either |
+
+`DELETE /authorized-persons/{id}` removes the person *and* their embeddings. It is not a
+soft delete — a record that dropped the name and kept the vectors would keep precisely
+the part that identifies somebody. Revoking access without deleting the record is a
+different act: `PUT` with `"status": "disabled"`.
+
+**Rotating the key makes every enrolled face undecryptable.** Everybody must re-enrol.
+That is what it means for the data to be genuinely encrypted rather than obscured.
+
+### Person authorization: read this before you rely on it
+
+**A miss is the safe failure here; a false accusation is not.** `UNAUTHORIZED_PERSON`
+is deliberately low severity, well below a suspected fall, because the system's
+confidence that it has correctly identified a stranger is much lower than its confidence
+that somebody fell — and the cost of being wrong lands on a person.
+
+- **It is a recognition system, not an access control system.** It has no authentication
+  in front of it, it does not open doors, and it must not be wired to anything that
+  does.
+- **The 0.42 default threshold is now measured**, on the standard LFW verification
+  protocol: 92.7% recall and **zero false matches in 1100 different-person pairs**, with
+  the threshold sitting in a wide empty band between the impostor 95th percentile (0.098)
+  and the genuine median (0.676). Reproduce it with
+  `python -m sentinel_ai.validation.faces --pairs <lfw pairs parquet>`.
+- **That was measured on portrait photographs, not on your cameras.** LFW faces are
+  large, frontal and well lit. A ceiling-mounted camera eight metres down a corridor
+  produces none of those, and `min_box_pixels` and `min_frontality` will reject most of
+  what it sees — which is the safe failure, but it means recall on *your* footage is not
+  92.7% and is not known. Tune per camera against faces from that camera.
+- **Even-handedness is now partly measured, and it is not uniform.** On 1800 FairFace
+  images (`python -m sentinel_ai.validation.faces --fairness 1800`), face detection is
+  even across every labelled group (99.1–100%) and so is the share clearing the quality
+  bars (67–76%). But **impostor similarity is not**: near-misses between different people
+  sit at p99 = 0.156 for White faces and 0.179–0.237 for every other group. All are far
+  below the shipped 0.42, so nothing fails today — but the margin protecting against a
+  false match is 15–50% thinner for non-White faces, and a site that lowers
+  `match_threshold` spends that margin unevenly.
+- **Verification accuracy by group is still unmeasured**, and cannot be measured with
+  what is publicly reachable: FairFace has no identity labels, so same-person pairs
+  cannot be built from it, and the datasets that do (RFW, DemogPairs) require an
+  institutional application. **This has not been validated as fair in the sense that
+  matters most.**
+- Recognition is **sticky for the life of a track**: once somebody is matched, turning
+  away from the camera does not un-recognise them. A dropped and re-acquired track
+  starts over.
+- Nothing is reported until `min_observations` (4) frames across `min_duration_seconds`
+  (2.0) agree. A single bad frame cannot accuse anybody.
+
+## Camera tamper
+
+Enabled per camera, needs **no model**, so it costs nothing to switch on site-wide. It
+asks whether most of the frame has collapsed into one luma bin — a covered lens, a
+sprayed dome, a light switched off — and reports only after `min_clear_seconds` (30 s)
+of varied view followed by `obstructed_seconds` (10 s) of a blank one. The second
+threshold rides out a lorry pulling across the view, headlights sweeping the lens, and
+an auto-exposure hunt after a light is switched on.
+
+**A camera that is dark all night does not alarm**, because the clear run resets the
+moment it ends; the detector must have seen something varied *first*. That also means a
+camera obstructed before the engine started is never reported — it has no clear run to
+compare against.
+
+Worth enabling everywhere for a reason that is easy to miss: an obstructed camera is
+silent in every other signal the system has, and silence looks exactly like a quiet
+corridor.
 
 ## Running the console
 

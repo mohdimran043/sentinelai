@@ -6,18 +6,15 @@
 import type {
   RecorderAlert,
   RecorderAlertsResponse,
-  RecorderCamera,
   RecorderCamerasResponse,
   RecorderCapabilitiesResponse,
   RecorderCoverageReport,
   RecorderJournalDayResponse,
   RecorderJournalResponse,
   RecorderModelsResponse,
-  RecorderNotificationsResponse,
   RecorderSettingsResponse,
   RecorderStatusResponse,
   RecorderUntrackedResponse,
-  RecorderWorkerStatus,
 } from '@/recorder/recorder.types'
 
 /**
@@ -596,205 +593,6 @@ export const REAL_STATUS: RecorderStatusResponse = {
     },
   ],
   server_time_ns: 1785580431295388577,
-}
-
-/* ------------------------------------------------------------------ *
- * GET /api/notifications — captured live 2026-08-01: 16 event types, 8
- * locked, 16 rules (one per type), 2 channels (dashboard configured, webhook
- * not).
- * ------------------------------------------------------------------ */
-
-export const REAL_NOTIFICATIONS: RecorderNotificationsResponse = {
-  channel_config: {},
-  channels: [
-    {
-      name: 'dashboard',
-      configured: true,
-      detail:
-        'In-app alert feed, persisted to disk. Always available, which is why a welfare-locked event falls back to it.',
-    },
-    {
-      name: 'webhook',
-      configured: false,
-      detail: 'No URL configured. Any alert routed here reaches nobody.',
-    },
-  ],
-  delivery_note:
-    'Integrity transitions and worker faults are delivered to the channels named here. Every attempt is recorded at /api/alerts, including the ones that failed. Delivery covers the facts this slice records — camera integrity and loss of observation — and nothing about people, because nothing detects them.',
-  delivery_wired: true,
-  event_types: [
-    {
-      type: 'STREAM_LOST',
-      description: 'The worker reported the stream gone. Nothing is being recorded for this camera.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'LOST',
-      description:
-        'No frames arrived for long enough to count as an outage. Observation of this camera has stopped.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'FAILED',
-      description:
-        'The supervisor gave up restarting this camera. Nothing is watching it and nothing will retry.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'MASK_LOAD_FAILED',
-      description: 'Privacy masks could not be loaded, so masking cannot be enforced.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'ENCODER_WRITE_FAILED',
-      description: 'Frames are arriving but cannot be written. Recorded coverage is being lost.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'CUDA_ERROR',
-      description: 'The GPU pipeline failed. Decode, masking and encode all stop.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'OBSTRUCTED',
-      description: 'The view collapsed to near-uniform — consistent with the lens being covered.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'FOV_SHIFTED',
-      description:
-        'The scene no longer matches its reference — consistent with the camera having been moved.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'UNDERLIT',
-      description: 'Too dark for the image to be relied on.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'DEGRADED_QUALITY',
-      description: 'Sharpness below threshold. The stream is usable but worse than it was.',
-      locked: false,
-      default_enabled: false,
-    },
-    {
-      type: 'DECODE_ERROR_BURST',
-      description: 'A run of decode errors. Frames are being lost inside the pipeline.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'CLOCK_STEP_DETECTED',
-      description: 'The clock jumped. Timestamps either side of the step may not line up.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'STREAM_CONNECTED',
-      description: 'The worker connected to the source.',
-      locked: false,
-      default_enabled: false,
-    },
-    {
-      type: 'CAMERA_RECOVERED',
-      description:
-        'The camera returned to HEALTHY. This is the end of an outage, not a statement that anything is well.',
-      locked: false,
-      default_enabled: true,
-    },
-    {
-      type: 'UNMASKED_FRAME_SERVED',
-      description:
-        'An unmasked frame was served to the console so a privacy mask could be placed. Only ever for a camera that is not recording and has no valid mask set. The frame was not written to disk.',
-      locked: true,
-      default_enabled: true,
-    },
-    {
-      type: 'MASK_SET_CHANGED',
-      description: "A camera's privacy mask set was replaced from the console. What this camera cannot see has changed.",
-      locked: true,
-      default_enabled: true,
-    },
-  ],
-  locked: [
-    'CUDA_ERROR',
-    'ENCODER_WRITE_FAILED',
-    'FAILED',
-    'LOST',
-    'MASK_LOAD_FAILED',
-    'MASK_SET_CHANGED',
-    'STREAM_LOST',
-    'UNMASKED_FRAME_SERVED',
-  ],
-  note: 'Locked event types report loss of observation or loss of privacy enforcement and cannot be disabled, left without channels, or routed only to a channel that cannot deliver. No configuration may suppress them.',
-  rules: [
-    { event_type: 'STREAM_LOST', channels: ['dashboard'], enabled: true },
-    { event_type: 'LOST', channels: ['dashboard'], enabled: true },
-    { event_type: 'FAILED', channels: ['dashboard'], enabled: true },
-    { event_type: 'MASK_LOAD_FAILED', channels: ['dashboard'], enabled: true },
-    { event_type: 'ENCODER_WRITE_FAILED', channels: ['dashboard'], enabled: true },
-    { event_type: 'CUDA_ERROR', channels: ['dashboard'], enabled: true },
-    { event_type: 'OBSTRUCTED', channels: ['dashboard'], enabled: true },
-    { event_type: 'FOV_SHIFTED', channels: ['dashboard'], enabled: true },
-    { event_type: 'UNDERLIT', channels: ['dashboard'], enabled: true },
-    { event_type: 'DEGRADED_QUALITY', channels: ['dashboard'], enabled: false },
-    { event_type: 'DECODE_ERROR_BURST', channels: ['dashboard'], enabled: true },
-    { event_type: 'CLOCK_STEP_DETECTED', channels: ['dashboard'], enabled: true },
-    { event_type: 'STREAM_CONNECTED', channels: ['dashboard'], enabled: false },
-    { event_type: 'CAMERA_RECOVERED', channels: ['dashboard'], enabled: true },
-    { event_type: 'UNMASKED_FRAME_SERVED', channels: ['dashboard'], enabled: true },
-    { event_type: 'MASK_SET_CHANGED', channels: ['dashboard'], enabled: true },
-  ],
-}
-
-/**
- * Synthetic camera/status builders for `CamerasPage` tests that need more
- * variety than one live capture provides — a camera the recorder is not
- * reporting worker status for, a stopped worker, a failed one with restarts.
- * Field shapes mirror `REAL_CAMERAS/REAL_STATUS` exactly.
- */
-export function makeCamera(overrides: Partial<RecorderCamera> = {}): RecorderCamera {
-  return {
-    id: 'test_cam',
-    name: 'Test Camera',
-    mode: 'room',
-    space_type: 'room',
-    source: 'v4l2:/dev/video0',
-    width: 1280,
-    height: 720,
-    fps: 15,
-    mask_path: '',
-    preroll_seconds: 300,
-    elevated_watch: false,
-    capacity: 0,
-    audio_enabled: false,
-    face_recognition_enabled: false,
-    ignored_zones: [],
-    ...overrides,
-  }
-}
-
-export function makeStatus(overrides: Partial<RecorderWorkerStatus> = {}): RecorderWorkerStatus {
-  return {
-    camera_id: 'test_cam',
-    mode: 'room',
-    integrity_state: 'HEALTHY',
-    running: true,
-    failed: false,
-    restarts: 0,
-    last_frame_age_ms: 500,
-    frames_dropped: 0,
-    ...overrides,
-  }
 }
 
 /* ------------------------------------------------------------------ *

@@ -155,8 +155,16 @@ class TestEventWelfareDefault:
         assert first.welfare is not second.welfare
 
 
-def test_escalation_reasons_cover_all_seven_spec_triggers() -> None:
+def test_escalation_reasons_are_exactly_the_documented_set() -> None:
+    """Pinned as a whole set, not a subset, so a member added without a published
+    contract change fails here rather than at a consumer.
+
+    `reason` is in the event schema's enum, so every addition is a wire change: a
+    consumer validating against the committed schema rejects an unknown value, which
+    is the correct failure but a remote one. This is the local one.
+    """
     assert {r.value for r in EscalationReason} == {
+        # Spec §4.1's seven.
         "new_salient_track",
         "scene_change",
         "dwell_exceeded",
@@ -164,4 +172,41 @@ def test_escalation_reasons_cover_all_seven_spec_triggers() -> None:
         "track_count_spike",
         "periodic_summary",
         "user_requested",
+        # Spec §6 and §7. Not per-frame predicates like the six automatic ones above,
+        # but temporal state machines' reports — see `domain/behaviour/`.
+        "fall_suspected",
+        "abandoned_object",
+        "camera_tamper",
+        "zone_intrusion",
+        "line_crossing",
+        # Spec §8-§12. Also a temporal machine's report rather than a per-frame
+        # predicate — see `domain/policy/authorization.py`.
+        "unauthorized_person",
     }
+
+
+def test_every_behaviour_kind_has_a_reason_and_no_reason_is_orphaned() -> None:
+    """The mapping the pipeline publishes through must be total in both directions.
+
+    A kind with no reason cannot be escalated at all, and a behaviour reason with no
+    kind is a value on the wire nothing can produce — a filter option in a console that
+    never matches. `_BEHAVIOUR_REASONS` is indexed rather than `.get`-with-a-default
+    precisely so the first is a build failure; this pins the second.
+    """
+    from sentinel_ai.domain.behaviour.candidate import BehaviourKind
+    from sentinel_ai.pipeline.runner import _BEHAVIOUR_REASONS
+
+    assert set(_BEHAVIOUR_REASONS) == set(BehaviourKind)
+    # `unauthorized_person` is deliberately absent from `BehaviourKind`: it is not a
+    # behaviour detector. It runs on a face pipeline rather than on tracks and geometry,
+    # and it is raised on its own path — see `CameraRunner._detect_unauthorized`.
+    behaviour_reasons = set(_BEHAVIOUR_REASONS.values())
+    assert len(behaviour_reasons) == len(BehaviourKind), "two kinds share one reason"
+
+
+def test_the_fall_reason_is_named_suspected_rather_than_detected() -> None:
+    """ADR 10, applied to the reason vocabulary. `fall_detected` would read to every
+    downstream consumer as a trained classifier's verdict; what is actually behind
+    this is a geometry state machine awaiting vision-language confirmation."""
+    assert EscalationReason.FALL_SUSPECTED.value == "fall_suspected"
+    assert "fall_detected" not in {r.value for r in EscalationReason}

@@ -1,5 +1,18 @@
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
+  acknowledgeAlert,
+  clearAlerts,
+  createCamera,
+  deleteCamera,
+  deleteFace,
+  deletePerson,
+  enrollFace,
+  listAlerts,
+  listPeople,
+  resolveAlert,
+  listFaces,
+  probeSource,
+  upsertPerson,
   describeCameraNow,
   getCameraEvents,
   getCameraTelemetry,
@@ -12,6 +25,11 @@ import {
   type CameraStatus,
   type CamerasResponse,
   type HealthResponse,
+  type AlertsResponse,
+  type PeopleResponse,
+  type CameraCreateRequest,
+  type FacesResponse,
+  type PersonRequest,
 } from '@/api/engineClient'
 
 const HEALTH_POLL_MS = 5_000
@@ -119,6 +137,161 @@ export function useUpdateCamera(cameraId: string) {
       if (error instanceof EngineHttpError && error.status === 403) {
         void queryClient.invalidateQueries({ queryKey: ['engine', 'cameras'] })
       }
+    },
+  })
+}
+
+/**
+ * The alert list. Polled fast — this is the one view where being a few seconds
+ * stale changes what an operator does, and the payload is a few dozen rows.
+ */
+const ALERTS_POLL_MS = 3_000
+
+export function useAlerts(): UseQueryResult<AlertsResponse, Error> {
+  return useQuery({
+    queryKey: ['engine', 'alerts'],
+    queryFn: listAlerts,
+    retry: 1,
+    refetchInterval: ALERTS_POLL_MS,
+    refetchIntervalInBackground: false,
+  })
+}
+
+export function useAcknowledgeAlert() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ alertId, by }: { alertId: string; by: string }) =>
+      acknowledgeAlert(alertId, by),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'alerts'] })
+    },
+  })
+}
+
+export function useResolveAlert() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (alertId: string) => resolveAlert(alertId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'alerts'] })
+    },
+  })
+}
+
+/**
+ * The enrolled roster. Polled slowly: it only changes when an operator changes
+ * it, unlike everything else on this console.
+ */
+const PEOPLE_POLL_MS = 30_000
+
+export function usePeople(): UseQueryResult<PeopleResponse, Error> {
+  return useQuery({
+    queryKey: ['engine', 'people'],
+    queryFn: listPeople,
+    retry: 1,
+    refetchInterval: PEOPLE_POLL_MS,
+    refetchIntervalInBackground: false,
+  })
+}
+
+/**
+ * The references on one person's record.
+ *
+ * Not folded into `usePeople`: a roster of fifty people would then fetch fifty face
+ * lists to draw a table that shows a count, and the faces are only looked at when
+ * somebody expands a person. Enabled explicitly by the caller for that reason.
+ */
+/**
+ * Probe a URL. A mutation rather than a query: it is an action the operator takes, it
+ * costs a network fetch and a decode on the engine, and it must never re-run on its own
+ * because the operator is still typing.
+ */
+export function useProbeSource() {
+  return useMutation({ mutationFn: (url: string) => probeSource(url) })
+}
+
+export function useCreateCamera() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (camera: CameraCreateRequest) => createCamera(camera),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'cameras'] })
+    },
+  })
+}
+
+export function useDeleteCamera() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (cameraId: string) => deleteCamera(cameraId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'cameras'] })
+    },
+  })
+}
+
+export function useClearAlerts() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearAlerts,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'alerts'] })
+    },
+  })
+}
+
+export function useFaces(personId: string, enabled: boolean): UseQueryResult<FacesResponse, Error> {
+  return useQuery({
+    queryKey: ['engine', 'people', personId, 'faces'],
+    queryFn: () => listFaces(personId),
+    enabled,
+    retry: 1,
+  })
+}
+
+export function useDeleteFace() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ personId, faceId }: { personId: string; faceId: string }) =>
+      deleteFace(personId, faceId),
+    onSuccess: (_result, { personId }) => {
+      // Both: the gallery loses a thumbnail and the roster's `reference_faces` count
+      // changes with it. Invalidating only one leaves the page contradicting itself.
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people', personId, 'faces'] })
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people'] })
+    },
+  })
+}
+
+export function useUpsertPerson() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ personId, person }: { personId: string; person: PersonRequest }) =>
+      upsertPerson(personId, person),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people'] })
+    },
+  })
+}
+
+export function useDeletePerson() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (personId: string) => deletePerson(personId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people'] })
+    },
+  })
+}
+
+export function useEnrollFace() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ personId, image }: { personId: string; image: File }) =>
+      enrollFace(personId, image),
+    onSuccess: (_result, { personId }) => {
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people', personId, 'faces'] })
+      void queryClient.invalidateQueries({ queryKey: ['engine', 'people'] })
     },
   })
 }

@@ -83,6 +83,57 @@
     background: var(--color-signal-d);
     color: var(--color-fg);
   }
+
+  /*
+   * Scrollbars and the caret ship with browser defaults that belong to no design
+   * system, and on a dark instrument panel a stock light scrollbar is the single
+   * most obvious seam. Both are themed from the palette rather than hidden — an
+   * invisible scrollbar on a dense operator console removes the one affordance
+   * that says a table has more rows below.
+   */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-2) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-2);
+    border: 2px solid var(--color-void);
+    border-radius: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-unknown);
+  }
+
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  input,
+  textarea {
+    caret-color: var(--color-signal);
+  }
+
+  /*
+   * Every number an operator compares column to column is tabular. Applied to the
+   * elements that carry readings rather than globally: proportional digits read
+   * better in prose, and this console has both.
+   */
+  .readout,
+  .data-table td,
+  .data-table th {
+    font-variant-numeric: tabular-nums;
+  }
 }
 
 @layer utilities {

@@ -185,6 +185,7 @@ class FakeClipHandle(ClipHandle):
         finish_error: Exception | None = None,
         append_error: Exception | None = None,
         append_error_after: int = 0,
+        notify_uri: str | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.event_id = event_id
@@ -194,6 +195,7 @@ class FakeClipHandle(ClipHandle):
         self._finish_error = finish_error
         self._append_error = append_error
         self._append_error_after = append_error_after
+        self._notify_uri = notify_uri
 
     async def append(self, packet: EncodedPacket) -> None:
         """`append_error`, when set, raises from the `append_error_after`-th call on.
@@ -210,6 +212,12 @@ class FakeClipHandle(ClipHandle):
             raise self._finish_error
         self.finished = True
         return f"s3://sentinel-clips/{self.camera_id}/{self.event_id}.mp4"
+
+    @property
+    def notify_uri(self) -> str | None:
+        """`None` unless a test sets one, which is the real default: a writer that makes
+        no short clip is a complete writer."""
+        return self._notify_uri
 
     async def abort(self) -> None:
         self.aborted = True

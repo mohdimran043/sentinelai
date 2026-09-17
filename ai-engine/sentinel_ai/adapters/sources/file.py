@@ -9,10 +9,17 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator
+from functools import partial
 
 import av
 
-from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
+from sentinel_ai.adapters.sources.hwaccel import build_hwaccel
+from sentinel_ai.ports.frame_source import (
+    DeferredPixels,
+    EncodedPacket,
+    FrameData,
+    FrameSource,
+)
 
 _FRAME_QUEUE_MAXSIZE = 8
 _PACKET_QUEUE_MAXSIZE = 256
@@ -53,10 +60,15 @@ class FileSource(FrameSource):
         camera_id: str,
         realtime: bool,
         packet_queue_maxsize: int = _PACKET_QUEUE_MAXSIZE,
+        hwaccel_device: str | None = None,
     ) -> None:
         self._path = path
         self._camera_id = camera_id
         self._realtime = realtime
+        # Resolved here rather than in `_pump`, so an unavailable device type fails
+        # while a human is still looking at the startup, not on a worker thread eight
+        # frames into a replay.
+        self._hwaccel = build_hwaccel(hwaccel_device)
         self._frame_queue: queue.Queue[FrameData | _QueueEnd] = queue.Queue(
             maxsize=_FRAME_QUEUE_MAXSIZE
         )
@@ -108,14 +120,18 @@ class FileSource(FrameSource):
                 delay = due - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
-            pixels = frame.to_ndarray(format="bgr24")
+            # Deferred, not converted here. The mailbox this is about to push into
+            # overwrites, so most of these frames are dropped before anybody looks at
+            # them, and a BGR conversion is a third of the cost of decoding. See
+            # `DeferredPixels`. Dimensions come from the decoder rather than from the
+            # array's shape, because there is no array yet.
             frame_data = FrameData(
                 camera_id=self._camera_id,
                 frame_index=frame_index,
                 timestamp=pts_seconds,
-                width=pixels.shape[1],
-                height=pixels.shape[0],
-                pixels=pixels,
+                width=frame.width,
+                height=frame.height,
+                pixels=DeferredPixels(partial(frame.to_ndarray, format="bgr24")),
             )
             if not self._put_frame_blocking(frame_data):
                 return -1
@@ -124,7 +140,11 @@ class FileSource(FrameSource):
 
     def _pump(self) -> None:
         try:
-            container = av.open(self._path)
+            container = (
+                av.open(self._path, hwaccel=self._hwaccel)
+                if self._hwaccel is not None
+                else av.open(self._path)
+            )
             try:
                 stream = container.streams.video[0]
                 time_base = stream.time_base

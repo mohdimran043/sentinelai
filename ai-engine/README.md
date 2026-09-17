@@ -14,10 +14,13 @@ cd ai-engine
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[runtime,dev]"      # CPU-only pipeline with fakes
 # pip install -e ".[gpu]"            # add this on the GPU box for real models
+# pip install -e ".[face-gpu]"       # and this only if a camera enables person_authorization
 
 docker compose -f ../deploy/compose/docker-compose.core.yml --profile core up -d   # Postgres, Redis, RabbitMQ, MinIO, mediamtx
 
 cp cameras.example.json cameras.json    # then edit it: see "Camera configuration"
+# Only if some camera enables person_authorization — the engine refuses to start without it:
+# export SENTINEL_FACE_ENCRYPTION_KEY=$(python -m sentinel_ai.adapters.face.encrypted_store)
 
 uvicorn sentinel_ai.main:app --host 0.0.0.0 --port 8000
 ```

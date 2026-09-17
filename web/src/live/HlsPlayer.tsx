@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type Hls from 'hls.js'
 import { MEDIAMTX_BASE_URL } from '@/api/config'
+import { snapshotUrl } from '@/api/engineClient'
 import { hlsPlaylistUrl } from '@/live/hlsUrl'
 import { canPlayHls, supportsNativeHls } from '@/live/hlsSupport'
 import { useLiveStream } from '@/live/useLiveStream'
@@ -95,6 +96,56 @@ export function HlsPlayer({ cameraId }: { cameraId: string }) {
   )
 }
 
+/**
+ * The latest decoded frame, refreshed on a timer.
+ *
+ * Deliberately labelled as what it is. A refreshing still is not live video and an
+ * operator must not read it as one — but it is what the engine actually has for a camera
+ * with no mediamtx path, and it is far better than the empty panel that was here before.
+ *
+ * `REFRESH_MS` is the trade: each request costs the engine one JPEG encode, and a second
+ * is often enough to see somebody walk through a doorway while being nowhere near a
+ * frame rate that would make this pretend to be video.
+ */
+const REFRESH_MS = 1_000
+
+function SnapshotView({ cameraId, attempt }: { cameraId: string; attempt: number }) {
+  const [at, setAt] = useState(() => Date.now())
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    const timer = setInterval(() => setAt(Date.now()), REFRESH_MS)
+    return () => clearInterval(timer)
+  }, [])
+
+  if (failed) {
+    return (
+      <Absent title="Nothing to show yet">
+        This camera has no live video path and has not delivered a frame the engine could
+        hold on to. If it was just added, give it a moment; the panel fills itself in.
+        Retrying{attempt > 1 ? ` (attempt ${formatCount(attempt)})` : ''}.
+      </Absent>
+    )
+  }
+
+  return (
+    <figure className="m-0">
+      <img
+        src={snapshotUrl(cameraId, at)}
+        alt={`Most recent frame from ${cameraId}`}
+        data-testid="camera-snapshot"
+        onError={() => setFailed(true)}
+        onLoad={() => setFailed(false)}
+        className="aspect-video w-full rounded-sm bg-void object-contain"
+      />
+      <figcaption className="muted mt-1 mb-0">
+        Latest frame, refreshed every second — this camera has no live video path, so this
+        is a still and not a stream.
+      </figcaption>
+    </figure>
+  )
+}
+
 function LiveVideoFallback({
   state,
   cameraId,
@@ -124,13 +175,11 @@ function LiveVideoFallback({
         </div>
       )
     case 'unavailable':
-      return (
-        <Absent title="No live stream reachable">
-          Nothing is being served at this camera&apos;s video path right now — it may not have
-          started publishing yet, or may have no live video path configured at all. Retrying
-          automatically{state.attempt > 1 ? ` (attempt ${formatCount(state.attempt)})` : ''}.
-        </Absent>
-      )
+      // Not an `Absent` any more. "No live stream" was true and useless on a camera the
+      // engine is visibly decoding: an EarthCam page and a local file never pass through
+      // mediamtx, so they have no playlist and never will, and the panel sat empty while
+      // frames were arriving. The engine already holds the latest frame, so show that.
+      return <SnapshotView cameraId={cameraId} attempt={state.attempt} />
     case 'dropped':
       return (
         <Notice tone="caution">

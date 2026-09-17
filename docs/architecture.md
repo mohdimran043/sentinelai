@@ -27,13 +27,15 @@ exists.
         │ main.py — composition root                       │  builds everything
         ├──────────────────────────────────────────────────┤
         │ api/         FastAPI routes                      │
-        │ pipeline/    CameraRunner, motion stage          │  impure: I/O, clocks,
-        │ orchestrator/ registry, resident set, scheduler  │  frameworks, GPU
-        │ adapters/    YOLO11, Qwen2.5-VL, PyAV, MinIO,    │
-        │              RabbitMQ, ByteTrack                 │
+        │ pipeline/    CameraRunner, motion, behaviour     │  impure: I/O, clocks,
+        │ orchestrator/ registry, resident set, scheduler, │  frameworks, GPU
+        │              alert register, priority queue      │
+        │ adapters/    YOLO11(+pose), Qwen2.5-VL, PyAV,    │
+        │              InsightFace, MinIO, RabbitMQ,       │
+        │              ByteTrack, encrypted face store     │
         ├──────────────────────────────────────────────────┤
         │ ports/       abstract interfaces — the seams     │  PURE
-        │ domain/      entities + policy                   │  PURE
+        │ domain/      entities, behaviour/, policy/       │  PURE
         └──────────────────────────────────────────────────┘
 ```
 
@@ -100,7 +102,7 @@ detectors pins neither of them.
 
 ## The ports
 
-Eight abstract interfaces in `ai-engine/sentinel_ai/ports/`. Everything
+Eleven abstract interfaces in `ai-engine/sentinel_ai/ports/`. Everything
 replaceable is replaceable through one of them.
 
 | Port | File | Contract |
@@ -112,9 +114,12 @@ replaceable is replaceable through one of them.
 | `EventPublisher` / `FailedEventSink` | `event_publisher.py` | `publish(event)`. Must **raise** on failure, never swallow |
 | `ClipWriter` / `ClipHandle` | `clip_writer.py` | `open()` returns a handle; `append`/`finish`/`abort` stream packets |
 | `Notifier` | `notifier.py` | `notify(WelfareNote)`. Must **never raise** — the exact opposite of `EventPublisher` |
+| `PoseEstimator` | `pose.py` | `estimate(frame, tracks) -> Mapping[int, PersonPose]`, keyed by track id. Loaded only where a capability needs it |
+| `FaceDetector` / `FaceEmbedder` | `face.py` | Find faces, turn one into a 512-d embedding. Two ports, one adapter — see below |
+| `FaceStore` | `face.py` | Persist and read enrolled people and their sealed embeddings |
 | `ModelRuntime` | `model_runtime.py` | Lifecycle: `initialize`, `warmup`, `predict`, `shutdown`, `mark_unhealthy`, `health`, `version`, `capabilities` |
 
-Three shapes worth understanding:
+Four shapes worth understanding:
 
 **`EventPublisher` must raise; `Notifier` must never.** They look alike — both
 take one record and send it somewhere — and their failure contracts are
@@ -136,6 +141,15 @@ implements both `VisionLanguageModel` and `ModelRuntime`. The capability port
 says *what the model does*; `ModelRuntime` says *how the orchestrator owns its
 VRAM*. A model that the registry should load, warm, health-check and evict needs
 both. One that manages its own lifetime needs only the capability port.
+
+**`FaceDetector` and `FaceEmbedder` are separate ports that one adapter implements.**
+Detection and embedding are genuinely different capabilities — a deployment could detect
+faces without ever comparing them — but InsightFace produces both from a single
+`FaceAnalysis.get()` call, and running it twice to honour the separation would double
+the cost for nothing. Splitting the ports keeps the *substitution* open; sharing the
+adapter keeps the *frame* cheap. `FaceStore` is a third port rather than part of either,
+because where biometric data is kept is a decision about storage and encryption, not
+about vision.
 
 `mark_unhealthy` is abstract rather than a defaulted no-op on purpose: a model
 can see its own load failures, but "this model has OOMed on two consecutive
@@ -175,25 +189,42 @@ One asyncio task per camera (`pipeline/runner.py`, `CameraRunner`).
 4. **Track.** `Tracker.update()`, inline, synchronous.
 5. **Motion.** `MotionAnalyzer` produces `motion_energy` and a normalised
    `scene_signature` histogram.
-6. **Gate.** A `SceneState` — deliberately carrying **no pixels** — goes to the
+6. **Behaviour.** For cameras that enabled a capability needing it, `PoseEstimator`
+   runs and its skeletons are attributed to tracks by IoU. A `BehaviourObservation`
+   — `SceneState` plus poses plus frame dimensions — goes to the four pure state
+   machines in `domain/behaviour/`: falls, abandonment, tamper, zones. Each returns
+   `(next_state, candidates)`; the highest-priority candidate escalates directly.
+7. **Authorize.** Then, for cameras that enabled `person_authorization`, faces are
+   detected, embedded and compared against the sealed roster. An unrecognised person
+   must persist across `min_observations` frames and `min_duration_seconds` before
+   anything is raised.
+
+   Both steps run **before** the gate and return early when they fire. A completed
+   temporal signature is already deduplicated to one report per episode by its own
+   state machine, so the gate's three governors have nothing left to protect against —
+   and a cooldown window swallowing a suspected fall is the failure the subsystem
+   exists to prevent. They are ordered falls-before-strangers because only one
+   escalation per frame is possible (the keyframe is shared) and a person on the floor
+   outranks a person who is merely unrecognised.
+8. **Gate.** A `SceneState` — deliberately carrying **no pixels** — goes to the
    pure `decide()`. It returns a decision *and the next state*, so the runner
    threads state through frames and the gate never holds mutable state or reads
    a clock.
-7. **Escalate.** If the gate says yes, an `EscalationRequest` is submitted to
+9. **Escalate.** If the gate says yes, an `EscalationRequest` is submitted to
    `VlmScheduler`. Submission is synchronous and drops when full, so a stalled
    VLM can never back-pressure the camera.
-8. **Clip.** In parallel, the packet loop keeps a `PreRollBuffer` ring. On
+10. **Clip.** In parallel, the packet loop keeps a `PreRollBuffer` ring. On
    escalation it opens a `ClipHandle`, which continues receiving packets until
    the post-roll deadline, then remuxes to MP4 and uploads to MinIO.
-9. **Describe.** The scheduler passes `AdmissionGate` (process-wide GPU
+11. **Describe.** The scheduler passes `AdmissionGate` (process-wide GPU
    concurrency + minimum interval), calls `ResidentSet.ensure()` to load the VLM
    if it was idle-evicted, and runs `describe()`.
-10. **Publish.** `VlmScheduler._assemble()` builds the `Event` — the one place in
+12. **Publish.** `VlmScheduler._assemble()` builds the `Event` — the one place in
     the codebase an `Event` is constructed — stamping `occurred_at` in Unix epoch
     seconds via the per-camera anchor. `event_codec` validates it against
     `contracts/events/anomaly_event.schema.json`, then `EventPublisher.publish()`
     sends it. A publisher that raises hands the event to `FailedEventSink`.
-11. **Notify.** Last, and only after the publish: if the VLM reported a welfare
+13. **Notify.** Last, and only after the publish: if the VLM reported a welfare
     concern this camera routes, a `WelfareNote` is handed to `Notifier` — by
     `put_nowait` onto a separate worker, never awaited here, so a hanging
     webhook cannot hold the GPU admission slot the step above is still inside.
@@ -206,7 +237,7 @@ One asyncio task per camera (`pipeline/runner.py`, `CameraRunner`).
 The gate evaluates in a fixed order, and the order is load-bearing
 (`domain/policy/escalation.py`):
 
-1. `vlm_enabled` — a disabled camera short-circuits everything
+1. `auto_escalation_enabled` — a disabled camera short-circuits everything
 2. **triggers** — is anything worth looking at?
 3. **cooldown** — is it simply too soon since the last call?
 4. **duplicate suppression** — have we already described this exact scene?

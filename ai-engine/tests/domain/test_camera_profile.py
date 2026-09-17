@@ -19,7 +19,7 @@ def test_defaults_match_the_spec_table() -> None:
     assert profile.bucket_capacity == 2
     assert profile.bucket_refill_seconds == 10.0
     assert profile.cooldown_seconds == 5.0
-    assert profile.vlm_enabled is True
+    assert profile.auto_escalation_enabled is True
 
 
 def test_the_cooldown_is_shorter_than_the_refill_interval() -> None:

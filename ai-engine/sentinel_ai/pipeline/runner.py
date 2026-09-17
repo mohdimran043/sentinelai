@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 from collections import deque
 from dataclasses import dataclass, replace
@@ -106,16 +107,32 @@ from uuid import UUID, uuid4
 
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.config import get_settings
+from sentinel_ai.domain.behaviour.candidate import BehaviourKind
+from sentinel_ai.domain.behaviour.observation import BehaviourObservation, PersonPose
 from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import EscalationReason, SceneState
+from sentinel_ai.domain.capabilities import (
+    DEFAULT_CAPABILITIES,
+    CameraCapabilities,
+    Capability,
+)
+from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, SceneState
+from sentinel_ai.domain.identity import FaceEmbedding, FaceObservation
+from sentinel_ai.domain.policy.authorization import (
+    AuthorizationPolicy,
+    AuthorizationTracker,
+    observe_authorization,
+)
 from sentinel_ai.domain.policy.escalation import GateState, decide, force
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
+from sentinel_ai.pipeline.behaviour import BehaviourEngine
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.detector import ObjectDetector
+from sentinel_ai.ports.face import DetectedFace, FaceDetector, FaceStore
 from sentinel_ai.ports.frame_source import FrameData, FrameSource
+from sentinel_ai.ports.pose import PoseEstimator
 from sentinel_ai.ports.tracker import Tracker
 
 logger = logging.getLogger(__name__)
@@ -128,6 +145,21 @@ _DEFAULT_FPS = 10.0
 _HISTORY_MAXLEN = 5
 """How many previous escalation details the VLM gets as context (spec §22)."""
 
+_BEHAVIOUR_REASONS: dict[BehaviourKind, EscalationReason] = {
+    BehaviourKind.FALL: EscalationReason.FALL_SUSPECTED,
+    BehaviourKind.ABANDONED_OBJECT: EscalationReason.ABANDONED_OBJECT,
+    BehaviourKind.CAMERA_TAMPER: EscalationReason.CAMERA_TAMPER,
+    BehaviourKind.ZONE_INTRUSION: EscalationReason.ZONE_INTRUSION,
+    BehaviourKind.LINE_CROSSING: EscalationReason.LINE_CROSSING,
+}
+"""What a behaviour becomes on the wire.
+
+A total mapping, indexed rather than `.get`-with-a-default: a kind with no reason would
+otherwise be published under some plausible-looking fallback, and `reason` is the field
+every consumer filters and prioritises on. A `KeyError` here is a build failure, which
+is the right cost for adding a detector without deciding what it is called.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class CameraTelemetry:
@@ -137,6 +169,19 @@ class CameraTelemetry:
     detections_run: int
     escalations: int
     escalations_dropped: int
+    """Escalations this camera raised that the queue refused outright.
+
+    Narrower than it looks, and the gap is worth knowing. Since the queue became
+    priority-ordered (§16) a submission is refused only when it is *itself* the least
+    urgent thing present. An escalation that was accepted and later evicted to make
+    room for a more urgent one is **not** counted here — this camera cannot know that
+    happened, because it happens after the submission returned. `VlmScheduler.dropped`
+    is the process-wide count that does include it.
+
+    So: this answers "how often was this camera turned away", and the scheduler's
+    counter answers "how much work was discarded". On a saturated site the second is
+    larger, and neither is wrong.
+    """
     discontinuities: int
     last_frame_at: float | None
     last_escalation_at: float | None
@@ -150,6 +195,31 @@ class CameraTelemetry:
     fell back to `""` would render as a nameless camera and look like a save that
     half-worked.
     """
+    falls_suspected: int = 0
+    """How many fall signatures have completed on this camera since the engine started.
+
+    Defaulted — and therefore placed here, after the last required field — so every
+    existing construction site keeps working. Counted on the runner rather than derived
+    from the event ring because that ring is bounded and volatile: a camera that has
+    produced more events than it holds would under-report, and a number an operator
+    reads as "how often has this happened here" must not silently shrink.
+    """
+
+    enabled: bool = True
+    """Whether this camera is being watched at all.
+
+    `False` describes a camera that is configured and deliberately stopped: its record
+    is still in `cameras.json`, it still has a label, a zone and a capability set, and
+    no `CameraRunner` exists for it. That is a different thing from a camera that is
+    running badly, and the distinction is the whole reason the field exists — an
+    operator looking at a wall needs "nobody is watching this on purpose" to be
+    unmistakable from "this has gone quiet".
+
+    A disabled camera's counters are the ones it had when it was stopped, frozen. They
+    are not zeroed, because zero would read as "saw nothing" when the truth is "saw
+    this much, then was switched off"; see `EngineService.disable_camera`.
+    """
+
     zone: Zone | None = None
     """Which zone this camera watches, or None when nobody has grouped it (T1).
 
@@ -158,6 +228,19 @@ class CameraTelemetry:
     from the same object it reads the liveness from — one request, and no way for the
     two to describe different sets of cameras. Defaulted so that every existing
     construction site keeps working and an ungrouped camera stays representable.
+    """
+
+    capabilities: CameraCapabilities = DEFAULT_CAPABILITIES
+    """Which AI capabilities are running on this camera (spec §13).
+
+    Reported for `zone`'s reason — `GET /cameras` is built from this record, so a
+    console reads what a camera is actually doing from the same object it reads the
+    camera's liveness from, and the two cannot describe different sets of cameras.
+
+    This is what makes the console's capability checkboxes honest: they render the
+    engine's own answer about what it is running, not the file's answer about what
+    was asked for. The two agree today because `main.compose` derives one from the
+    other, and this field is how that stays checkable from outside.
     """
 
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind)
@@ -243,6 +326,30 @@ class _LatestSlot:
             await self._event.wait()
 
 
+def _encode_jpeg(frame: FrameData, max_edge: int) -> bytes | None:
+    """One frame as a JPEG, or `None` if it cannot be made.
+
+    `None` rather than raising: a snapshot is a convenience on a page that has plenty
+    else to show, and a camera whose page 500s because an encoder complained is worse
+    than one whose picture is missing.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        pixels = frame.pixel_array()
+        if not isinstance(pixels, np.ndarray):
+            return None
+        picture = Image.fromarray(pixels[:, :, ::-1].astype(np.uint8))  # BGR -> RGB
+        picture.thumbnail((max_edge, max_edge))
+        buffer = io.BytesIO()
+        picture.save(buffer, format="JPEG", quality=80)
+        return buffer.getvalue()
+    except Exception:
+        logger.debug("could not encode a snapshot", exc_info=True)
+        return None
+
+
 class CameraRunner:
     def __init__(
         self,
@@ -250,7 +357,7 @@ class CameraRunner:
         camera_id: str,
         camera_label: str,
         source: FrameSource,
-        detector: ObjectDetector,
+        detector: ObjectDetector | None,
         tracker: Tracker,
         motion: MotionAnalyzer,
         profile: CameraProfile,
@@ -258,6 +365,13 @@ class CameraRunner:
         clip_writer: ClipWriter | None,
         preroll: PreRollBuffer,
         detect_every_n_frames: int = 1,
+        pose: PoseEstimator | None = None,
+        behaviour: BehaviourEngine | None = None,
+        face: FaceDetector | None = None,
+        face_store: FaceStore | None = None,
+        authorization: AuthorizationPolicy | None = None,
+        describe_scenes: bool = True,
+        capabilities: CameraCapabilities = DEFAULT_CAPABILITIES,
         zone: Zone | None = None,
         notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
         notify_min_confidence: Confidence = Confidence.LIKELY,
@@ -281,7 +395,44 @@ class CameraRunner:
         self._notify_on = notify_on
         self._notify_min_confidence = notify_min_confidence
         self._source = source
+        # `None` when this camera enabled no capability that needs one (spec §13). The
+        # frame loop then decodes, tracks liveness and buffers pre-roll, but runs no
+        # inference at all — which is what "watch this camera, run nothing on it" has
+        # to mean if it is to cost anything less than a camera that does. Skipping is
+        # per camera rather than per process on purpose: the detector is shared (ADR 4),
+        # so its mere existence for one camera must not oblige every other camera to
+        # pay for a forward pass.
         self._detector = detector
+        # Carried, never branched on by the gate: whether a described escalation is
+        # wanted is the scheduler's business, and it rides out on every
+        # `EscalationRequest` so the decision is snapshotted with the rest of the
+        # request rather than re-read at describe time.
+        self._describe_scenes = describe_scenes
+        # Every behaviour machine this camera enabled, with its state. An empty engine
+        # (`enabled` False) is the normal case and costs a boolean per frame.
+        # Constructed by the composition root rather than here, because which detectors
+        # a camera runs is a capability question and `domain/capabilities.py` is where
+        # that is answered.
+        self._behaviour = behaviour if behaviour is not None else BehaviourEngine()
+        # The shared pose model, or `None` when no camera asked for one. Optional
+        # independently of the engine: a camera can run fall detection with pose
+        # unavailable and the state machine falls back to bounding-box geometry,
+        # recording which it used (`domain/behaviour/fall.py`).
+        self._pose = pose
+        self._falls_suspected = 0
+        self._behaviours_raised = 0
+        # All three are `None` unless this camera enabled `person_authorization`. They
+        # travel together: a policy with no face pipeline would be inert configuration,
+        # and a pipeline with no roster to search would have nothing to compare against.
+        # `main.compose` sets all three or none.
+        self._face = face
+        self._face_store = face_store
+        self._authorization = authorization
+        self._authorization_tracker = AuthorizationTracker()
+        self._unauthorized_raised = 0
+        # Carried for reporting only — `telemetry()` publishes it so a console can
+        # render what is actually running on this camera rather than what it hopes is.
+        self._capabilities = capabilities
         self._tracker = tracker
         self._motion = motion
         # The file's profile, kept apart from `self._profile` (set below) because
@@ -334,6 +485,9 @@ class CameraRunner:
         self._last_keyframe: FrameData | None = None
         self._last_signature_len: int | None = None
         self._last_frame_index: int | None = None
+        # The most recent decoded frame, for `snapshot_jpeg`. One per camera,
+        # replaced each time, so it pins a single decode buffer and never grows.
+        self._latest_frame: FrameData | None = None
         self._last_processed_timestamp: float | None = None
         self._last_two_timestamps: tuple[float, float] | None = None
 
@@ -394,11 +548,13 @@ class CameraRunner:
         *,
         label: str,
         zone: Zone | None,
+        capabilities: CameraCapabilities,
         notify_on: frozenset[ConcernKind],
         notify_min_confidence: Confidence,
         clip_preroll_seconds: float | None,
         clip_postroll_seconds: float | None,
         summary_interval_seconds: float | None,
+        detector: ObjectDetector | None,
     ) -> None:
         """Apply an already-persisted edit of this camera's record to the running
         camera. **The new values take effect on the next escalation, never
@@ -484,13 +640,36 @@ class CameraRunner:
 
         self._camera_label = label
         self._zone = zone
+        self._capabilities = capabilities
+        # Both derived from `capabilities`, never stored alongside it, for the reason
+        # `main.compose` derives them at startup: two fields that can disagree about
+        # whether a camera describes scenes is a camera whose behaviour depends on
+        # which one a reader happened to consult.
+        #
+        # Read points, in the same "when does the new value first apply" terms as the
+        # durations below: `_describe_scenes` is read once per escalation in
+        # `_escalate`, before its first await, so the escalation already in flight
+        # keeps the setting it was decided under. `auto_escalation_enabled` is read by
+        # the gate once per frame inside `decide()`, and swapping `_profile` between
+        # frames is safe for `summary_interval_seconds`'s reason — no `GateState` is
+        # derived from it, so turning triggers off simply stops the next frame firing
+        # one and turning them on lets the next frame fire normally.
+        self._describe_scenes = capabilities.enabled(Capability.SCENE_DESCRIPTION)
+        # The caller resolves this: whether a detector *exists* is a property of the
+        # process (which roles were built at startup), and this runner cannot know it.
+        # `None` means this camera now runs no inference — `_process_frame` returns
+        # after counting the frame, so liveness stays accurate while nothing is spent.
+        self._detector = detector
         self._notify_on = notify_on
         self._notify_min_confidence = notify_min_confidence
         self._clip_preroll_override = clip_preroll_seconds
         self._clip_postroll_override = clip_postroll_seconds
         self._summary_interval_override = summary_interval_seconds
         self._clip_postroll_seconds = new_postroll
-        self._profile = new_profile
+        self._profile = replace(
+            new_profile,
+            auto_escalation_enabled=capabilities.enabled(Capability.ANOMALY_DETECTION),
+        )
 
     def _postroll_for(self, override: float | None) -> float:
         """The given per-camera post-roll if set, else the process-wide default.
@@ -530,6 +709,31 @@ class CameraRunner:
             return self._base_profile
         return replace(self._base_profile, summary_interval_seconds=override)
 
+    async def snapshot_jpeg(self, max_edge: int = 960) -> bytes | None:
+        """The most recent frame as a JPEG, or `None` if none has arrived yet.
+
+        Not video, and the console says so where it shows one. It exists because live
+        video is mediamtx's job and only cameras *published to* mediamtx have a playlist
+        — an EarthCam page and a file do not, and before this their camera page showed
+        nothing at all while the engine was demonstrably decoding them.
+
+        Encoded on demand and off the event loop. Encoding every frame against the
+        chance somebody is looking would be a JPEG per frame per camera forever; this
+        costs one encode per request instead, and a request only happens while a page is
+        open.
+        """
+        frame = self._latest_frame
+        if frame is None:
+            return None
+        return await asyncio.to_thread(_encode_jpeg, frame, max_edge)
+
+    @property
+    def camera_id(self) -> str:
+        """The camera this runner watches. Read-only: the id is what every other index
+        in the system keys on, and a runner that could be renamed underneath them would
+        strand its telemetry, its alerts and its events under the old one."""
+        return self._camera_id
+
     def telemetry(self) -> CameraTelemetry:
         return CameraTelemetry(
             camera_id=self._camera_id,
@@ -540,9 +744,11 @@ class CameraRunner:
             escalations=self._escalations,
             escalations_dropped=self._escalations_dropped,
             discontinuities=self._discontinuities,
+            falls_suspected=self._falls_suspected,
             last_frame_at=self._last_frame_at,
             last_escalation_at=self._last_escalation_at,
             zone=self._zone,
+            capabilities=self._capabilities,
             notify_on=self._notify_on,
             notify_min_confidence=self._notify_min_confidence,
             # The stored overrides, not the resolved values — see the field docstrings
@@ -578,8 +784,30 @@ class CameraRunner:
         if self._gate_state is None:
             self._gate_state = GateState.initial(self._profile, frame.timestamp)
 
-        detections = await self._detector.detect(frame)
-        self._detections_run += 1
+        if self._detector is None and not self._behaviour.enabled:
+            # Nothing on this camera reads a frame. Liveness still has to be accurate,
+            # so the frame is counted and timestamped exactly as it would be otherwise —
+            # a camera running nothing must still be visibly *up*, or an operator
+            # cannot tell it apart from one that has stopped delivering.
+            self._last_frame_index = frame.frame_index
+            self._last_processed_timestamp = frame.timestamp
+            self._latest_frame = frame
+            return
+
+        # `()` rather than a skipped stage when no detector was built for this camera.
+        # `Capability.CAMERA_TAMPER` needs no model at all — it reads the luma histogram
+        # the motion stage computes — so a camera can legitimately reach here with
+        # nothing to detect *with* and still have something to watch *for*. The tracker
+        # handed an empty tuple yields no tracks, which is the truth.
+        # Held for `snapshot_jpeg`, which is how a camera with no mediamtx path — an
+        # EarthCam page, a file — gets a picture on its page at all. One frame per
+        # camera, replaced every time, so it pins one decode buffer and never grows.
+        self._latest_frame = frame
+
+        detections: tuple[Detection, ...] = ()
+        if self._detector is not None:
+            detections = await self._detector.detect(frame)
+            self._detections_run += 1
 
         # Before `update()`/`analyze()`, not after. Both of the regression signals are
         # readable off the frame alone, and everything those two stages derive is
@@ -622,6 +850,25 @@ class CameraRunner:
         self._last_scene = scene
         self._last_keyframe = frame
 
+        # Behaviour detectors run before the gate and, when one fires, **instead of**
+        # it. A completed signature is already deduplicated to one report per episode by
+        # its own state machine, so it bypasses the gate's three governors exactly as a
+        # user request does — see `EscalationReason.FALL_SUSPECTED`. Letting a cooldown
+        # window swallow it would lose the one escalation this subsystem exists to
+        # produce, and running the gate *as well* would spend a second VLM call
+        # describing the same frame.
+        if await self._detect_behaviours(scene, frame):
+            return
+
+        # After the behaviour machines and before the gate, for the same reason they
+        # come before it: a completed authorisation episode is already deduplicated to
+        # one report per tracked person, so the gate's governors have nothing left to
+        # protect against. It runs *after* them because a person on the floor matters
+        # more than a person who is unrecognised, and only one escalation per frame is
+        # possible — the keyframe is shared.
+        if await self._detect_unauthorized(scene, frame):
+            return
+
         outcome = decide(scene, self._profile, self._gate_state)
         self._gate_state = outcome.state
         decision = outcome.decision
@@ -633,6 +880,182 @@ class CameraRunner:
                 detail=decision.detail,
                 now=frame.timestamp,
             )
+
+    async def _detect_behaviours(self, scene: SceneState, frame: FrameData) -> bool:
+        """Advance every behaviour machine; escalate and return True if one completed.
+
+        Returns a bool rather than escalating silently so `_process_frame` can see that
+        this frame is already spoken for. The alternative — letting the gate run too —
+        would describe the same keyframe twice, once as a behaviour and once as
+        whatever trigger the same unusual scene also fired.
+        """
+        if not self._behaviour.enabled:
+            return False
+
+        poses: dict[int, PersonPose] = {}
+        if self._pose is not None and self._behaviour.needs_pose:
+            try:
+                poses = await self._pose.estimate(frame, scene.tracks)
+            except Exception as error:
+                # Pose is an enhancement with a working fallback, so a failure here
+                # degrades the reading rather than costing the frame. Raising would
+                # take down a camera pipeline over an optional model; skipping the
+                # whole check would silently disable fall detection on a camera whose
+                # operator enabled it. Neither is acceptable, and the geometry path is
+                # exactly what `fall.py` keeps for this case.
+                logger.warning(
+                    "pose estimation failed for camera %s; falling back to geometry: %s",
+                    self._camera_id,
+                    error,
+                )
+
+        candidates = self._behaviour.observe(
+            BehaviourObservation(
+                scene=scene,
+                poses=poses,
+                # Zones are stored as fractions of the frame so they survive an RTSP
+                # resolution renegotiation; this is what turns them back into pixels.
+                frame_width=frame.width,
+                frame_height=frame.height,
+            )
+        )
+        if not candidates:
+            return False
+
+        # At most one escalation per frame even when two machines finish together: the
+        # keyframe is shared, so a second request would describe the same image.
+        # `BehaviourEngine.observe` has already ordered them, so the first is the one
+        # whose consequences are worst — see `_PRIORITY` there. The others stay in
+        # their `REPORTED` phase and will not raise again, which is a real limitation
+        # recorded here rather than hidden; the alternative is N escalations for one
+        # frame, flooding the queue the gate exists to protect.
+        winner = candidates[0]
+        self._behaviours_raised += 1
+        if winner.kind is BehaviourKind.FALL:
+            self._falls_suspected += 1
+        await self._escalate(
+            scene=scene,
+            keyframe=frame,
+            reason=_BEHAVIOUR_REASONS[winner.kind],
+            detail=winner.summary,
+            now=frame.timestamp,
+            subject_tracks=winner.track_ids,
+        )
+        return True
+
+    async def _detect_unauthorized(self, scene: SceneState, frame: FrameData) -> bool:
+        """Run the face pipeline and advance the authorisation machine (§8-§12).
+
+        Returns True when a finding was escalated, so `_process_frame` knows this frame
+        is already spoken for.
+
+        Every failure here degrades rather than propagates. Face recognition is an
+        optional capability layered on a pipeline that works without it, and taking a
+        camera down because a face model faulted would trade the whole of surveillance
+        for one feature. A failure is logged and the frame carries on to the gate.
+        """
+        if self._face is None or self._face_store is None or self._authorization is None:
+            return False
+        if not scene.tracks:
+            # No people, so no faces worth looking for. The common case, and skipping
+            # it is most of why this capability is affordable at all.
+            return False
+
+        try:
+            detected = await self._face.detect(frame)
+            if not detected:
+                return False
+            observations = await self._build_face_observations(detected, scene, frame)
+        except Exception as error:
+            logger.warning(
+                "face pipeline failed for camera %s; authorisation is not checked on "
+                "this frame: %s",
+                self._camera_id,
+                error,
+            )
+            return False
+
+        if not observations:
+            return False
+
+        self._authorization_tracker, findings = observe_authorization(
+            observations,
+            self._authorization,
+            self._authorization_tracker,
+            now=frame.timestamp,
+        )
+        if not findings:
+            return False
+
+        finding = findings[0]
+        self._unauthorized_raised += 1
+        await self._escalate(
+            scene=scene,
+            keyframe=frame,
+            reason=EscalationReason.UNAUTHORIZED_PERSON,
+            detail=finding.summary(),
+            now=frame.timestamp,
+            subject_tracks=(finding.track_id,),
+        )
+        return True
+
+    async def _build_face_observations(
+        self,
+        detected: tuple[DetectedFace, ...],
+        scene: SceneState,
+        frame: FrameData,
+    ) -> tuple[FaceObservation, ...]:
+        """Attach each detected face to the person track it sits inside, and search.
+
+        A face is attributed to the tracked person whose box **contains its centre**,
+        rather than by overlap: a face box is a small region entirely inside a person
+        box, so IoU between them is tiny even when the attribution is obvious.
+        Containment is the right test for a part-of relationship.
+
+        A face inside no tracked person is dropped. It is usually a reflection, a
+        photograph on a wall, or a person the object detector missed — and without a
+        track there is nothing for §11's temporal confirmation to accumulate against,
+        so it could never contribute to a finding anyway.
+        """
+        assert self._face_store is not None
+        observations: list[FaceObservation] = []
+        for face in detected:
+            track_id = self._track_containing(face.box, scene)
+            if track_id is None:
+                continue
+            if not isinstance(face.aligned, FaceEmbedding):
+                # This detector did not produce an embedding alongside the detection.
+                # A separate embedder would be wired here; until one is, saying so
+                # beats guessing.
+                continue
+            candidates = await self._face_store.search(
+                face.aligned,
+                camera_id=self._camera_id,
+                zone=self._zone.value if self._zone is not None else None,
+                now=frame.timestamp,
+            )
+            observations.append(
+                FaceObservation(
+                    track_id=track_id,
+                    embedding=face.aligned,
+                    quality=face.quality,
+                    timestamp=frame.timestamp,
+                    candidates=candidates,
+                )
+            )
+        return tuple(observations)
+
+    @staticmethod
+    def _track_containing(face_box: BBox, scene: SceneState) -> int | None:
+        """The person track whose box contains this face's centre, if any."""
+        centre_x, centre_y = face_box.cx, face_box.cy
+        for track in scene.tracks:
+            if track.label != "person":
+                continue
+            box = track.box
+            if box.x1 <= centre_x <= box.x2 and box.y1 <= centre_y <= box.y2:
+                return track.track_id
+        return None
 
     def _is_timeline_regression(self, frame: FrameData) -> bool:
         """Spec §5.2/§6: the stream restarted — an RTSP reconnect (Task 14) restarts
@@ -677,6 +1100,19 @@ class CameraRunner:
         # remuxed into the same clip.
         self._preroll.clear()
         self._gate_state = GateState.initial(self._profile, frame.timestamp)
+        # Every behaviour machine is reset for the tracker's reason, one layer up: each
+        # phase they hold is keyed by a track id the tracker has just invalidated, and
+        # every timestamp in them is on a timeline that no longer exists. Carried
+        # across a reconnect, a track that was `UPRIGHT` before the break would measure
+        # its first post-break frame against a centroid from the old stream — arbitrary
+        # pixels over an arbitrary interval — which is exactly how a reconnect becomes
+        # a reported fall that never happened.
+        self._behaviour.reset()
+        # The authorisation machine holds per-track evidence keyed by ids the tracker
+        # has just invalidated. Carried across, a reconnect could complete somebody
+        # else's episode — and an accusation assembled from two different people's
+        # frames is the worst thing this feature could produce.
+        self._authorization_tracker = AuthorizationTracker()
         self._last_two_timestamps = None
         # An already-recording clip is the same problem as the pre-roll, one step later:
         # left open it goes on appending new-timeline packets directly onto old-timeline
@@ -702,6 +1138,7 @@ class CameraRunner:
         reason: EscalationReason,
         detail: str,
         now: float,
+        subject_tracks: tuple[int, ...] = (),
     ) -> UUID:
         event_id = uuid4()
         history = tuple(self._history)
@@ -725,6 +1162,11 @@ class CameraRunner:
         zone = self._zone
         notify_on = self._notify_on
         notify_min_confidence = self._notify_min_confidence
+        describe = self._describe_scenes
+        # Empty unless a behaviour detector named a subject. `_escalate` is shared
+        # between the gate's trigger path and the behaviour path, and only the second
+        # knows whose behaviour it is reporting.
+        subject_track_ids = subject_tracks
 
         def request_with(clip: ClipHandle | None) -> EscalationRequest:
             return EscalationRequest(
@@ -741,6 +1183,12 @@ class CameraRunner:
                 zone=zone,
                 notify_on=notify_on,
                 notify_min_confidence=notify_min_confidence,
+                # Snapshotted with the rest of the request, for the reason the welfare
+                # policy above is: `apply_metadata` can land at any await between here
+                # and the published event, and an escalation half on the old capability
+                # set and half on the new one has no defensible meaning.
+                describe=describe,
+                subject_track_ids=subject_track_ids,
             )
 
         if self._clip_writer is None:

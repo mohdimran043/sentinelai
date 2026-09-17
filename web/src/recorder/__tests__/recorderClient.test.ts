@@ -80,7 +80,11 @@ describe('recorderClient', () => {
 
     expect(failure).toBeInstanceOf(RecorderUnreachableError)
     expect(failure).not.toBeInstanceOf(RecorderHttpError)
-    expect((failure as Error).message).toBe('The recorder is unreachable.')
+    // The address, not just the fact: an operator seeing this needs to know *where*
+    // the console looked, because the commonest cause is that the recorder — a
+    // separate product from the AI engine — simply is not running there.
+    expect((failure as Error).message).toContain('not reachable at')
+    expect((failure as Error).message).toContain('separate service from the AI engine')
   })
 
   it('requests /journal/{camera} and parses the real days list', async () => {

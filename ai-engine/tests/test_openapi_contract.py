@@ -21,18 +21,64 @@ def test_the_document_covers_the_endpoints_phase_1c_consumes() -> None:
     paths = openapi_document()["paths"]
     assert set(paths) == {
         "/health",
+        "/settings",
+        "/storage",
         "/cameras",
+        "/cameras/probe",
         "/cameras/{camera_id}",
+        "/cameras/{camera_id}/enabled",
+        "/cameras/{camera_id}/clips",
+        "/cameras/{camera_id}/clips/{event_id}",
+        "/cameras/{camera_id}/snapshot",
         "/cameras/{camera_id}/telemetry",
         "/cameras/{camera_id}/events",
         "/cameras/{camera_id}/describe",
         "/events/stream",
+        "/alerts",
+        "/alerts/{alert_id}/acknowledge",
+        "/alerts/{alert_id}/resolve",
+        "/alerts/{alert_id}/clip",
+        "/authorized-persons",
+        "/authorized-persons/{person_id}",
+        "/authorized-persons/{person_id}/faces",
+        "/authorized-persons/{person_id}/faces/{face_id}",
+        "/authorized-persons/{person_id}/faces/{face_id}/image",
     }
-    assert set(paths["/cameras/{camera_id}"]) == {"patch"}
+    # Enrol, list, and fetch or remove one. The image has its own path rather than an
+    # `include=` on the list, so a roster listing never carries biometric data it was
+    # not asked for — see `EnrolledFaceEntry`.
+    assert set(paths["/authorized-persons/{person_id}/faces"]) == {"get", "post"}
+    assert set(paths["/authorized-persons/{person_id}/faces/{face_id}"]) == {"delete"}
+    assert set(paths["/authorized-persons/{person_id}/faces/{face_id}/image"]) == {"get"}
+    # The write surface: add, edit, remove. `POST /cameras` is what makes the console
+    # able to stand up a camera without an operator editing the file and restarting.
+    assert set(paths["/cameras"]) == {"get", "post"}
+    assert set(paths["/cameras/probe"]) == {"post"}
+    assert set(paths["/cameras/{camera_id}"]) == {"patch", "delete"}
+    # Lifecycle, deliberately not a field on PATCH: everything PATCH writes is
+    # metadata a running camera absorbs between frames, and this starts or stops it.
+    assert set(paths["/cameras/{camera_id}/enabled"]) == {"put"}
+    # Read-only, both of them. Settings are overwhelmingly restart-bound, and storage
+    # is an observation of a bucket this engine does not manage the lifetime of.
+    assert set(paths["/settings"]) == {"get"}
+    assert set(paths["/storage"]) == {"get"}
+    assert set(paths["/cameras/{camera_id}/clips"]) == {"get"}
+    assert set(paths["/cameras/{camera_id}/clips/{event_id}"]) == {"get"}
     assert set(paths["/cameras/{camera_id}/describe"]) == {"post"}
     assert set(paths["/cameras/{camera_id}/telemetry"]) == {"get"}
+    # The fallback for a camera with no mediamtx playlist — an EarthCam page, a file.
+    assert set(paths["/cameras/{camera_id}/snapshot"]) == {"get"}
     assert set(paths["/cameras/{camera_id}/events"]) == {"get"}
     assert set(paths["/events/stream"]) == {"get"}
+    # DELETE clears the whole list — triage state, never evidence.
+    assert set(paths["/alerts"]) == {"get", "delete"}
+    assert set(paths["/alerts/{alert_id}/acknowledge"]) == {"post"}
+    # The only route that serves a recording. GET only: a clip is written by the
+    # pipeline and is never editable through the API.
+    assert set(paths["/alerts/{alert_id}/clip"]) == {"get"}
+    assert set(paths["/alerts/{alert_id}/resolve"]) == {"post"}
+    assert set(paths["/authorized-persons"]) == {"get"}
+    assert set(paths["/authorized-persons/{person_id}"]) == {"put", "delete"}
 
 
 class TestTheWriteEndpointIsDocumentedAsUnauthenticated:

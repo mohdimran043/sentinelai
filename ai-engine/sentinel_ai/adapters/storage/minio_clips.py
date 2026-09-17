@@ -64,13 +64,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import av
 from minio import Minio
+from minio.error import S3Error
 
+from sentinel_ai.ports.clip_index import CameraStorage, ClipIndex, ClipRecord, StorageUsage
+from sentinel_ai.ports.clip_reader import ClipReader
 from sentinel_ai.ports.clip_writer import ClipHandle, ClipWriter
 from sentinel_ai.ports.frame_source import EncodedPacket
 
@@ -254,15 +259,85 @@ class _RemuxSession:
             logger.warning("failed to remove temp clip file %s", self._temp_path, exc_info=True)
 
 
+def _restamped(packet: Any, out_stream: Any, index: int, rate: float, time_base: Any) -> Any:
+    """Re-time a packet onto a clean zero-based timeline.
+
+    The source's timestamps carry the camera's arrival clock, gaps and all. Copying them
+    into a three-second excerpt produces a file whose player scrubber claims a length it
+    does not have, and whose first frame sits minutes in. Renumbering is safe precisely
+    because this is an excerpt and not the evidence: the evidence clip keeps the real
+    timeline, and this one only has to play.
+    """
+    step = 1.0 / rate
+    stamp = int(index * step / float(time_base)) if time_base else index
+    packet.stream = out_stream
+    packet.pts = stamp
+    packet.dts = stamp
+    return packet
+
+
+def _trim(source: Path, target: Path, seconds: float) -> None:
+    """Copy the first `seconds` of `source` into `target`, remuxing only.
+
+    Packet-level copy: the encoded bytes are the camera's own, exactly as ADR 3 requires
+    of the evidence clip, so the short copy is a true excerpt rather than a re-rendering
+    of one.
+
+    Cut on the presentation timestamp of the *input*, and stop at the first packet past
+    the limit rather than trying to land exactly on it. An mp4 cannot start anywhere but
+    a keyframe, and chasing an exact duration here would mean either re-encoding or
+    emitting a clip that opens on a grey block.
+    """
+    import av
+
+    # Counted in frames, not measured on the timeline, and the difference is the whole
+    # reason this is not two lines.
+    #
+    # An evidence clip's timestamps are the camera's own arrival clock, and that clock
+    # has holes in it: the pre-roll ring is flushed in one go, a reconnect resets the
+    # source, a busy camera drops frames. "The first three seconds of the timeline" is
+    # therefore not three seconds of footage — measured on a live run it was between
+    # 0.4s and 1.6s of it, varying per clip, which is the worst possible behaviour for
+    # something nobody watches twice.
+    #
+    # Frames are what a person actually sees, so frames are what gets counted. `fps`
+    # comes from the stream itself rather than from the writer's estimate, because a
+    # remuxed clip carries the rate the camera really delivered.
+    with av.open(str(source)) as inbound, av.open(str(target), mode="w") as outbound:
+        stream = inbound.streams.video[0]
+        out_stream = outbound.add_stream_from_template(stream)
+        rate = float(stream.average_rate) if stream.average_rate else 0.0
+        if rate <= 0:
+            raise ValueError("clip declares no frame rate; cannot cut it by duration")
+        wanted = max(1, int(seconds * rate))
+
+        kept = 0
+        for packet in inbound.demux(stream):
+            if packet.dts is None:
+                continue
+            outbound.mux(_restamped(packet, out_stream, kept, rate, stream.time_base))
+            kept += 1
+            if kept >= wanted:
+                break
+
+
 class MinioClipHandle(ClipHandle):
     def __init__(
-        self, session: _RemuxSession, client: Minio, bucket: str, camera_id: str, event_id: UUID
+        self,
+        session: _RemuxSession,
+        client: Minio,
+        bucket: str,
+        camera_id: str,
+        event_id: UUID,
+        notify_seconds: float = 0.0,
     ) -> None:
         self._session = session
         self._client = client
         self._bucket = bucket
         self._camera_id = camera_id
         self._event_id = event_id
+        self._notify_seconds = notify_seconds
+        self._notify_uri: str | None = None
         self._done = False
 
     async def append(self, packet: EncodedPacket) -> None:
@@ -298,8 +373,52 @@ class MinioClipHandle(ClipHandle):
                 exc_info=True,
             )
             raise
+        # Before the temp file goes: the short clip is cut from it, and once it is
+        # deleted there is nothing left to cut. Best-effort — a notification without a
+        # short clip still carries the full one, while a failed evidence upload is a
+        # lost anomaly, so this must never be able to fail that.
+        if self._notify_seconds > 0:
+            self._notify_uri = await self._write_short(temp_path)
+
         # Only reached on a genuine upload success — the temp file's job is done.
         temp_path.unlink(missing_ok=True)
+        return f"s3://{self._bucket}/{object_name}"
+
+    @property
+    def notify_uri(self) -> str | None:
+        return self._notify_uri
+
+    async def _write_short(self, source: Path) -> str | None:
+        """The first `notify_seconds` of the finished clip, as a second object.
+
+        A remux, never a re-encode — [ADR 3](../../../docs/decisions.md)'s rule applies
+        here for the same reasons, and one of them is sharper: this copy is the one a
+        person actually looks at on a phone, so degrading it would degrade the only
+        version most notifications ever get watched as.
+
+        Starts at the beginning rather than at the keyframe, which is the pre-roll: the
+        seconds *before* the event are what make a notification legible — somebody
+        walking in, then falling — and a clip that opens on the fall shows a person
+        already on the floor.
+        """
+        target = source.with_name(f"{source.stem}-notify.mp4")
+        object_name = f"{self._camera_id}/{self._event_id}-notify.mp4"
+        try:
+            await asyncio.to_thread(_trim, source, target, self._notify_seconds)
+            await asyncio.to_thread(
+                self._client.fput_object, self._bucket, object_name, str(target)
+            )
+        except Exception:
+            logger.warning(
+                "could not make a short notification clip for camera %s event %s; the "
+                "notification will carry the full clip instead",
+                self._camera_id,
+                self._event_id,
+                exc_info=True,
+            )
+            return None
+        finally:
+            target.unlink(missing_ok=True)
         return f"s3://{self._bucket}/{object_name}"
 
     async def abort(self) -> None:
@@ -323,11 +442,15 @@ class MinioClipWriter(ClipWriter):
         bucket: str,
         secure: bool,
         temp_dir: Path,
+        retention_days: int = 0,
+        notify_seconds: float = 0.0,
     ) -> None:
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
         self._bucket = bucket
         self._temp_dir = temp_dir
         self._temp_dir.mkdir(parents=True, exist_ok=True)
+        self._retention_days = retention_days
+        self._notify_seconds = notify_seconds
         self._bucket_ready = False
 
     async def open(self, camera_id: str, event_id: UUID, fps: float) -> ClipHandle:
@@ -336,8 +459,252 @@ class MinioClipWriter(ClipWriter):
             self._bucket_ready = True
         temp_path = self._temp_dir / f"{camera_id}-{event_id}.mp4"
         session = await asyncio.to_thread(_RemuxSession, temp_path, fps)
-        return MinioClipHandle(session, self._client, self._bucket, camera_id, event_id)
+        return MinioClipHandle(
+            session,
+            self._client,
+            self._bucket,
+            camera_id,
+            event_id,
+            notify_seconds=self._notify_seconds,
+        )
 
     def _ensure_bucket(self) -> None:
         if not self._client.bucket_exists(self._bucket):
             self._client.make_bucket(self._bucket)
+        self._ensure_lifecycle()
+
+    def _ensure_lifecycle(self) -> None:
+        """Expire clips after `retention_days`, enforced by the object store itself.
+
+        A lifecycle rule rather than a sweeper task in this process, because the two
+        fail very differently. A sweeper deletes nothing while the engine is down, and
+        an engine that has been down for a week comes back to a week of clips it was
+        supposed to have expired. The rule is evaluated by MinIO whether or not anything
+        is running.
+
+        `retention_days <= 0` removes the rule and keeps clips forever, which is the
+        supported way to say "we handle retention elsewhere" — plenty of deployments
+        have a bucket policy of their own, and silently layering a second one on top of
+        it is how evidence disappears a week before somebody expected.
+        """
+        from minio.commonconfig import ENABLED, Filter
+        from minio.lifecycleconfig import Expiration, LifecycleConfig, Rule
+
+        if self._retention_days <= 0:
+            try:
+                self._client.delete_bucket_lifecycle(self._bucket)
+            except Exception:
+                logger.debug("no lifecycle rule to remove from %s", self._bucket)
+            return
+
+        config = LifecycleConfig(
+            [
+                Rule(
+                    ENABLED,
+                    rule_id="sentinel-clip-retention",
+                    # Every object in the bucket. The bucket holds clips and nothing
+                    # else, so a prefix would only be a place for a future key layout to
+                    # quietly fall outside the rule.
+                    rule_filter=Filter(prefix=""),
+                    expiration=Expiration(days=self._retention_days),
+                )
+            ]
+        )
+        try:
+            self._client.set_bucket_lifecycle(self._bucket, config)
+        except Exception:
+            # Logged, never fatal. A store that refuses lifecycle configuration — an S3
+            # implementation without it, or credentials without the permission — is
+            # still a store that takes clips, and refusing to record evidence because it
+            # cannot be scheduled for deletion is the wrong way round.
+            logger.warning(
+                "could not set a %d-day retention rule on %s; clips will be kept until "
+                "something else removes them",
+                self._retention_days,
+                self._bucket,
+                exc_info=True,
+            )
+
+
+_SHORT_SUFFIX = "-notify.mp4"
+"""How `MinioClipHandle._write_short` names the trimmed copy. Named once so the writer
+and the index cannot drift about which objects are which."""
+
+_MISSING_OBJECT_CODES = frozenset({"NoSuchKey", "NoSuchBucket"})
+"""What the object store says when a clip is simply not there.
+
+Retention deletes clips on a schedule, so an alert that outlives its clip is ordinary
+rather than exceptional — `NoSuchBucket` joins it because a bucket whose last object
+expired can be reaped too, and "the recording is gone" is the same answer either way.
+Any other `S3Error` is a real failure and is raised.
+"""
+
+
+class MinioClipReader(ClipReader, ClipIndex):
+    """Reads back what `MinioClipWriter` wrote, and says what is there.
+
+    Separate from the writer rather than a second method on it, because the API holds
+    this and the pipeline holds that — and because a reader configured with read-only
+    credentials is a thing a deployment should be able to have.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        bucket: str,
+        secure: bool,
+        retention_days: int = 0,
+    ) -> None:
+        self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+        self._bucket = bucket
+        # Reported, not enforced, by this class: the expiry is a bucket lifecycle rule
+        # the object store applies (see `MinioClipWriter._ensure_lifecycle`). Carried
+        # here so a storage screen can say how long clips last without a second call.
+        self._retention_days = retention_days
+
+    async def read(self, uri: str) -> bytes | None:
+        object_name = self._object_name(uri)
+        if object_name is None:
+            # Not an exception: the caller passed a URI this reader does not serve, and
+            # the honest answer to "give me that clip" is that there is no such clip
+            # here. An exception would turn a rejected URI into a 500, which reads as
+            # an engine fault rather than as the refusal it is.
+            logger.warning("refusing to read a clip uri outside this reader's bucket")
+            return None
+        try:
+            return await asyncio.to_thread(self._fetch, object_name)
+        except S3Error as error:
+            if error.code in _MISSING_OBJECT_CODES:
+                return None
+            raise
+
+    def _fetch(self, object_name: str) -> bytes:
+        response = None
+        try:
+            response = self._client.get_object(self._bucket, object_name)
+            data: bytes = response.read()
+            return data
+        finally:
+            # `get_object` hands back a live urllib3 stream. Without both calls the
+            # connection is never returned to the pool, and a console polling a wall of
+            # alerts exhausts it.
+            if response is not None:
+                response.close()
+                response.release_conn()
+
+    def _object_name(self, uri: str) -> str | None:
+        """The object this URI names, or `None` if this reader must not serve it.
+
+        The bucket check is the point. A clip URI reaches this having come off an alert
+        that this engine wrote, so in the current wiring it is already trustworthy —
+        and this refuses to depend on that, because the check costs nothing and the
+        assumption is one endpoint away from being false. `..` is rejected for the same
+        reason: S3 keys are opaque and `..` has no meaning to MinIO, but this string
+        also becomes a filesystem path in `_trim`'s sibling code paths, and a rule that
+        holds everywhere is worth more than one that holds where it was first written.
+        """
+        prefix = f"s3://{self._bucket}/"
+        if not uri.startswith(prefix):
+            return None
+        object_name = uri[len(prefix) :]
+        if not object_name or ".." in object_name.split("/"):
+            return None
+        return object_name
+
+    def clip_uri(self, camera_id: str, event_id: UUID, *, short: bool) -> str:
+        """Where a given event's clip lives, without asking the store.
+
+        The naming convention is `MinioClipWriter`'s, and this is the one place outside
+        it that knows the convention — so a caller that wants to play a clip names the
+        camera and the event rather than assembling an object path of its own.
+        """
+        suffix = "-notify" if short else ""
+        return f"s3://{self._bucket}/{camera_id}/{event_id}{suffix}.mp4"
+
+    async def usage(self) -> StorageUsage:
+        try:
+            return await asyncio.to_thread(self._usage)
+        except Exception:
+            logger.warning("could not read clip storage usage", exc_info=True)
+            # Zeroes with `reachable=False`, never zeroes on their own: a storage screen
+            # drawing an empty bucket is how an operator concludes their evidence has
+            # been deleted when in fact nobody could ask.
+            return StorageUsage(
+                bucket=self._bucket,
+                clips=0,
+                objects=0,
+                bytes_used=0,
+                retention_days=self._retention_days,
+                per_camera=(),
+                reachable=False,
+            )
+
+    def _usage(self) -> StorageUsage:
+        per_camera: dict[str, list[int]] = {}
+        objects = 0
+        total = 0
+        for item in self._client.list_objects(self._bucket, recursive=True):
+            name = item.object_name or ""
+            size = item.size or 0
+            objects += 1
+            total += size
+            camera_id = name.split("/", 1)[0] if "/" in name else ""
+            counts = per_camera.setdefault(camera_id, [0, 0])
+            counts[1] += size
+            # Only the full clip increments the count. An operator asking how many
+            # clips a camera has means incidents, and counting the short copy would
+            # double every one of them.
+            if not name.endswith(_SHORT_SUFFIX):
+                counts[0] += 1
+        return StorageUsage(
+            bucket=self._bucket,
+            clips=sum(counts[0] for counts in per_camera.values()),
+            objects=objects,
+            bytes_used=total,
+            retention_days=self._retention_days,
+            per_camera=tuple(
+                CameraStorage(camera_id=camera_id, clips=counts[0], bytes_used=counts[1])
+                for camera_id, counts in sorted(per_camera.items())
+            ),
+        )
+
+    async def list_clips(self, camera_id: str, *, limit: int) -> tuple[ClipRecord, ...]:
+        try:
+            return await asyncio.to_thread(self._list_clips, camera_id, limit)
+        except Exception:
+            logger.warning("could not list clips for camera %s", camera_id, exc_info=True)
+            return ()
+
+    def _list_clips(self, camera_id: str, limit: int) -> tuple[ClipRecord, ...]:
+        full: dict[UUID, ClipRecord] = {}
+        short: set[UUID] = set()
+        # `prefix` rather than filtering client-side: a bucket holding every camera's
+        # clips would otherwise be read whole to answer a question about one of them.
+        for item in self._client.list_objects(
+            self._bucket, prefix=f"{camera_id}/", recursive=True
+        ):
+            name = item.object_name or ""
+            stem = name.rsplit("/", 1)[-1]
+            is_short = stem.endswith(_SHORT_SUFFIX)
+            raw = stem[: -len(_SHORT_SUFFIX)] if is_short else stem.removesuffix(".mp4")
+            try:
+                event_id = UUID(raw)
+            except ValueError:
+                # Something else put an object here. Skipped rather than raised: one
+                # stray file must not make a camera's whole footage list unreadable.
+                continue
+            if is_short:
+                short.add(event_id)
+                continue
+            full[event_id] = ClipRecord(
+                event_id=event_id,
+                size_bytes=item.size or 0,
+                modified_at=item.last_modified.timestamp() if item.last_modified else 0.0,
+                has_short_copy=False,
+            )
+        ordered = sorted(full.values(), key=lambda clip: clip.modified_at, reverse=True)
+        return tuple(
+            replace(clip, has_short_copy=clip.event_id in short) for clip in ordered[:limit]
+        )

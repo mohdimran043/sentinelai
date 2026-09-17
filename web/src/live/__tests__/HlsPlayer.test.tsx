@@ -58,13 +58,17 @@ describe('HlsPlayer — native HLS support (Safari-like)', () => {
     expect(screen.getByText(/checking for a live stream/i)).toBeInTheDocument()
   })
 
-  it('reports the stream unreachable — honestly, not as a broken player — and derives the URL from the base and camera id', async () => {
+  it('falls back to the engine snapshot — not an empty panel — and derives the URL from the base and camera id', async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 404 }))
     render(<HlsPlayer cameraId="replay_01" />)
 
     await advance(0)
 
-    expect(screen.getByText(/no live stream reachable/i)).toBeInTheDocument()
+    // No playlist is a permanent state for an EarthCam page or a file, not a wait.
+    // The engine holds the latest frame either way, so the panel shows that and says
+    // plainly that it is a still.
+    expect(screen.getByTestId('camera-snapshot')).toBeInTheDocument()
+    expect(screen.getByText(/this is a still and not a stream/i)).toBeInTheDocument()
     // The checking state does not linger once an answer is in — no forever spinner.
     expect(screen.queryByText(/checking for a live stream/i)).not.toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
@@ -79,10 +83,11 @@ describe('HlsPlayer — native HLS support (Safari-like)', () => {
     render(<HlsPlayer cameraId="avenue_01" />)
 
     await advance(0)
-    expect(screen.getByText(/no live stream reachable/i)).toBeInTheDocument()
+    expect(screen.getByTestId('camera-snapshot')).toBeInTheDocument()
 
     await advance(2_000) // first backoff retry, now succeeds
-    expect(screen.queryByText(/no live stream reachable/i)).not.toBeInTheDocument()
+    // Real video wins the moment it exists: the still is a fallback, never a preference.
+    expect(screen.queryByTestId('camera-snapshot')).not.toBeInTheDocument()
 
     const video = screen.getByTestId('hls-video') as HTMLVideoElement
     expect(video).not.toHaveClass('hidden')

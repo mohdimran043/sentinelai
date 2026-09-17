@@ -10,7 +10,7 @@ export function formatCount(value: number): string {
   return integerFormatter.format(value)
 }
 
-/** `occurred_at` / `last_frame_at` etc. arrive as epoch seconds (a Python `time.time()`). */
+/** `occurred_at` / `last_frame_epoch` etc. arrive as epoch seconds (a Python `time.time()`). */
 export function epochSecondsToDate(epochSeconds: number): Date {
   return new Date(epochSeconds * 1000)
 }

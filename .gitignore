@@ -18,6 +18,12 @@ datasets/**
 !datasets/*.sh
 !datasets/*.md
 !datasets/.gitkeep
+# A validation dataset gets a directory with its own fetcher and provenance note. The
+# media it downloads stays ignored by the rule above — it is somebody else's data, and
+# git is not where a video dataset belongs.
+!datasets/*/
+!datasets/*/*.sh
+!datasets/*/*.md
 models/
 *.engine
 *.onnx

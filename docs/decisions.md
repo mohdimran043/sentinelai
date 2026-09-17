@@ -21,6 +21,14 @@ patching the code; ADR 4 is an example of exactly that.
 | [8](#8-contracts-is-the-only-engine--ui-coupling) | `contracts/` is the only engine ↔ UI coupling | Accepted, partly unenforced |
 | [9](#9-a-file-for-cameras-environment-variables-for-scalars) | A file for cameras, environment variables for scalars | Accepted |
 | [10](#10-welfare-concerns-are-an-opinion-not-a-detection) | Welfare concerns are an opinion, not a detection | Accepted |
+| [11](#11-a-capability-decides-which-models-exist-not-which-ones-run) | A capability decides which models exist, not which ones run | Accepted |
+| [12](#12-fall-detection-is-a-temporal-signature-and-it-gets-its-own-basis) | Fall detection is a temporal signature, and it gets its own `basis` | Accepted, unvalidated on real footage |
+| [13](#13-behaviour-detectors-are-pure-state-machines-measured-in-body-heights) | Behaviour detectors are pure state machines, measured in body heights | Accepted |
+| [14](#14-an-alert-is-an-episode-not-an-event) | An alert is an episode, not an event | Accepted |
+| [15](#15-person-authorization-stores-sealed-embeddings-and-nothing-else) | Person authorization stores sealed embeddings, and nothing else | Accepted |
+| [16](#16-triage-state-is-durable-the-event-stream-is-still-the-record) | Triage state is durable; the event stream is still the record | Accepted |
+| [17](#17-scale-by-processes-not-by-threads) | Scale by processes, not by threads | Accepted, supersedes a wrong diagnosis |
+| [18](#18-an-earthcam-camera-is-a-page-url-resolved-every-time) | An EarthCam camera is a page URL, resolved every time | Accepted |
 
 ---
 
@@ -562,3 +570,418 @@ reasoning, or a purpose-built pose model — does **not** widen
 `basis: "single_frame_vlm"` to cover it. It gets its own `basis` value, and the
 routing rule is rewritten against the pair. Widening this one would retroactively
 relabel every opinion already stored under it.
+
+---
+
+## 11. A capability decides which models exist, not which ones run
+
+**Decided.** Each camera carries a `capabilities` set in `cameras.json`. The union over
+every camera is computed **before anything is constructed**, and `main.build_models`
+builds only the model roles that union names. A role nobody asked for is never
+instantiated, never registered, never given VRAM, and never appears in `/health`.
+
+**Why not a runtime flag.** The obvious cheaper design is to load everything and skip
+the calls a camera does not want. That gets the behaviour right and the cost wrong: a
+site running thirty corridor cameras on triggers alone would still hold 2.7 GiB of
+vision-language weights and 460 MiB of pose weights for the life of the process, and
+`ResidentSet` would dutifully keep them resident because residency is a function of what
+is *registered*, not of what is used. §13's "automatically avoid loading unnecessary
+models for disabled capabilities" is a statement about VRAM, and only a decision taken
+before construction can honour it.
+
+**Skipping is per camera as well as per process.** The detector is shared (ADR 4), so it
+exists as soon as any camera needs one — but a camera with no capabilities is handed
+`None` and runs no inference at all. Otherwise "switch this camera off" would still cost
+a forward pass per frame to produce detections nothing reads.
+
+**The pure layer names roles, not checkpoints.** `domain/capabilities.py` says a
+capability needs a `ModelRole.VLM`; which checkpoint fills that is `Settings`, and
+`domain/` may not import `config` (ADR 6). Swapping Qwen for Moondream is a setting.
+
+**What it cost.**
+
+- **A field that had to be renamed.** `CameraProfile.vlm_enabled` never controlled the
+  VLM — it short-circuits the whole gate — and that was a distinction without a
+  difference only while every camera that escalated also described. Once
+  `scene_description` became separately optional, a camera could escalate and publish
+  while never calling a model, and a field called `vlm_enabled` sitting `True` on
+  exactly that camera was the most misleading thing in the record. It is
+  `auto_escalation_enabled` now, derived from the capability set at composition rather
+  than stored beside it.
+- **An event with no description is now two different facts.** `description_unavailable`
+  has always meant "the model was asked and did not answer". A camera with description
+  switched off produces an event with no description either, and rendering that as a
+  model failure teaches an operator to ignore a flag that otherwise means a real fault.
+  Rather than widen a required boolean into a tri-state — a breaking change for every
+  consumer already reading it — the reason rides in `Event.metadata` under
+  `description_skipped`.
+- **Enabling a capability at runtime can be refused.** `PATCH /cameras/{id}` takes
+  `capabilities`, and disabling always works. *Enabling* one whose model this process
+  never loaded answers **409 naming the restart**, because placing a 3B model under an
+  HTTP request would stall every camera sharing the GPU. The check runs before the file
+  is written, so a refusal leaves the record and the running camera agreeing.
+
+**What would change it.** A model server that could place and evict weights out of
+process on demand (the `SENTINEL_MODE=production` gRPC seam) would make enabling a
+capability live a bounded operation rather than a restart.
+
+---
+
+## 12. Fall detection is a temporal signature, and it gets its own `basis`
+
+**Decided.** `domain/behaviour/fall.py` is a pure state machine over bounding-box
+geometry and, where available, pose keypoints: **upright → rapid descent → horizontal →
+still, for long enough**. All four are required. It emits `FallEvidence` — measurements,
+no score — raises `EscalationReason.FALL_SUSPECTED`, and the welfare concern that
+survives vision-language confirmation carries `basis="temporal_pose_vlm"`.
+
+**This is ADR 10's own escape clause being used, not overturned.** That decision said a
+second source of welfare judgement "does **not** widen `basis: 'single_frame_vlm'` to
+cover it. It gets its own `basis` value, and the routing rule is rewritten against the
+pair." That is exactly what happened: `basis` went from a JSON `const` to a two-member
+enum, and every opinion already stored under `single_frame_vlm` still means what it
+meant when it was written. A consumer that hard-coded the old `const` now rejects a
+`temporal_pose_vlm` payload, which is the correct failure — it is being handed evidence
+of a kind it has no handling for.
+
+**Why the transition and not the posture.** A person lying on the ground is not a fall;
+it is a person lying on the ground, and there are innocent reasons for it. A detector
+firing on posture alone produces exactly the alert an operator learns to dismiss, and a
+dismissed alert is worse than none because it costs the attention a real collapse then
+does not get. The cost of this choice is stated plainly rather than hidden: **someone
+already on the floor when they enter frame raises nothing.** This detects falling, not
+lying.
+
+**Why body heights, never pixels.** Every rate and distance is normalised by the
+person's own bounding-box height. A `px/s` threshold is a threshold on
+distance-from-camera wearing a speed's clothes — tuned on one camera and wrong on the
+next.
+
+**Why no confidence score.** `FallEvidence` carries the descent rate, how long the
+person has been down, and whether pose or geometry did the reading. A single float would
+be read as a calibrated probability by everything downstream, and nothing here has
+earned one — the same argument ADR 10 makes about the VLM's own opinion.
+
+**It bypasses the gate's three governors**, like `user_requested` and unlike the six
+automatic triggers. The machine has already deduplicated to one report per episode and
+will not raise again until the person stands up, so the governors have nothing left to
+protect against — and a cooldown window swallowing the one escalation that mattered is
+the failure this subsystem exists to prevent.
+
+**Pose is an enhancement, never a requirement.** A camera without it runs the same
+machine on box aspect ratio and records `used_pose=False`. A pose model that raises
+degrades the reading and does not cost the frame.
+
+**What it cost.**
+
+- A ninth port (`PoseEstimator`) and a third registrable model.
+- Single-stage pose output has to be reconciled with the pipeline's own tracks by IoU,
+  and a skeleton that cannot be confidently attributed is dropped. A pose bound to the
+  wrong person does not add noise — it makes one person's posture read as another's for
+  as long as the confusion lasts.
+- The machine must be reset on a stream discontinuity, for the tracker's reason one
+  layer up: every phase is keyed by a track id the reconnect invalidated and every
+  timestamp is on a timeline that no longer exists.
+
+**What has not been validated.** The state machine is exercised exhaustively against
+scripted geometry — falls, sits, stumbles, people already down, tracking artefacts — and
+end to end through the real frame loop. It has **not** been measured against real fall
+footage, because none is in this repository. Its false-positive and false-negative rates
+on real video are unknown. Read `operations.md` before relying on it.
+
+**What would change it.** A trained action-recognition model would be a third source and
+would get a third `basis` value, not this one.
+
+---
+
+## 13. Behaviour detectors are pure state machines, measured in body heights
+
+**Decided.** Abandoned object, camera tamper, zone intrusion and line crossing are
+implemented the same way ADR 12 implemented falls: a frozen dataclass of thresholds, a
+`(state, observation) -> (state, candidates)` function in `domain/behaviour/`, and no
+clock, no pixels beyond geometry, no model call. `BehaviourEngine` (`pipeline/`) owns
+the mutable per-camera state and nothing else; every judgement is in `domain/`.
+
+**Why no framework.** Each detector is 100–200 lines and shares a shape, not code. An
+abstract `Detector` base class would have bought one thing — a registry — at the cost of
+forcing four genuinely different state machines through one interface. `observe_falls`,
+`observe_abandonment`, `observe_tamper` and `observe_zones` are four functions the
+engine calls in sequence; adding a fifth is adding a function and one call site.
+
+**Why loitering is not among them.** It already exists. `dwell_exceeded` has been an
+escalation trigger since the gate was written, with its own radius and duration. §6 of
+the brief asked for loitering; implementing a second one would have been a duplicate
+under a different name, and the honest answer was to say so and tune the existing one.
+
+**Every distance is in body heights, every share is a fraction.** A person must be
+within `1.5` of their *own* bounding-box height of a bag to count as attending it; a
+zone vertex is a fraction of frame width. Both for ADR 12's reason: a pixel threshold is
+a threshold on distance-from-camera and resolution, wearing a length's clothes. This one
+bit us concretely — an RTSP source that renegotiates from 1920×1080 to 960×540 would
+silently shrink every pixel-specified zone to a quarter of its intended area, and
+nothing would report an error.
+
+**Camera tamper needs no model at all.** It reads the luma histogram the motion stage
+already computes and asks whether one bin holds most of the frame. That makes camera
+health free to enable on every camera in a site — which matters because an obstructed
+camera and a quiet camera look identical in every other signal the system has.
+
+**What it cost.**
+
+- A `min_clear_seconds` gate on tamper, because a camera that is dark at 3am is not
+  being tampered with. The detector must have seen a varied view *first*, and the clear
+  run resets the moment it ends — an early version accrued "clear" time while already
+  blank and would have alarmed on a permanently covered lens forever.
+- Object abandonment is keyed on the tracker, so a bag whose track is lost and
+  re-acquired starts over. Preferred to the alternative: a detector that re-identifies
+  objects across track breaks would report the same bag repeatedly.
+- Ground points, not centroids, for person↔object distance. A tall person's centroid is
+  a metre above the floor; the bag is on it.
+
+**What would change it.** A fifth detector that genuinely needed cross-detector state —
+say, "this bag was left by the person who is now loitering" — would justify a shared
+context object. Four independent ones do not.
+
+---
+
+## 14. An alert is an episode, not an event
+
+**Decided.** `Alert` is a first-class domain entity keyed by
+`(camera_id, reason, subject)`. The first qualifying event opens one; every later event
+matching that key within `SENTINEL_ALERT_MERGE_WINDOW_SECONDS` increments
+`occurrences` and extends `last_seen_at` rather than opening another. An operator
+acknowledges the episode, not each sighting.
+
+**Why.** The brief's own example: a person seen 17 times in 20 seconds is *one* thing
+happening, and 17 rows is a UI that teaches operators to stop reading it. The engine
+already had three deduplication governors on the *escalation* side (cooldown, scene
+dedup, token bucket), but those exist to protect the GPU. They are tuned for compute,
+not attention, and they cannot merge across them — a fall and a zone intrusion by the
+same person are two escalations and should stay two events, while five zone intrusions
+by that person are one alert.
+
+**Why the subject is `subject_track_ids`, not `track_ids`.** This is the decision that
+cost the most to get right. `Event.track_ids` is every track in the scene, so a busy
+corridor produced a different key on every frame — a live run generated eleven separate
+alerts for one person walking past, each keyed by whoever else happened to be in shot.
+`subject_track_ids` was added to `Event` for exactly this: the tracks the detector
+attributed the event *to*. It is omitted from the wire payload when empty so that every
+trigger-raised event stays byte-identical to what it was before the field existed.
+
+**Severity is the maximum of the model's opinion and the reason's floor.** A VLM that
+describes a collapse mildly cannot lower a `FALL_SUSPECTED` below critical. The floor
+lives in `domain/policy/priority.py` next to the priority ordering, because they answer
+the same question — how much of a human's attention this deserves.
+
+**The register is volatile, and that is a real limitation.** It lives in engine memory,
+bounded at `SENTINEL_ALERT_REGISTER_CAPACITY`, evicting resolved before acknowledged
+before active. An acknowledgement does not survive a restart. The durable record is the
+published event stream; the alert layer is a view over it for an operator at a screen.
+Phase 1C's Postgres is where this becomes durable, and nothing about the domain model
+has to change when it does.
+
+**What would change it.** Multi-operator use. Two people acknowledging from two consoles
+against an in-memory register is a race the current design does not address, because
+there is currently one console and no authentication.
+
+---
+
+## 15. Person authorization stores sealed embeddings, and nothing else
+
+**Decided.** Per-camera opt-in face recognition. Enrolment produces a 512-d ArcFace
+embedding, sealed individually with AES-256-GCM under `SENTINEL_FACE_ENCRYPTION_KEY`,
+written to a 0600 file by write-then-rename. **No face image is ever stored**, and no
+embedding or similarity score is logged.
+
+**Why no images.** The system does not need them. Recognition needs the embedding;
+review needs the event clip, which the evidence pipeline already produces. Storing a
+reference photo would add a second, more sensitive copy of a person's biometrics for no
+capability the system lacks without it.
+
+**The engine refuses to start without a key.** If any camera enables
+`person_authorization` and `SENTINEL_FACE_ENCRYPTION_KEY` is unset, startup fails.
+There is no default key and no plaintext fallback, because a fallback path is the path
+everything ends up on. The cost is stated honestly: rotating the key makes every
+enrolled face undecryptable and everybody must re-enrol.
+
+**No threshold is hard-coded.** All eight — match similarity, minimum observations,
+minimum duration, minimum face pixels, minimum frontality, and the three quality bars —
+are fields on a per-camera `AuthorizationPolicy` with documented defaults. The measured
+starting point (`0.42` cosine) came from running the real pipeline: self-match `1.000`,
+a different person `0.065`. A site with a different camera height and lens will need a
+different number, and the config is where that conversation happens.
+
+**Recognition is sticky for the life of a track.** Once a track has matched an
+authorized person, it stays recognised even when the face becomes unreadable. An
+earlier version re-accumulated evidence every time somebody turned away from the camera,
+and would eventually accuse a person it had already identified. A person does not stop
+being authorized by turning their head.
+
+**Three independent quality bars, never blended.** Face size, frontality and detector
+score each have a floor, and a face must clear all three. A weighted score would let a
+large, badly-angled face pass on size alone — and the whole point of the bars is to keep
+a bad embedding out of a comparison whose output is an accusation.
+
+**Unauthorized is a low-severity finding, not an alarm.** `UNAUTHORIZED_PERSON` sits
+well below `FALL_SUSPECTED` in `priority.py`. The system's confidence that it has
+correctly identified a stranger is much lower than its confidence that somebody fell,
+and the consequence of being wrong lands on a person.
+
+**What it cost.**
+
+- A second inference runtime. InsightFace runs under ONNX Runtime, not torch, so the
+  process carries two model stacks. Worth it: it falls back to CPU cleanly, and faces
+  are rare relative to frames.
+- Enrolment is an API call with an image body, which is the one place a face image
+  enters the process. It is embedded and discarded within the request.
+
+**What would change it.** A requirement to show operators *who* a stranger resembles
+would need reference images and is a different decision, made with a different set of
+people in the room.
+
+---
+
+## 16. Triage state is durable; the event stream is still the record
+
+**Decided.** The alert register gets an `AlertStore` port and a JSON-file adapter.
+Operator actions — acknowledge, resolve — are flushed **before the API answers**.
+Machine-driven changes — an alert opening, an occurrence count rising — are flushed by a
+coalescing five-second timer. `SENTINEL_ALERT_STORE_PATH=null` restores the previous
+memory-only behaviour.
+
+**Why the two paths are paced differently.** They are different kinds of fact. An
+occurrence count is recoverable — every event behind it is already published to the
+broker — and it changes as fast as the site is busy. An acknowledgement exists nowhere
+else in the system and changes a handful of times a minute, because there is a human in
+the loop. Flushing everything synchronously would write the whole register on every
+event; flushing everything lazily would let a `kill -9` throw away the one thing that
+cannot be reconstructed. So the rare, precious path waits and the common, recoverable
+path does not.
+
+**A 200 from `POST /alerts/{id}/acknowledge` now means the decision is on disk.** An
+operator told "acknowledged" by an engine that then restarts and shows the row as unseen
+has been lied to about the only state they created, and after that they stop trusting
+the list. Verified against `kill -9`, not just a clean shutdown.
+
+**A revision counter, not a dirty flag.** The coordinator records the revision it last
+saved and compares. A boolean would have to be cleared either before the write — losing
+a change that arrives during it — or after, re-writing an unchanged set. There is a test
+for exactly that interleaving.
+
+**Acknowledgement became first-wins and idempotent.** Two consoles watching one wall
+both acknowledge the same row; last-write-wins would push `acknowledged_at` later every
+time somebody looked, turning "when did this stop being unseen" into "when did somebody
+last click". A second acknowledgement is not an error — the operator is reading a live
+list — so it returns the existing state rather than a 409.
+
+**This does not make the alert store the record of what happened.** That is still the
+anomaly event on the broker. This file records what a human *did about it*. The
+distinction is written into the file's own `_comment` field, because somebody will find
+it on a server one day and need to know.
+
+**What it cost.**
+
+- A store that cannot be read — truncated, or written by a build with a different schema
+  version — loses triage state and lets the engine start. Taking surveillance down over
+  a bookkeeping file is the worse failure, and the file is kept rather than deleted so
+  there is something to debug.
+- A seventh shutdown phase, after the notification drain, because publishing is what
+  opens an alert and the register is not settled until the last publish has happened.
+
+**What would change it.** Phase 1C's Postgres. It replaces this adapter and nothing
+else, which is what the port is for — and it is also what makes multi-operator use
+addressable, which an in-process register is not.
+
+---
+
+## 17. Scale by processes, not by threads
+
+**Decided.** More cameras than one process comfortably carries are run as several
+processes, each with its own `cameras.json` and port. Measured on the 24-core box, for
+the same twenty cameras: one process 49.3 fps, two processes 114.4, **four processes
+176.0** — 3.6x, on hardware that did not change.
+
+**This supersedes a wrong diagnosis, and the wrongness is the interesting part.**
+`docs/performance.md` previously said the binding constraint was CPU H.264 decode and
+pointed at ADR 2's "what would change it". One measurement disproved it: at twenty
+cameras the engine uses **113% of a single core on a 24-core box**. Not CPU-bound. The
+GPU does its forward pass in about 5 ms and is delivering 49 of them a second, so not
+GPU-bound either. The constraint was never a resource — it was the single Python
+process: one event loop, one shared detector behind a lock (ADR 4), and a GIL
+serialising the executor thread against the loop. Twenty-three cores idle, one
+saturated.
+
+**Two optimisations were built before that was understood, and both are kept anyway.**
+Lazy pixel conversion (`DeferredPixels`) takes a 1080p decode from 1.51 to 1.09 cores
+when nine frames in ten are dropped, and is strictly less work for identical output.
+`SENTINEL_DECODE_HWACCEL` is no longer inert. Neither moved the sweep, because neither
+addressed the constraint. They are documented as such so nobody measures them again.
+
+**Over-sharding collapses, and the cliff is steep.** Ten processes fell to 11.6 fps
+aggregate — worse than one. Each pays its own CUDA context and model placement, and ten
+of them time-slicing one GPU spend more on context switching than on inference. Four is
+the measured recommendation here; the knee is somewhere between four and ten and will
+move with the GPU.
+
+**What it cost.** Nothing in code, which is the appeal. It costs one thing in operations:
+each process holds its own alert register and its own event ring, so an operator console
+pointed at one process cannot see another's alerts. That is tolerable while the console
+talks to one engine and becomes Phase 1C's problem the moment it should not be.
+
+**What would change it.** Real parallelism inside one process — a free-threaded Python
+build, or moving inference behind the gRPC transport `SENTINEL_MODE=production` reserves,
+so the GIL stops being shared with the decode and orchestration loop.
+
+---
+
+## 18. An EarthCam camera is a page URL, resolved every time
+
+**Decided.** A public EarthCam camera is configured as the page a person would open in a
+browser. `EarthCamSource` fetches that page before **every** connection attempt, reads
+the configuration the page embeds for its own player, picks the best variant from the
+master playlist, and opens it with the request context the player uses.
+
+**Nothing is cached, and that is the design rather than an omission.** The page hands out
+a playlist URL signed with `?t=…&td=…` that expires. Caching it is the failure this
+exists to prevent — a stale URL is the 403 that made the naive version look broken. So
+there is no token store, no refresh timer and no separate "403 handler": a signature that
+dies mid-stream is repaired by the reconnect its own death triggers, on the backoff
+`RtspSource` already had. The 403 is still *recognised*, because "your URL is old" and
+"the camera went private" are different things an operator should not have to tell apart
+from an ffmpeg error string.
+
+**It resolves; it does not circumvent.** There is no login, paywall or DRM. The signature
+is issued to anonymous visitors by the page itself, and this asks the page for a current
+one rather than forging, extending or replaying anything. The `Referer`, `Origin` and
+`User-Agent` sent are the player's own — a truthful statement of where the request came
+from, not a disguise. Nothing here retries past a refusal.
+
+**`EarthCamSource` subclasses `RtspSource` rather than copying it.** The two differ in
+exactly one thing: what to open. The reconnect loop, the single demux pass fanning out to
+decoded frames *and* still-encoded packets, the discontinuity signal that resets the
+tracker, the bounded queues and the shutdown are the same problem — and that loop is the
+trickiest code in the pipeline, so two copies of it was the worst available outcome.
+`_open_container` and `_stream_label` were extracted as the two seams this needed.
+
+**The signature never reaches a log.** `redact_url` drops the whole query rather than
+named parameters, so a future one nobody has thought about does not have to be added to a
+denylist. The field holding the token is excluded from the dataclass's `repr`, because the
+usual way a secret reaches a log is a traceback nobody wrote.
+
+**Only earthcam.com is fetched**, checked on the page URL *and* on every media URL the
+page points at. `build_source` takes that URL straight from `cameras.json`; without the
+check, a camera entry would be a server-side request forgery primitive, and the second
+check matters because the page decides where the media lives.
+
+**What it cost.**
+
+- `httpx` became a runtime dependency rather than a dev one.
+- A camera that depends on somebody else's website being up, and on its page layout. The
+  parse fails loudly with a message saying the layout may have changed, and the two
+  integration tests that hit the real pages are marked `network` so a change on their end
+  reports without failing the build.
+
+**What would change it.** A camera the page serves over something other than HLS, or an
+EarthCam that starts requiring an account — the second would make this a credentialed
+client, which is a different decision with a different answer.
+

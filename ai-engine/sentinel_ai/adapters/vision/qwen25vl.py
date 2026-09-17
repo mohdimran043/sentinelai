@@ -127,6 +127,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from sentinel_ai.adapters.vram import measure_model_vram_mib, sample_pools
 from sentinel_ai.domain.entities import SceneState
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment, WelfareConcern
 from sentinel_ai.ports.frame_source import FrameData
@@ -645,15 +646,20 @@ def _parse_response(raw_text: str) -> SceneDescription:
 
 
 class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
-    def __init__(self, model_id: str, max_new_tokens: int, device: str) -> None:
+    def __init__(
+        self, model_id: str, max_new_tokens: int, device: str, quantization: str = "nf4"
+    ) -> None:
         self._model_id = model_id
         self._max_new_tokens = max_new_tokens
         self._device = device
+        self._quantization = quantization
         self._model: object | None = None
         self._processor: object | None = None
         self._state = LifecycleState.UNLOADED
         self._health_detail = ""
         self._vram_mib = 0
+        self._vram_baseline_mib = 0
+        self._allocated_baseline_mib = 0
 
     async def initialize(self) -> None:
         """Branch B: transformers + bitsandbytes 4-bit NF4 on the unquantised
@@ -666,6 +672,11 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
         actively maintained.
         """
         self._state = LifecycleState.DOWNLOADING
+        # Sampled before any weight is placed, so `warmup()` reports this model's
+        # own footprint rather than the process-wide reserved pool — see
+        # `adapters/vram.py` for the measurement bug that made every model after
+        # the first claim its predecessors' memory.
+        self._vram_baseline_mib, self._allocated_baseline_mib = sample_pools(self._device)
         try:
             import torch
             from transformers import (
@@ -674,16 +685,29 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
                 Qwen2_5_VLForConditionalGeneration,
             )
 
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
             checkpoint = _base_checkpoint(self._model_id)
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                checkpoint, quantization_config=quantization_config, device_map=self._device
-            )
+            if self._quantization == "nf4":
+                # ADR 1's configuration, and still the right default: it is what makes
+                # this model fit beside a detector on an 8 GiB card.
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    checkpoint,
+                    quantization_config=BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                    ),
+                    device_map=self._device,
+                )
+            else:
+                # Unquantised fp16. NF4 stores weights in four bits and dequantises them
+                # on **every forward pass**, which is a fine trade when VRAM is the
+                # binding constraint and a poor one when it is not — and on a card with
+                # room to spare, that dequantisation is pure latency in the middle of
+                # the one operation that blocks everything else.
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    checkpoint, dtype=torch.float16, device_map=self._device
+                )
             model.eval()
             self._model = model
             self._processor = AutoProcessor.from_pretrained(checkpoint)
@@ -721,25 +745,22 @@ class Qwen25VLDescriber(VisionLanguageModel, ModelRuntime):
             reason_detail="warmup",
         )
         await self.describe(request)
-        import torch
-
-        if torch.cuda.is_available():
-            reserved = torch.cuda.memory_reserved(self._device) // (1024 * 1024)
-            self._vram_mib = int(reserved) + _CUDA_CONTEXT_OVERHEAD_MIB
+        self._vram_mib = measure_model_vram_mib(
+            self._vram_baseline_mib, self._device, self._allocated_baseline_mib
+        )
         self._state = LifecycleState.HEALTHY
 
     async def describe(self, request: VisionRequest) -> SceneDescription:
         if self._model is None or self._processor is None:
             raise RuntimeError("Qwen25VLDescriber.describe called before initialize()")
-        if not isinstance(request.keyframe.pixels, np.ndarray):
-            raise TypeError(
-                f"FrameData.pixels must be a numpy array, got {type(request.keyframe.pixels)!r}"
-            )
+        resolved = request.keyframe.pixel_array()
+        if not isinstance(resolved, np.ndarray):
+            raise TypeError(f"FrameData.pixels must be a numpy array, got {type(resolved)!r}")
         import asyncio
 
         from PIL import Image
 
-        pixels: npt.NDArray[np.uint8] = request.keyframe.pixels
+        pixels: npt.NDArray[np.uint8] = resolved
         image = Image.fromarray(pixels.astype(np.uint8))
         messages = [
             {

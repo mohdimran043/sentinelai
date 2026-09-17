@@ -61,7 +61,9 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    # quay.io, not Docker Hub — see the note on `minio-init` below. Both MinIO
+    # images moved; leaving either on Docker Hub aborts `make up` entirely.
+    image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
     profiles: ["core"]
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -83,7 +85,11 @@ services:
     # One-shot bucket creation: sentinel_ai.config.Settings.minio_bucket ("sentinel-clips")
     # must exist before Task 9's MinioClipWriter uploads a clip. Runs once per `make up` and
     # exits 0 whether or not the bucket already existed (`mc mb --ignore-existing`).
-    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    # quay.io, not Docker Hub: MinIO withdrew the `minio/mc` Docker Hub repository,
+    # and a `docker compose up` that cannot pull one image aborts the whole profile —
+    # so this single dead reference took the datastores down with it. quay.io is
+    # MinIO's own registry and carries the same release tags.
+    image: quay.io/minio/mc:RELEASE.2024-10-08T09-37-26Z
     profiles: ["core"]
     depends_on:
       minio:

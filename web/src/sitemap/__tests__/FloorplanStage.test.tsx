@@ -17,9 +17,15 @@ function makeCamera(overrides: Partial<CameraStatus> = {}): CameraStatus {
     escalations_dropped: 0,
     discontinuities: 0,
     last_frame_at: null,
+    // The wall-clock observation liveness actually reads; `last_frame_at` is the
+    // camera's own source timeline and means something different.
+    last_frame_epoch: null,
     last_escalation_at: null,
-    // The welfare policy an unconfigured camera loads with: every concern kind,
-    // the stronger tier, and null durations meaning "follow the engine default".
+    // What an unconfigured camera loads with: both capabilities, every concern
+    // kind, the stronger tier, and null durations meaning "follow the engine
+    // default".
+    capabilities: ['anomaly_detection', 'scene_description'],
+    falls_suspected: 0,
     notify_on: ['collapse', 'altercation', 'self_harm', 'medication', 'distress', 'other'],
     notify_min_confidence: 'likely',
     clip_preroll_seconds: null,

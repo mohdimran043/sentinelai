@@ -29,6 +29,7 @@ from sentinel_ai.orchestrator.notifications import NotificationDispatcher
 from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import (
+    DESCRIPTION_SKIPPED_METADATA_KEY,
     EscalationRequest,
     VlmScheduler,
     _is_out_of_memory,
@@ -178,6 +179,7 @@ def a_request(
     zone: Zone | None = None,
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
     notify_min_confidence: Confidence = Confidence.LIKELY,
+    describe: bool = True,
 ) -> EscalationRequest:
     scene = SceneState(
         camera_id=camera_id,
@@ -199,6 +201,7 @@ def a_request(
         camera_label="Front Door",
         history=(),
         clip=clip,
+        describe=describe,
         zone=zone,
         notify_on=notify_on,
         notify_min_confidence=notify_min_confidence,
@@ -269,6 +272,174 @@ def new_scheduler(
         wall_clock=wall_clock,
         recent_events_per_camera=recent_events_per_camera,
     )
+
+
+class TestSceneDescriptionDisabled:
+    """§13: a camera without `scene_description` still produces events, and they must
+    not look like a model failure.
+
+    Two ways to get here, and they must behave identically: this camera did not ask
+    (`describe=False`), or no camera asked and the process never built a VLM at all.
+    """
+
+    async def test_an_undescribed_escalation_still_publishes_an_event(self) -> None:
+        """The escalation is information on its own — a track count spiked, a speed
+        was anomalous. Dropping it because nobody wanted prose would silently delete
+        the cheap monitoring tier this capability exists to make possible."""
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher=publisher)) as scheduler:
+            scheduler.submit(a_request(describe=False))
+            await scheduler.drain()
+
+        assert len(publisher.events) == 1
+
+    async def test_the_vlm_is_never_called(self) -> None:
+        vlm = FakeVisionLLM(
+            response=SceneDescription(
+                description="should never be produced", threat_value=0.9, suggested_action="x"
+            )
+        )
+        async with Worker(new_scheduler(vlm=vlm)) as scheduler:
+            scheduler.submit(a_request(describe=False))
+            await scheduler.drain()
+
+        assert vlm.call_count == 0
+
+    async def test_the_event_says_the_description_was_skipped_not_that_it_failed(
+        self,
+    ) -> None:
+        """`description_unavailable` has always meant "the model was asked and did not
+        answer". A camera with description switched off is the opposite fact, and
+        rendering it as a fault teaches an operator to ignore a flag that otherwise
+        means something real. The distinction rides in `metadata` rather than widening
+        a required bool into a tri-state."""
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher=publisher)) as scheduler:
+            scheduler.submit(a_request(describe=False))
+            await scheduler.drain()
+
+        event = publisher.events[0]
+        assert event.description_unavailable is True
+        assert event.metadata[DESCRIPTION_SKIPPED_METADATA_KEY] == "scene_description_disabled"
+
+    async def test_a_described_escalation_carries_no_skipped_marker(self) -> None:
+        """The marker's absence is what a console reads as "this is a real
+        description", so it must never appear on one."""
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher=publisher)) as scheduler:
+            scheduler.submit(a_request())
+            await scheduler.drain()
+
+        assert DESCRIPTION_SKIPPED_METADATA_KEY not in publisher.events[0].metadata
+
+    async def test_a_scheduler_built_with_no_vlm_skips_every_description(self) -> None:
+        """The process-wide case: no camera enabled `scene_description`, so
+        `build_models` never constructed a VLM. Every escalation takes the same path a
+        per-camera opt-out takes, including one that still says `describe=True`."""
+        publisher = FakePublisher()
+        built_without_a_vlm = VlmScheduler(
+            vlm=None,
+            publisher=publisher,
+            admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+            resident_set=RecordingResidentSet(),
+            vlm_model_key=None,
+            dead_letter=FakeFailedEventSink(),
+            notifications=NotificationDispatcher(FakeNotifier()),
+            maxsize=4,
+            timeout_seconds=5.0,
+            clock=clock,
+            wall_clock=wall_clock,
+        )
+        async with Worker(built_without_a_vlm) as scheduler:
+            scheduler.submit(a_request(describe=True))
+            await scheduler.drain()
+
+        assert len(publisher.events) == 1
+        assert publisher.events[0].description_unavailable is True
+
+    def test_a_vlm_without_its_key_is_refused_at_construction(self) -> None:
+        """The two travel together or not at all: a runtime with no key cannot be kept
+        resident, and a key with no runtime asks the registry for a model nobody
+        registered. Either way the failure surfaces much later, as a describe that
+        mysteriously degrades."""
+        with pytest.raises(ValueError, match="both be set or both be None"):
+            VlmScheduler(
+                vlm=FakeVisionLLM(),
+                publisher=FakePublisher(),
+                admission=AdmissionGate(concurrency=1, min_interval_seconds=0.0),
+                resident_set=RecordingResidentSet(),
+                vlm_model_key=None,
+                dead_letter=FakeFailedEventSink(),
+                notifications=NotificationDispatcher(FakeNotifier()),
+                maxsize=4,
+                timeout_seconds=5.0,
+                clock=clock,
+            )
+
+
+class TestTheFallBasis:
+    """ADR 10's own prescription, exercised: a second evidence source gets a second
+    `basis` value rather than widening the first."""
+
+    @staticmethod
+    def _concerned_vlm() -> FakeVisionLLM:
+        return FakeVisionLLM(
+            response=SceneDescription(
+                description="A person is lying on the floor and is not moving.",
+                threat_value=0.8,
+                suggested_action="Send someone now.",
+                welfare=WelfareAssessment(
+                    concerns=(
+                        WelfareConcern(
+                            kind=ConcernKind.COLLAPSE,
+                            confidence=Confidence.LIKELY,
+                            evidence="a person is motionless on the floor",
+                        ),
+                    )
+                ),
+            )
+        )
+
+    async def test_a_confirmed_fall_is_stamped_temporal_pose_vlm(self) -> None:
+        publisher = FakePublisher()
+        async with Worker(
+            new_scheduler(vlm=self._concerned_vlm(), publisher=publisher)
+        ) as scheduler:
+            scheduler.submit(a_request(reason=EscalationReason.FALL_SUSPECTED))
+            await scheduler.drain()
+
+        assert publisher.events[0].welfare.basis == "temporal_pose_vlm"
+
+    async def test_an_ordinary_escalation_keeps_single_frame_vlm(self) -> None:
+        """The stamp is not a general upgrade. An opinion about one frame stays an
+        opinion about one frame however concerning the model found it."""
+        publisher = FakePublisher()
+        async with Worker(
+            new_scheduler(vlm=self._concerned_vlm(), publisher=publisher)
+        ) as scheduler:
+            scheduler.submit(a_request(reason=EscalationReason.PERIODIC_SUMMARY))
+            await scheduler.drain()
+
+        assert publisher.events[0].welfare.basis == "single_frame_vlm"
+
+    async def test_a_fall_the_model_did_not_corroborate_is_not_stamped(self) -> None:
+        """The state machine fired and the model disagreed. Stamping that would record
+        corroboration that never happened — the exact claim the second value exists to
+        make truthfully."""
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher=publisher)) as scheduler:
+            scheduler.submit(a_request(reason=EscalationReason.FALL_SUSPECTED))
+            await scheduler.drain()
+
+        event = publisher.events[0]
+        assert event.welfare.concerns == ()
+        assert event.welfare.basis == "single_frame_vlm"
+
+    def test_the_domain_refuses_a_basis_outside_the_published_vocabulary(self) -> None:
+        """The type is a mypy-only guarantee; this record is rebuilt from untrusted
+        JSON by the event codec, so the runtime check is what actually holds."""
+        with pytest.raises(ValueError, match="basis must be one of"):
+            WelfareAssessment(concerns=(), basis="pose_only")  # type: ignore[arg-type]
 
 
 async def test_a_submitted_escalation_is_described_and_published() -> None:

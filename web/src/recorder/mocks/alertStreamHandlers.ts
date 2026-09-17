@@ -3,7 +3,7 @@ import { RECORDER_BASE_URL } from '@/recorder/config'
 
 /**
  * MSW handler for `GET /api/alerts/stream` — **tests only**. Kept in its own
- * file for the same reason `maskHandlers.ts`/`maskFixtures.ts` are: several
+ * file for the same reason the other per-endpoint handler modules are: several
  * other sections were landing in the shared `recorder/mocks/handlers.ts` at
  * the same time this was written, so this only needs one import and one line
  * there rather than a contested block.

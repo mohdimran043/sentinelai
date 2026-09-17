@@ -1,8 +1,16 @@
-import { Link, useParams } from 'react-router-dom'
-import { useCameraEvents, useCameraTelemetry, useCameras, useDescribeCameraNow } from '@/api/queries'
+import { useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import {
+  useCameraEvents,
+  useCameraTelemetry,
+  useCameras,
+  useDeleteCamera,
+  useDescribeCameraNow,
+} from '@/api/queries'
 import type { RecentEventEntry } from '@/api/engineClient'
 import { HlsPlayer } from '@/live/HlsPlayer'
 import { CameraRecordPanel } from '@/routes/camera/CameraRecordPanel'
+import { CapabilityPanel } from '@/routes/camera/CapabilityPanel'
 import { WelfareConcerns } from '@/routes/camera/WelfareConcerns'
 import { Panel } from '@/components/ui/Panel'
 import { Reading } from '@/components/ui/Reading'
@@ -142,7 +150,7 @@ export function CameraPage() {
   const cameraRecord = camerasQuery.data?.cameras.find((c) => c.camera_id === cameraId)
 
   const liveness =
-    telemetryQuery.status === 'success' ? cameraLiveness(telemetryQuery.data.last_frame_at) : 'no-data'
+    telemetryQuery.status === 'success' ? cameraLiveness(telemetryQuery.data.last_frame_epoch ?? null) : 'no-data'
   const tone = toneForLiveness(liveness)
 
   return (
@@ -271,8 +279,8 @@ export function CameraPage() {
             <Reading
               label="Last frame"
               value={
-                telemetryQuery.data.last_frame_at !== null
-                  ? formatAgo(telemetryQuery.data.last_frame_at)
+                telemetryQuery.data.last_frame_epoch != null
+                  ? formatAgo(telemetryQuery.data.last_frame_epoch)
                   : '—'
               }
             />
@@ -301,6 +309,21 @@ export function CameraPage() {
           </p>
         )}
       </div>
+
+      {/*
+        Above the welfare notification panel, because what a camera is *watching
+        for* governs what it can ever notify about — an operator wondering why a
+        camera never reports falls should meet the capability switch before the
+        routing policy.
+      */}
+      {telemetryQuery.data ? (
+        <div className="mb-4">
+          <CapabilityPanel
+            camera={telemetryQuery.data}
+            writable={camerasQuery.data?.config_writable ?? false}
+          />
+        </div>
+      ) : null}
 
       <Panel className="mb-4" data-testid="notifications-panel">
         <h2>Notifications</h2>
@@ -336,6 +359,74 @@ export function CameraPage() {
           writable={camerasQuery.data?.config_writable ?? false}
         />
       ) : null}
+
+      <RemoveCamera
+        cameraId={cameraId}
+        writable={camerasQuery.data?.config_writable ?? false}
+      />
     </div>
+  )
+}
+
+/**
+ * Stop a camera and drop it from the file.
+ *
+ * Two clicks, and the second one says what it will do rather than "Confirm". Removing a
+ * camera stops it watching immediately — this is not an archive or a disable, and an
+ * operator who wanted to silence one temporarily wants the capability toggles above.
+ */
+function RemoveCamera({ cameraId, writable }: { cameraId: string; writable: boolean }) {
+  const navigate = useNavigate()
+  const remove = useDeleteCamera()
+  const [armed, setArmed] = useState(false)
+
+  if (!writable) return null
+
+  return (
+    <Panel className="mt-4">
+      <div className="eyebrow mb-1">Remove</div>
+      <p className="muted mt-0 mb-3 max-w-[70ch]">
+        Stops watching immediately and deletes the record from{' '}
+        <code>cameras.json</code>. Events and clips already published are not touched —
+        they are the durable record and this is not an undo. To silence a camera without
+        removing it, turn its capabilities off instead.
+      </p>
+
+      {remove.isError ? (
+        <Notice tone="breach" className="mb-3">
+          {remove.error.message}
+        </Notice>
+      ) : null}
+
+      {armed ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              remove.mutate(cameraId, { onSuccess: () => navigate('/dashboard') })
+            }
+            disabled={remove.isPending}
+            className="rounded-sm border border-breach bg-[#1a0d0d] px-[13px] py-[6px] font-mono text-[11.5px] uppercase tracking-[0.08em] text-breach disabled:opacity-40"
+          >
+            {remove.isPending ? 'Removing…' : `Stop and remove ${cameraId}`}
+          </button>
+          <button
+            type="button"
+            onClick={() => setArmed(false)}
+            className="font-mono text-[11px] uppercase tracking-[0.07em] text-dim underline-offset-2 hover:text-fg hover:underline"
+          >
+            Keep it
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setArmed(true)}
+          className="rounded-sm border border-line-2 bg-panel-2 px-[13px] py-[6px] font-mono text-[11.5px] uppercase tracking-[0.08em] text-dim hover:border-breach hover:text-breach"
+        >
+          Remove this camera
+        </button>
+      )}
+    </Panel>
   )
 }

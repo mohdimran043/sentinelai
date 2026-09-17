@@ -300,15 +300,15 @@ class TestDeduplication:
 
 
 class TestVlmDisabled:
-    def test_a_camera_with_vlm_disabled_never_escalates(self) -> None:
-        profile = CameraProfile(camera_id="cam-1", vlm_enabled=False)
+    def test_a_camera_with_auto_escalation_disabled_never_escalates(self) -> None:
+        profile = CameraProfile(camera_id="cam-1", auto_escalation_enabled=False)
         outcome = decide(
             scene(timestamp=0.0, tracks=(running_track(),)),
             profile,
             GateState.initial(profile, now=0.0),
         )
         assert outcome.decision.should_escalate is False
-        assert outcome.decision.suppressed_by == "vlm_disabled"
+        assert outcome.decision.suppressed_by == "auto_escalation_disabled"
 
 
 class TestSceneDeltaStreak:

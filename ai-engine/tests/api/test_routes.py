@@ -5,6 +5,8 @@ shapes only — no business logic lives here to test.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -15,21 +17,39 @@ from sentinel_ai.adapters.config.camera_file import (
     UNSET,
     CameraConfig,
     CameraConfigError,
+    CameraCreate,
     CameraEdit,
 )
+from sentinel_ai.adapters.face.encrypted_store import EncryptedFaceStore, generate_key
+from sentinel_ai.adapters.sources.probe import ProbeResult
 from sentinel_ai.api.app import create_app
+from sentinel_ai.domain.alert import Alert
 from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import EscalationReason, Severity
+from sentinel_ai.domain.capabilities import (
+    DEFAULT_CAPABILITIES,
+    CameraCapabilities,
+    Capability,
+    ModelRole,
+)
+from sentinel_ai.domain.entities import EscalationReason, Event, Severity, ThreatScore
+from sentinel_ai.domain.identity import AuthorizedPerson, EnrolledFace, FaceEmbedding
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.domain.zone import Zone
+from sentinel_ai.orchestrator.alerts import AlertRegister
 from sentinel_ai.orchestrator.event_history import (
     CameraEventHistory,
     EventSubscription,
     RecentEvent,
     RecentEventLog,
 )
-from sentinel_ai.orchestrator.service import UnknownCameraError
+from sentinel_ai.orchestrator.service import (
+    CapabilityUnavailableError,
+    FaceCapabilityUnavailableError,
+    UnknownCameraError,
+    UnknownPersonError,
+)
 from sentinel_ai.pipeline.runner import CameraTelemetry
+from sentinel_ai.ports.face import FaceStore
 from sentinel_ai.ports.model_runtime import HealthReport, LifecycleState
 
 _WELFARE_POLICY_FIELDS = (
@@ -51,6 +71,9 @@ class _FakeEngineService:
         events: tuple[RecentEvent, ...] = (),
         capacity: int = 200,
         update_error: Exception | None = None,
+        alert_register: AlertRegister | None = None,
+        face_store: FaceStore | None = None,
+        enroll_error: Exception | None = None,
     ) -> None:
         self._cameras = {t.camera_id: t for t in cameras}
         self._health = health or {}
@@ -58,6 +81,19 @@ class _FakeEngineService:
         self._events = events
         self._capacity = capacity
         self._update_error = update_error
+        # A real register rather than a stub list: what these tests own is the HTTP
+        # translation, and the register's own behaviour is `test_alerts.py`'s subject.
+        # Using the real one means a route cannot pass here against semantics the
+        # register does not actually have.
+        self._register = alert_register if alert_register is not None else AlertRegister()
+        self.alert_flushes = 0
+        # What `read_alert_clip` will answer with, and what it was asked. `None` is the
+        # ordinary "nothing recorded" case, which is most alerts most of the time.
+        self.clip_bytes: bytes | None = None
+        self.clip_requests: list[tuple[UUID, bool]] = []
+        self._face_store = face_store
+        self._enroll_error = enroll_error
+        self._alerts = self._register.snapshot()
         self.edits: list[tuple[str, CameraEdit]] = []
         self.started = False
         self.stopped = False
@@ -94,6 +130,108 @@ class _FakeEngineService:
         if camera_id not in self._cameras:
             raise UnknownCameraError(camera_id)
         return self._cameras[camera_id]
+
+    async def list_people(self) -> tuple[tuple[AuthorizedPerson, int], ...]:
+        if self._face_store is None:
+            return ()
+        people = await self._face_store.list_people()
+        out: list[tuple[AuthorizedPerson, int]] = []
+        for person in people:
+            out.append((person, await self._face_store.reference_count(person.person_id)))
+        return tuple(out)
+
+    async def upsert_person(self, person: AuthorizedPerson) -> AuthorizedPerson:
+        if self._face_store is None:
+            raise FaceCapabilityUnavailableError()
+        await self._face_store.add_person(person)
+        return person
+
+    async def delete_person(self, person_id: UUID) -> bool:
+        if self._face_store is None:
+            raise FaceCapabilityUnavailableError()
+        return await self._face_store.delete_person(person_id)
+
+    async def enroll_face(
+        self, person_id: UUID, image: object, *, original: bytes | None = None
+    ) -> int:
+        """A stand-in for the detect-embed-store chain.
+
+        These tests own the HTTP translation; the chain itself needs a real face model
+        and is exercised in a `gpu`-marked test. `self._enroll_error` lets a test choose
+        which of the documented failures to provoke.
+        """
+        if self._face_store is None:
+            raise FaceCapabilityUnavailableError()
+        if self._enroll_error is not None:
+            raise self._enroll_error
+        if await self._face_store.get_person(person_id) is None:
+            raise UnknownPersonError(person_id)
+        await self._face_store.add_embedding(person_id, FaceEmbedding.of((1.0, 0.0, 0.0)))
+        return await self._face_store.reference_count(person_id)
+
+    def alerts(self) -> tuple[Alert, ...]:
+        return self._register.snapshot()
+
+    def acknowledge_alert(self, alert_id: UUID, *, by: str, at: float) -> Alert:
+        return self._register.acknowledge(alert_id, by=by, at=at)
+
+    def resolve_alert(self, alert_id: UUID) -> Alert:
+        return self._register.resolve(alert_id)
+
+    async def read_alert_clip(self, alert_id: UUID, *, short: bool) -> bytes | None:
+        """Records which variant was asked for and hands back a recognisable stand-in.
+
+        Real MP4 bytes would prove nothing these tests are about: what the route owes
+        is the right object, the right media type and the right status, and a fake that
+        returns distinguishable bytes per variant is what makes "it served the short
+        one" assertable at all.
+
+        The register lookup is not decoration. `EngineService.read_alert_clip` resolves
+        the URI *from the alert* — that is the whole of the authorisation — so a fake
+        that skipped it would hand out bytes for an id the engine has never heard of,
+        and the route's 404 path would be tested against a service that cannot produce
+        it.
+        """
+        self._register.get(alert_id)
+        self.clip_requests.append((alert_id, short))
+        if self.clip_bytes is None:
+            return None
+        return self.clip_bytes if short else self.clip_bytes + b"-full"
+
+    async def flush_alerts(self) -> None:
+        """Counted rather than performed, so a test can assert that the handler asked
+        for a write before answering — which is the whole promise of a 200 on the two
+        operator endpoints."""
+        self.alert_flushes += 1
+
+    def clear_alerts(self) -> int:
+        return 0
+
+    async def snapshot(self, camera_id: str) -> bytes | None:
+        return None
+
+    async def create_camera(self, create: CameraCreate) -> CameraConfig:
+        raise NotImplementedError("this fake does not exercise the create path")
+
+    async def delete_camera(self, camera_id: str) -> None:
+        raise UnknownCameraError(camera_id)
+
+    async def probe_source(self, url: str) -> ProbeResult:
+        return ProbeResult(ok=False, detail="probing is not faked here", source_kind="file")
+
+    async def list_faces(self, person_id: UUID) -> tuple[EnrolledFace, ...]:
+        raise FaceCapabilityUnavailableError()
+
+    async def read_face_image(self, person_id: UUID, face_id: UUID) -> bytes | None:
+        return None
+
+    async def delete_face(self, person_id: UUID, face_id: UUID) -> bool:
+        raise FaceCapabilityUnavailableError()
+
+    def last_frame_epoch(self, camera_id: str) -> float | None:
+        """A fixed, plainly-not-now epoch so a test asserting on the shape sees a
+        stable value rather than a moving one."""
+        return 1_700_000_000.0 if camera_id in self._cameras else None
 
     def health(self) -> dict[str, HealthReport]:
         return self._health
@@ -132,6 +270,9 @@ class _FakeEngineService:
                 )
                 for name in _WELFARE_POLICY_FIELDS
             },
+            capabilities=(
+                current.capabilities if edit.capabilities is UNSET else edit.capabilities
+            ),
         )
 
 
@@ -140,6 +281,7 @@ def _telemetry(
     *,
     zone: Zone | None = None,
     label: str | None = None,
+    capabilities: CameraCapabilities = DEFAULT_CAPABILITIES,
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
     notify_min_confidence: Confidence = Confidence.LIKELY,
     clip_preroll_seconds: float | None = None,
@@ -149,6 +291,7 @@ def _telemetry(
     return CameraTelemetry(
         camera_id=camera_id,
         label=label if label is not None else camera_id,
+        capabilities=capabilities,
         frames_seen=100,
         frames_dropped=2,
         detections_run=98,
@@ -210,16 +353,33 @@ def test_camera_telemetry_returns_the_expected_shape() -> None:
     assert response.json() == {
         "camera_id": "cam-1",
         "label": "cam-1",
+        # True unless an operator switched this camera off. Asserted here rather than
+        # left to the lifecycle tests because this is the shape contract: a console
+        # reads liveness from the same object it reads the counters from, and a missing
+        # `enabled` would make every camera look like it is running.
+        "enabled": True,
         "frames_seen": 100,
         "frames_dropped": 2,
         "detections_run": 98,
         "escalations": 3,
         "escalations_dropped": 0,
         "discontinuities": 1,
+        # Zero, and zero is a claim: the camera has this capability's counter and
+        # nothing has completed. A console must not render it as "not monitored".
+        "falls_suspected": 0,
+        # The camera's own source timeline, unchanged — never an age.
         "last_frame_at": 12.5,
+        # And the wall-clock observation a liveness indicator actually reads. The
+        # two are different numbers on purpose: reading the first as an epoch is
+        # the bug this field exists to prevent.
+        "last_frame_epoch": 1_700_000_000.0,
         "last_escalation_at": 10.0,
         "zone": None,
         "zone_kind": None,
+        # The default set, sorted — a camera whose file says nothing about
+        # `capabilities` describes scenes and runs the automatic triggers, which is
+        # what every camera did before the field existed.
+        "capabilities": ["anomaly_detection", "scene_description"],
         "notify_on": ["altercation", "collapse", "distress", "medication", "other", "self_harm"],
         "notify_min_confidence": "likely",
         "clip_preroll_seconds": None,
@@ -588,6 +748,71 @@ class TestCameraEdit:
         )
         return service, TestClient(create_app(service, camera_writes_enabled=True))
 
+    def test_a_capability_edit_reaches_the_store_as_a_whole_set(self) -> None:
+        """A replacement, never an addition. A console sending one capability means
+        "this camera now runs exactly this", and merging instead would make turning a
+        capability *off* impossible through this endpoint."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"capabilities": ["anomaly_detection"]})
+
+        assert response.status_code == 200
+        _, edit = service.edits[-1]
+        assert edit.capabilities == CameraCapabilities.of(Capability.ANOMALY_DETECTION)
+        assert response.json()["capabilities"] == ["anomaly_detection"]
+
+    def test_an_empty_capability_list_is_an_instruction_not_an_empty_edit(self) -> None:
+        """`[]` means "run nothing on this camera" and must reach the store as such.
+
+        The absent-versus-empty distinction `notify_on` already carries, with the
+        polarity that matters more: collapsing `[]` into "unchanged" would leave
+        models running on a camera an operator had just switched off.
+        """
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"capabilities": []})
+
+        assert response.status_code == 200
+        _, edit = service.edits[-1]
+        assert edit.capabilities == CameraCapabilities.none()
+
+    def test_a_null_capability_list_is_rejected_rather_than_guessed(self) -> None:
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"capabilities": None})
+
+        assert response.status_code == 422
+        assert "capabilities" in response.text
+        assert service.edits == []
+
+    def test_an_unknown_capability_name_is_a_422_not_a_silent_drop(self) -> None:
+        """Fail-loud, as an unknown `zone` is. A capability quietly dropped leaves an
+        operator believing monitoring is running that was never switched on."""
+        service, client = self.app()
+        with client:
+            response = client.patch("/cameras/cam-1", json={"capabilities": ["xray_vision"]})
+
+        assert response.status_code == 422
+        assert service.edits == []
+
+    def test_a_capability_whose_model_was_never_loaded_is_a_409_naming_the_restart(
+        self,
+    ) -> None:
+        """§13's honest refusal. Placing a 3B vision model is a multi-second
+        download-and-place against a GPU every camera shares, so it cannot happen
+        under an HTTP request — and a 200 that wrote the file and left the camera
+        unable to honour it would be worse than saying so."""
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),),
+            update_error=CapabilityUnavailableError("cam-1", frozenset({ModelRole.VLM})),
+        )
+        with TestClient(create_app(service, camera_writes_enabled=True)) as client:
+            response = client.patch("/cameras/cam-1", json={"capabilities": ["scene_description"]})
+
+        assert response.status_code == 409
+        assert "restart" in response.json()["detail"]
+        assert "Nothing was changed" in response.json()["detail"]
+
     def test_a_label_edit_returns_the_stored_record(self) -> None:
         service, client = self.app()
         with client:
@@ -602,7 +827,10 @@ class TestCameraEdit:
             # Echoed even though this edit did not name them: the response is the
             # record as it now stands, not a diff. A camera whose file says nothing
             # about `notify_on` notifies on every kind, and saying so explicitly is
-            # what stops a console rendering "no kinds" for it.
+            # what stops a console rendering "no kinds" for it. `capabilities` is
+            # echoed for the same reason, and its default is the pre-capabilities
+            # behaviour: describe scenes, run the automatic triggers.
+            "capabilities": ["anomaly_detection", "scene_description"],
             "notify_on": sorted(ConcernKind),
             "notify_min_confidence": "likely",
             "clip_preroll_seconds": None,
@@ -1187,3 +1415,428 @@ class TestWelfareConcernsOnTheEventRing:
 
         kinds = [c["kind"] for c in response.json()["events"][0]["welfare_concerns"]]
         assert kinds == ["medication"]
+
+
+class TestAlertRoutes:
+    """The HTTP translation. Register semantics are `tests/orchestrator/test_alerts.py`'s
+    subject and are not re-tested here."""
+
+    @staticmethod
+    def _an_event(
+        *,
+        reason: EscalationReason = EscalationReason.ZONE_INTRUSION,
+        track_ids: tuple[int, ...] = (7,),
+    ) -> Event:
+        return Event(
+            event_id=uuid4(),
+            camera_id="cam-1",
+            occurred_at=0.0,
+            reason=reason,
+            threat=ThreatScore.from_value(0.7),
+            description="a person is in the stairwell",
+            suggested_action="Go and look.",
+            track_ids=track_ids,
+            subject_track_ids=track_ids,
+        )
+
+    def app(self) -> tuple[AlertRegister, TestClient]:
+        register = AlertRegister()
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), alert_register=register)
+        return register, TestClient(create_app(service))
+
+    def test_an_empty_register_answers_an_empty_list(self) -> None:
+        _, client = self.app()
+        with client:
+            response = client.get("/alerts")
+        assert response.status_code == 200
+        assert response.json() == {"alerts": [], "open_count": 0}
+
+    def test_repeated_events_are_one_row_with_a_count(self) -> None:
+        """§17's requirement, at the API boundary: an operator sees one row saying it
+        happened three times, not three rows."""
+        register, client = self.app()
+        for index in range(3):
+            register.absorb(
+                self._an_event(), camera_label="Corridor 1", zone=Zone.CORRIDOR, now=float(index)
+            )
+        with client:
+            body = client.get("/alerts").json()
+        assert len(body["alerts"]) == 1
+        assert body["alerts"][0]["occurrences"] == 3
+        assert body["open_count"] == 1
+
+    def test_the_worst_alert_is_first(self) -> None:
+        register, client = self.app()
+        register.absorb(
+            self._an_event(reason=EscalationReason.LINE_CROSSING, track_ids=(1,)),
+            camera_label="Corridor 1",
+            zone=None,
+            now=0.0,
+        )
+        register.absorb(
+            self._an_event(reason=EscalationReason.FALL_SUSPECTED, track_ids=(2,)),
+            camera_label="Corridor 1",
+            zone=None,
+            now=1.0,
+        )
+        with client:
+            body = client.get("/alerts").json()
+        assert body["alerts"][0]["reason"] == "fall_suspected"
+        assert body["alerts"][0]["priority"] == "critical"
+
+    def test_acknowledging_records_the_label_and_the_state(self) -> None:
+        register, client = self.app()
+        alert = register.absorb(self._an_event(), camera_label="Corridor 1", zone=None, now=0.0)
+        assert alert is not None
+        with client:
+            response = client.post(
+                f"/alerts/{alert.alert_id}/acknowledge", json={"by": "operator-1"}
+            )
+        assert response.status_code == 200
+        assert response.json()["state"] == "acknowledged"
+        assert response.json()["acknowledged_by"] == "operator-1"
+
+    def test_acknowledging_an_unknown_alert_is_a_404(self) -> None:
+        _, client = self.app()
+        with client:
+            response = client.post(f"/alerts/{uuid4()}/acknowledge", json={"by": "operator-1"})
+        assert response.status_code == 404
+        assert "'" not in response.json()["detail"], "KeyError.__str__ must not reach the wire"
+
+    def test_acknowledging_a_resolved_alert_is_a_409(self) -> None:
+        """The operator is acting on a stale list. Silently accepting would tell them
+        they had done something they had not."""
+        register, client = self.app()
+        alert = register.absorb(self._an_event(), camera_label="Corridor 1", zone=None, now=0.0)
+        assert alert is not None
+        register.resolve(alert.alert_id)
+        with client:
+            response = client.post(
+                f"/alerts/{alert.alert_id}/acknowledge", json={"by": "operator-1"}
+            )
+        assert response.status_code == 409
+
+    def test_an_empty_acknowledger_is_rejected(self) -> None:
+        register, client = self.app()
+        alert = register.absorb(self._an_event(), camera_label="Corridor 1", zone=None, now=0.0)
+        assert alert is not None
+        with client:
+            response = client.post(f"/alerts/{alert.alert_id}/acknowledge", json={"by": ""})
+        assert response.status_code == 422
+
+    def test_resolving_is_idempotent(self) -> None:
+        """Two operators closing the same row is an ordinary race."""
+        register, client = self.app()
+        alert = register.absorb(self._an_event(), camera_label="Corridor 1", zone=None, now=0.0)
+        assert alert is not None
+        with client:
+            first = client.post(f"/alerts/{alert.alert_id}/resolve")
+            second = client.post(f"/alerts/{alert.alert_id}/resolve")
+        assert first.status_code == second.status_code == 200
+        assert second.json()["state"] == "resolved"
+
+    def test_a_resolved_alert_stays_listed_but_is_not_open(self) -> None:
+        register, client = self.app()
+        alert = register.absorb(self._an_event(), camera_label="Corridor 1", zone=None, now=0.0)
+        assert alert is not None
+        register.resolve(alert.alert_id)
+        with client:
+            body = client.get("/alerts").json()
+        assert len(body["alerts"]) == 1
+        assert body["open_count"] == 0
+
+
+class TestAuthorizedPersonRoutes:
+    """§23's enrolment surface, and §12's constraint on what it may return."""
+
+    def app(self, tmp_path: Path, **kwargs: object) -> tuple[EncryptedFaceStore, TestClient]:
+        store = EncryptedFaceStore(tmp_path / "faces.json", encryption_key=generate_key())
+        service = _FakeEngineService(
+            cameras=(_telemetry("cam-1"),),
+            face_store=store,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        return store, TestClient(create_app(service))
+
+    @staticmethod
+    def _body(**overrides: object) -> dict[str, object]:
+        body: dict[str, object] = {"display_name": "Employee A", "camera_ids": ["cam-1"]}
+        body.update(overrides)
+        return body
+
+    @staticmethod
+    def _png() -> bytes:
+        """A real, tiny PNG.
+
+        The route decodes the upload before it looks the person up, so a placeholder
+        byte string would 422 on every enrolment test and hide whatever they were
+        actually checking.
+        """
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), color=(120, 120, 120)).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_an_empty_roster_lists_nothing(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        with client:
+            assert client.get("/authorized-persons").json() == {"people": []}
+
+    def test_a_person_can_be_enrolled_and_read_back(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        person_id = uuid4()
+        with client:
+            created = client.put(f"/authorized-persons/{person_id}", json=self._body())
+            listed = client.get("/authorized-persons").json()
+
+        assert created.status_code == 200
+        assert created.json()["display_name"] == "Employee A"
+        assert created.json()["camera_ids"] == ["cam-1"]
+        assert len(listed["people"]) == 1
+
+    def test_no_biometric_data_ever_appears_on_the_wire(self, tmp_path: Path) -> None:
+        """§12. The roster carries names and permissions; embeddings stay in the
+        encrypted store. `reference_faces` is a count, never the faces."""
+        _, client = self.app(tmp_path)
+        person_id = uuid4()
+        with client:
+            client.put(f"/authorized-persons/{person_id}", json=self._body())
+            client.post(
+                f"/authorized-persons/{person_id}/faces",
+                files={"image": ("face.png", self._png(), "image/png")},
+            )
+            body = client.get("/authorized-persons").json()
+
+        serialised = json.dumps(body).lower()
+        for forbidden in ("embedding", "vector", "image", "ciphertext", "nonce"):
+            assert forbidden not in serialised
+        assert body["people"][0]["reference_faces"] == 1
+
+    def test_enrolling_a_face_increments_the_reference_count(self, tmp_path: Path) -> None:
+        """§10 asks for multiple references per person, and one is usually why somebody
+        is not recognised from an angle."""
+        _, client = self.app(tmp_path)
+        person_id = uuid4()
+        with client:
+            client.put(f"/authorized-persons/{person_id}", json=self._body())
+            first = client.post(
+                f"/authorized-persons/{person_id}/faces",
+                files={"image": ("a.png", self._png(), "image/png")},
+            )
+            second = client.post(
+                f"/authorized-persons/{person_id}/faces",
+                files={"image": ("b.png", self._png(), "image/png")},
+            )
+        assert first.json()["reference_faces"] == 1
+        assert second.json()["reference_faces"] == 2
+
+    def test_enrolling_against_an_unknown_person_is_a_404(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        with client:
+            response = client.post(
+                f"/authorized-persons/{uuid4()}/faces",
+                files={"image": ("a.png", self._png(), "image/png")},
+            )
+        assert response.status_code == 404
+
+    def test_an_image_with_no_face_is_a_422_that_says_so(self, tmp_path: Path) -> None:
+        """An enrolment that silently stored nothing is how somebody becomes
+        unrecognisable with nobody able to say why."""
+        _, client = self.app(tmp_path, enroll_error=ValueError("no face was found in that image"))
+        person_id = uuid4()
+        with client:
+            client.put(f"/authorized-persons/{person_id}", json=self._body())
+            response = client.post(
+                f"/authorized-persons/{person_id}/faces",
+                files={"image": ("a.png", self._png(), "image/png")},
+            )
+        assert response.status_code == 422
+        assert "no face" in response.json()["detail"]
+
+    def test_deleting_removes_the_person_and_reports_204(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        person_id = uuid4()
+        with client:
+            client.put(f"/authorized-persons/{person_id}", json=self._body())
+            client.post(
+                f"/authorized-persons/{person_id}/faces",
+                files={"image": ("a.png", self._png(), "image/png")},
+            )
+            response = client.delete(f"/authorized-persons/{person_id}")
+            remaining = client.get("/authorized-persons").json()
+
+        assert response.status_code == 204
+        assert remaining["people"] == []
+        assert str(person_id) not in (tmp_path / "faces.json").read_text(encoding="utf-8")
+
+    def test_deleting_someone_who_was_never_there_is_a_404(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        with client:
+            assert client.delete(f"/authorized-persons/{uuid4()}").status_code == 404
+
+    def test_an_empty_camera_list_authorises_nowhere(self, tmp_path: Path) -> None:
+        """The opposite default would make forgetting to set it a silent grant
+        everywhere, which for an access rule is the failure worth designing against."""
+        _, client = self.app(tmp_path)
+        person_id = uuid4()
+        with client:
+            response = client.put(
+                f"/authorized-persons/{person_id}", json=self._body(camera_ids=[])
+            )
+        assert response.json()["camera_ids"] == []
+
+    def test_an_empty_display_name_is_rejected(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        with client:
+            response = client.put(
+                f"/authorized-persons/{uuid4()}", json=self._body(display_name="  ")
+            )
+        assert response.status_code == 422
+
+    def test_an_unknown_field_is_rejected_rather_than_ignored(self, tmp_path: Path) -> None:
+        _, client = self.app(tmp_path)
+        with client:
+            response = client.put(f"/authorized-persons/{uuid4()}", json=self._body(is_admin=True))
+        assert response.status_code == 422
+
+    def test_an_engine_without_the_capability_answers_503_not_404(self) -> None:
+        """A 404 would tell an operator the person does not exist, when the truth is
+        that nothing on this deployment does face recognition at all."""
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), face_store=None)
+        with TestClient(create_app(service)) as client:
+            assert client.get("/authorized-persons").json() == {"people": []}
+            assert (
+                client.put(f"/authorized-persons/{uuid4()}", json=self._body()).status_code == 503
+            )
+            assert client.delete(f"/authorized-persons/{uuid4()}").status_code == 503
+
+
+class TestAlertDurabilityContract:
+    """A 200 from acknowledge or resolve has to mean the decision reached the disk.
+
+    Telling an operator "acknowledged" and then showing the row as unseen after a
+    restart is worse than not having persistence at all: they stop trusting the list.
+    """
+
+    def app(self) -> tuple[_FakeEngineService, TestClient]:
+        register = AlertRegister()
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), alert_register=register)
+        register.absorb(
+            TestAlertRoutes._an_event(),
+            camera_label="Cam 1",
+            zone=None,
+            now=0.0,
+        )
+        return service, TestClient(create_app(service))
+
+    def _alert_id(self, client: TestClient) -> str:
+        return str(client.get("/alerts").json()["alerts"][0]["alert_id"])
+
+    def test_acknowledging_flushes_before_answering(self) -> None:
+        service, client = self.app()
+        with client:
+            response = client.post(
+                f"/alerts/{self._alert_id(client)}/acknowledge", json={"by": "night shift"}
+            )
+        assert response.status_code == 200
+        assert service.alert_flushes == 1
+
+    def test_resolving_flushes_before_answering(self) -> None:
+        service, client = self.app()
+        with client:
+            response = client.post(f"/alerts/{self._alert_id(client)}/resolve")
+        assert response.status_code == 200
+        assert service.alert_flushes == 1
+
+    def test_a_refused_acknowledgement_does_not_flush(self) -> None:
+        """Nothing changed, so there is nothing to write — and a write per rejected
+        request is a disk write per operator working from a stale list."""
+        service, client = self.app()
+        with client:
+            alert_id = self._alert_id(client)
+            client.post(f"/alerts/{alert_id}/resolve")
+            before = service.alert_flushes
+            refused = client.post(f"/alerts/{alert_id}/acknowledge", json={"by": "x"})
+        assert refused.status_code == 409
+        assert service.alert_flushes == before
+
+    def test_a_second_acknowledgement_keeps_the_first_operator_and_time(self) -> None:
+        """Two consoles watching one wall both acknowledge the same row. Last-write-wins
+        would push `acknowledged_at` later every time somebody looked, turning "when did
+        this stop being unseen" into "when did somebody last click"."""
+        _, client = self.app()
+        with client:
+            alert_id = self._alert_id(client)
+            first = client.post(f"/alerts/{alert_id}/acknowledge", json={"by": "first"}).json()
+            second = client.post(f"/alerts/{alert_id}/acknowledge", json={"by": "second"}).json()
+        assert second["acknowledged_by"] == "first"
+        assert second["acknowledged_at"] == first["acknowledged_at"]
+        assert second["state"] == "acknowledged"
+
+
+class TestAlertClip:
+    """`GET /alerts/{alert_id}/clip` — the only route that serves a recording."""
+
+    def app(self, clip: bytes | None) -> tuple[_FakeEngineService, str, TestClient]:
+        register = AlertRegister()
+        service = _FakeEngineService(cameras=(_telemetry("cam-1"),), alert_register=register)
+        service.clip_bytes = clip
+        alert = register.absorb(
+            TestAlertRoutes._an_event(), camera_label="Corridor 1", zone=Zone.CORRIDOR, now=0.0
+        )
+        assert alert is not None
+        return service, str(alert.alert_id), TestClient(create_app(service))
+
+    def test_serves_the_short_clip_by_default(self) -> None:
+        service, alert_id, client = self.app(b"short-clip-bytes")
+        with client:
+            response = client.get(f"/alerts/{alert_id}/clip")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "video/mp4"
+        assert response.content == b"short-clip-bytes"
+        # The default is the length somebody actually watches while triaging a wall of
+        # rows. An operator who wants the full recording has to ask for it.
+        assert service.clip_requests == [(UUID(alert_id), True)]
+
+    def test_serves_the_full_clip_when_asked(self) -> None:
+        service, alert_id, client = self.app(b"clip")
+        with client:
+            response = client.get(f"/alerts/{alert_id}/clip", params={"short": "false"})
+
+        assert response.status_code == 200
+        assert response.content == b"clip-full"
+        assert service.clip_requests == [(UUID(alert_id), False)]
+
+    def test_a_clip_that_is_gone_is_404_rather_than_500(self) -> None:
+        """Retention deletes clips on a schedule, so an alert outliving its recording is
+        ordinary. An operator must be told the footage has expired, not that the engine
+        is broken — those lead to completely different next actions."""
+        _, alert_id, client = self.app(None)
+        with client:
+            response = client.get(f"/alerts/{alert_id}/clip")
+
+        assert response.status_code == 404
+        assert "no clip" in response.json()["detail"]
+
+    def test_an_unknown_alert_is_404(self) -> None:
+        _, _, client = self.app(b"clip")
+        with client:
+            response = client.get(f"/alerts/{uuid4()}/clip")
+
+        assert response.status_code == 404
+
+    def test_the_clip_never_enters_a_shared_cache(self) -> None:
+        """Footage of people. It may sit in the viewer's own browser briefly, because a
+        clip never changes once written and re-fetching it on every render is waste —
+        but `private` keeps it out of every proxy between here and there."""
+        _, alert_id, client = self.app(b"clip")
+        with client:
+            response = client.get(f"/alerts/{alert_id}/clip")
+
+        cache_control = response.headers["cache-control"]
+        assert "private" in cache_control
+        assert "public" not in cache_control

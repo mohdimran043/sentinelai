@@ -10,7 +10,7 @@ import pytest
 
 from sentinel_ai.adapters.sources.file import FileSource
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
-from sentinel_ai.ports.frame_source import EncodedPacket
+from sentinel_ai.ports.frame_source import DeferredPixels, EncodedPacket
 
 ASSET = str(Path(__file__).resolve().parents[1] / "assets" / "synthetic_clip.mp4")
 ASSET_BFRAMES = str(Path(__file__).resolve().parents[1] / "assets" / "synthetic_clip_bframes.mp4")
@@ -31,7 +31,34 @@ async def test_decodes_every_frame_in_order() -> None:
     assert [f.frame_index for f in frames] == list(range(50))
     assert frames[0].width == 320
     assert frames[0].height == 240
-    assert isinstance(frames[0].pixels, np.ndarray)
+    # Through `pixel_array()`, because a real source hands out `DeferredPixels` —
+    # the dimensions above come from the decoder and must agree with the array that
+    # converting eventually produces, which is the invariant this asserts.
+    pixels = frames[0].pixel_array()
+    assert isinstance(pixels, np.ndarray)
+    assert pixels.shape == (240, 320, 3)
+    await source.close()
+
+
+async def test_pixels_are_not_converted_until_somebody_asks() -> None:
+    """The measured win: 1.51 -> 1.09 cores on a 1080p clip when nine frames in ten are
+    dropped before anybody reads them. A source that converted eagerly would spend a
+    third of its decode budget on frames the mailbox is about to overwrite."""
+    source = FileSource(ASSET, camera_id="cam-1", realtime=False)
+    frames = [f async for f in source]
+    assert all(isinstance(f.pixels, DeferredPixels) for f in frames)
+    assert not any(f.pixels.resolved for f in frames if isinstance(f.pixels, DeferredPixels))
+    await source.close()
+
+
+async def test_converting_twice_costs_once() -> None:
+    """A keyframe is read by the detector, then again by the VLM an escalation later."""
+    source = FileSource(ASSET, camera_id="cam-1", realtime=False)
+    frame = await anext(aiter(source))
+    first = frame.pixel_array()
+    assert isinstance(frame.pixels, DeferredPixels)
+    assert frame.pixels.resolved
+    assert frame.pixel_array() is first
     await source.close()
 
 

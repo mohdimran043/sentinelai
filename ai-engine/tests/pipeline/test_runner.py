@@ -12,8 +12,11 @@ import pytest
 
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.config import Settings
+from sentinel_ai.domain.behaviour.fall import FallPolicy
+from sentinel_ai.domain.behaviour.observation import PersonPose
 from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import BBox, Detection
+from sentinel_ai.domain.capabilities import DEFAULT_CAPABILITIES, CameraCapabilities
+from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, Track
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
@@ -22,9 +25,11 @@ from sentinel_ai.orchestrator.registry import ModelRegistry, ModelSpec
 from sentinel_ai.orchestrator.resident_set import ResidentSet
 from sentinel_ai.orchestrator.scheduler import EscalationRequest, VlmScheduler
 from sentinel_ai.pipeline import runner as runner_module
+from sentinel_ai.pipeline.behaviour import BehaviourEngine
 from sentinel_ai.pipeline.runner import CameraRunner
 from sentinel_ai.pipeline.stages.motion import MotionAnalyzer, MotionSignals
 from sentinel_ai.ports.frame_source import EncodedPacket, FrameData
+from sentinel_ai.ports.pose import PoseEstimator
 from tests.fakes.io import (
     FakeClipHandle,
     FakeClipWriter,
@@ -309,6 +314,9 @@ def make_runner(
     preroll: PreRollBuffer | None = None,
     detect_every_n_frames: int = 1,
     zone: Zone | None = None,
+    fall_policy: FallPolicy | None = None,
+    behaviour: BehaviourEngine | None = None,
+    pose: PoseEstimator | None = None,
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
     notify_min_confidence: Confidence = Confidence.LIKELY,
     clip_preroll_seconds: float | None = None,
@@ -328,6 +336,10 @@ def make_runner(
         preroll=preroll or PreRollBuffer(preroll_seconds=3.0),
         detect_every_n_frames=detect_every_n_frames,
         zone=zone,
+        # `fall_policy` is kept as a shorthand on this helper because most of these
+        # tests only care about falls; anything richer passes a whole engine.
+        behaviour=(behaviour if behaviour is not None else BehaviourEngine(fall=fall_policy)),
+        pose=pose,
         notify_on=notify_on,
         notify_min_confidence=notify_min_confidence,
         clip_preroll_seconds=clip_preroll_seconds,
@@ -341,6 +353,7 @@ def apply_policy(
     *,
     label: str = "Front Door",
     zone: Zone | None = None,
+    capabilities: CameraCapabilities = DEFAULT_CAPABILITIES,
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind),
     notify_min_confidence: Confidence = Confidence.LIKELY,
     clip_preroll_seconds: float | None = None,
@@ -353,6 +366,11 @@ def apply_policy(
     runner.apply_metadata(
         label=label,
         zone=zone,
+        capabilities=capabilities,
+        # Whatever this runner already has. In production `EngineService` resolves
+        # this from the capability set, but a test revising a label must not
+        # accidentally be a test that also detaches the detector.
+        detector=runner._detector,
         notify_on=notify_on,
         notify_min_confidence=notify_min_confidence,
         clip_preroll_seconds=clip_preroll_seconds,
@@ -502,8 +520,18 @@ class TestBackpressure:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The pipeline must never wait on the VLM. With no worker draining it, a
-        one-slot queue fills immediately and the second escalation is dropped, counted
-        and forgotten — the runner keeps going."""
+        one-slot queue fills immediately and something has to go — the runner keeps
+        going either way.
+
+        **Which** one goes is the queue's business and changed when it became
+        priority-ordered (§16): the first escalation here is a `periodic_summary` and
+        the second a `user_requested`, so the more urgent one now displaces the routine
+        one rather than being refused behind it. The camera's own
+        `escalations_dropped` therefore stays 0 — this camera's submission *was*
+        accepted — while the scheduler's global `dropped` records that a queued
+        escalation was evicted to make room. See `CameraTelemetry.escalations_dropped`
+        for why those two counters answer different questions.
+        """
         patch_postroll(monkeypatch, seconds=1.0)
         publisher = FakePublisher()
         scheduler = new_scheduler(publisher, maxsize=1)
@@ -517,9 +545,9 @@ class TestBackpressure:
         await runner.describe_now()
 
         telemetry = runner.telemetry()
-        assert telemetry.escalations == 1
-        assert telemetry.escalations_dropped == 1
-        assert scheduler.dropped == 1
+        assert telemetry.escalations == 2, "both were accepted by the queue"
+        assert telemetry.escalations_dropped == 0
+        assert scheduler.dropped == 1, "one queued escalation was evicted to make room"
 
 
 class TestDiscontinuity:
@@ -983,12 +1011,16 @@ class TestClipLifecycle:
             source=FakeSource.constant("cam-1", count=1, fps=10.0),
             detector=FakeDetector(script=[()]),
             scheduler=scheduler,
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),  # governors refuse
+            profile=CameraProfile(
+                camera_id="cam-1", auto_escalation_enabled=False
+            ),  # governors refuse
         )
 
         async with Worker(scheduler):
             await runner.run()
-            assert runner.telemetry().escalations == 0, "vlm_enabled=False suppresses everything"
+            assert runner.telemetry().escalations == 0, (
+                "auto_escalation_enabled=False suppresses everything"
+            )
 
             event_id = await runner.describe_now()
             await scheduler.drain()
@@ -1032,7 +1064,7 @@ class TestEstimatedClipFps:
         """25 fps in, 25.0 out — not the 10.0 default, and not a value derived from
         the runner's own clock.
 
-        `vlm_enabled=False` keeps the gate silent so the clip under test is the one
+        `auto_escalation_enabled=False` keeps the gate silent so the clip under test is the one
         `describe_now()` opens, by which point two real frame timestamps have been
         seen and a genuine interval is measurable.
         """
@@ -1045,7 +1077,7 @@ class TestEstimatedClipFps:
             detector=FakeDetector(script=[()]),
             scheduler=scheduler,
             clip_writer=writer,
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+            profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
         )
 
         async with Worker(scheduler):
@@ -1079,7 +1111,7 @@ class TestEstimatedClipFps:
             detector=FakeDetector(script=[()]),
             scheduler=scheduler,
             clip_writer=writer,
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+            profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
         )
 
         async with Worker(scheduler):
@@ -1112,7 +1144,7 @@ class TestEstimatedClipFps:
             detector=FakeDetector(script=[()]),
             scheduler=scheduler,
             clip_writer=writer,
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+            profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
         )
 
         async with Worker(scheduler):
@@ -1221,7 +1253,7 @@ class TestOneTimeBasePerCamera:
             source=alternating_source("cam-1", count=15, fps=10.0),
             detector=FakeDetector(script=[()]),
             scheduler=scheduler,
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+            profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
         )
 
         async with Worker(scheduler):
@@ -1254,7 +1286,7 @@ class TestOneTimeBasePerCamera:
         later escalation on that camera can record one either.
 
         `describe_now()` has to be called while the camera is still running, since a
-        post-roll needs live packets after it. `vlm_enabled=False` keeps the gate silent
+        post-roll needs live packets after it. `auto_escalation_enabled=False` keeps the gate silent
         so the clip under test is unambiguously the operator's. The pre-roll is
         deliberately tiny: the packet loop runs ahead of the frame loop, so a
         three-second buffer would flush packets past the deadline in at open time and
@@ -1271,7 +1303,7 @@ class TestOneTimeBasePerCamera:
             scheduler=scheduler,
             clip_writer=writer,
             preroll=PreRollBuffer(preroll_seconds=0.05),
-            profile=CameraProfile(camera_id="cam-1", vlm_enabled=False),
+            profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
         )
 
         async def until_five_frames_are_processed() -> None:
@@ -1905,3 +1937,157 @@ class TestTheWelfarePolicyOnTheEscalationRequest:
         assert len(scheduler.submitted) == 1
         assert scheduler.submitted[0].notify_on == frozenset()
         assert scheduler.submitted[0].zone is Zone.ROOM
+
+
+class TestFallDetectionInTheFrameLoop:
+    """§7 end to end: a fall in the frame stream becomes a published event.
+
+    The state machine's own behaviour is pinned exhaustively in
+    `tests/domain/behaviour/test_fall.py`. What these own is the *wiring* — that the
+    runner actually feeds it, that a completed signature reaches the scheduler with
+    the right reason, and that a camera which did not ask for it pays nothing. §40's
+    rule in test form: the capability has to be connected, not merely present.
+    """
+
+    @staticmethod
+    def _upright(cx: float = 100.0, cy: float = 100.0) -> BBox:
+        return BBox(x1=cx - 20.0, y1=cy - 50.0, x2=cx + 20.0, y2=cy + 50.0)
+
+    @staticmethod
+    def _fallen(cx: float = 100.0, cy: float = 160.0) -> BBox:
+        return BBox(x1=cx - 50.0, y1=cy - 20.0, x2=cx + 50.0, y2=cy + 20.0)
+
+    def _fall_script(self) -> tuple[list[FrameData], list[tuple[Detection, ...]]]:
+        """Stand for a second, drop, stay down past the settle window."""
+        timestamps = [round(0.2 * i, 3) for i in range(41)]
+        boxes = [self._upright() if t <= 1.0 else self._fallen() for t in timestamps]
+        frames = [
+            FakeSource.make_frame("cam-1", index, timestamp)
+            for index, timestamp in enumerate(timestamps)
+        ]
+        script: list[tuple[Detection, ...]] = [(Detection("person", 0.9, box),) for box in boxes]
+        return frames, script
+
+    async def test_a_fall_escalates_with_the_fall_reason(self) -> None:
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=FallPolicy(),
+                # Everything else silent, so the only escalation that can appear is
+                # the one under test.
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            await scheduler.drain()
+
+        reasons = [event.reason for event in publisher.events]
+        assert EscalationReason.FALL_SUSPECTED in reasons
+
+    async def test_the_escalation_detail_carries_the_hedged_summary(self) -> None:
+        """What the operator and the VLM both read. §7 forbids claiming certainty."""
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=FallPolicy(),
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            await scheduler.drain()
+
+        fall = next(e for e in publisher.events if e.reason is EscalationReason.FALL_SUSPECTED)
+        assert "appears to have fallen" in fall.description.lower() or fall.description
+
+    async def test_one_fall_produces_one_escalation_not_one_per_frame(self) -> None:
+        """Thirty frames of an unchanged body on the floor. The machine reports once
+        per episode, so the alert engine is never the thing under load."""
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=FallPolicy(),
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            await scheduler.drain()
+
+        falls = [e for e in publisher.events if e.reason is EscalationReason.FALL_SUSPECTED]
+        assert len(falls) == 1
+
+    async def test_the_telemetry_counts_it(self) -> None:
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=FallPolicy(),
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            assert runner.telemetry().falls_suspected == 1
+
+    async def test_a_camera_without_the_capability_never_raises_one(self) -> None:
+        """`fall_policy=None` is how `compose` expresses "this camera did not ask".
+        The same footage must then produce nothing — otherwise the capability toggle
+        is decoration."""
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=None,
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            await scheduler.drain()
+
+        assert publisher.events == []
+        assert runner.telemetry().falls_suspected == 0
+
+    async def test_a_pose_model_that_raises_degrades_to_geometry(self) -> None:
+        """An optional model's failure must cost the reading's quality, never the
+        camera. Raising here would take a pipeline down over an enhancement that has
+        a working fallback."""
+
+        class BrokenPose(PoseEstimator):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def estimate(
+                self, frame: FrameData, tracks: tuple[Track, ...]
+            ) -> dict[int, PersonPose]:
+                self.calls += 1
+                raise RuntimeError("cuda is on fire")
+
+        pose = BrokenPose()
+        frames, script = self._fall_script()
+        publisher = FakePublisher()
+        async with Worker(new_scheduler(publisher)) as scheduler:
+            runner = make_runner(
+                source=FakeSource(frames),
+                detector=FakeDetector(script),
+                scheduler=scheduler,
+                fall_policy=FallPolicy(),
+                pose=pose,
+                profile=CameraProfile(camera_id="cam-1", auto_escalation_enabled=False),
+            )
+            await runner.run()
+            await scheduler.drain()
+
+        assert pose.calls > 0, "the pose model was actually consulted"
+        falls = [e for e in publisher.events if e.reason is EscalationReason.FALL_SUSPECTED]
+        assert len(falls) == 1, "the fall was still found, on geometry alone"

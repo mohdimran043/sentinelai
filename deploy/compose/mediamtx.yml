@@ -8,6 +8,21 @@
 # `source: publisher` means mediamtx waits to be pushed to. Anything else is pulled by
 # mediamtx itself on demand.
 
+# HLS muxers stay up instead of being built on first request.
+#
+# Without this, mediamtx tears a muxer down after its readers leave and rebuilds it on
+# the next request — and the request that triggers the rebuild gets a 404. The console's
+# player retries on a backoff and recovers within about two seconds
+# (`web/src/live/manifestProbe.ts`), so this is a cosmetic fault rather than a broken
+# stream, but "cosmetic" here means every operator opening a camera page sees "no stream
+# answers right now" first and the video second.
+#
+# The cost is real and worth stating: a remuxer runs for every path with a publisher,
+# whether or not anybody is watching. That is cheap — remuxing is a container rewrite,
+# not a transcode (ADR 3's reasoning, in a different component) — but it is not free, and
+# a deployment with many cameras and few viewers may prefer the default.
+hlsAlwaysRemux: yes
+
 paths:
 
   # --- looped local footage -------------------------------------------------------

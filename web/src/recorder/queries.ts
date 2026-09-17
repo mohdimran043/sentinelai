@@ -10,9 +10,7 @@ import {
   getRecorderCapabilities,
   getRecorderJournal,
   getRecorderJournalDay,
-  getRecorderMask,
   getRecorderModels,
-  getRecorderNotifications,
   getRecorderReport,
   getRecorderSettings,
   getRecorderStatus,
@@ -28,9 +26,7 @@ import type {
   RecorderCoverageReport,
   RecorderJournalDayResponse,
   RecorderJournalResponse,
-  RecorderMaskResponse,
   RecorderModelsResponse,
-  RecorderNotificationsResponse,
   RecorderSettingsResponse,
   RecorderStatusResponse,
   RecorderUntrackedResponse,
@@ -105,14 +101,6 @@ export function useRecorderCapabilities(): UseQueryResult<RecorderCapabilitiesRe
   })
 }
 
-export function useRecorderNotifications(): UseQueryResult<RecorderNotificationsResponse, Error> {
-  return useQuery({
-    queryKey: ['recorder', 'notifications'],
-    queryFn: getRecorderNotifications,
-    retry: 1,
-  })
-}
-
 export function useRecorderSettings(): UseQueryResult<RecorderSettingsResponse, Error> {
   return useQuery({
     queryKey: ['recorder', 'settings'],
@@ -170,18 +158,6 @@ export function useRecorderReport(
     queryKey: ['recorder', 'report', cameraId, date],
     queryFn: () => getRecorderReport(cameraId as string, date as string),
     enabled: cameraId !== undefined && date !== undefined,
-    retry: 1,
-  })
-}
-
-/** The mask editor's state for one camera. Undefined `cameraId` means "no camera picked yet". */
-export function useRecorderMask(
-  cameraId: string | undefined,
-): UseQueryResult<RecorderMaskResponse, Error> {
-  return useQuery({
-    queryKey: ['recorder', 'masks', cameraId],
-    queryFn: () => getRecorderMask(cameraId as string),
-    enabled: cameraId !== undefined,
     retry: 1,
   })
 }

@@ -44,7 +44,13 @@
         "speed_anomaly",
         "track_count_spike",
         "periodic_summary",
-        "user_requested"
+        "user_requested",
+        "fall_suspected",
+        "abandoned_object",
+        "camera_tamper",
+        "zone_intrusion",
+        "line_crossing",
+        "unauthorized_person"
       ]
     },
     "threat_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
@@ -55,7 +61,16 @@
     "description": { "type": "string" },
     "suggested_action": { "type": "string" },
     "labels": { "type": "array", "items": { "type": "string" } },
-    "track_ids": { "type": "array", "items": { "type": "integer" } },
+    "track_ids": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "Every salient track in view when this was captured — the scene, not the subject. Context and search material; not an identification of who the event is about, because on a busy camera it is most of the frame and it changes every frame."
+    },
+    "subject_track_ids": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "Who this event is *about*, when that is knowable — the tracks a behaviour detector attributed it to. Absent for the six automatic triggers, which describe a scene rather than a subject, and for camera-level findings like tampering that have nobody to attribute. Absent and `[]` mean the same thing. Consumers grouping events into incidents must use this and not `track_ids`: keying on the scene's tracks produces a different group on every frame."
+    },
     "keyframe_uri": { "type": ["string", "null"] },
     "clip_uri": { "type": ["string", "null"] },
     "description_unavailable": { "type": "boolean" },
@@ -99,8 +114,8 @@
         },
         "basis": {
           "type": "string",
-          "const": "single_frame_vlm",
-          "description": "Always this value today. A constant, not a free-form string, so a consumer can trust where the opinion came from without a side channel; a future second source gets its own basis value rather than silently widening what this one means."
+          "enum": ["single_frame_vlm", "temporal_pose_vlm"],
+          "description": "Where this welfare opinion came from, so a consumer can weigh it without a side channel or any tribal knowledge of which pipeline produced it. `single_frame_vlm` is a vision-language model's reading of one still frame and nothing else. `temporal_pose_vlm` is that same reading corroborated by a multi-second geometry state machine that watched a person go from upright, through a rapid descent, to horizontal, and stay down (spec \u00a77) — strictly more evidence than the first, and a second value rather than a widening of it precisely so that every opinion already stored under `single_frame_vlm` keeps meaning exactly what it meant when it was written. This was a `const` of `single_frame_vlm` until a second source existed; a consumer that hard-coded that value will now reject a `temporal_pose_vlm` payload, and that is the correct failure — it is being handed evidence of a kind it has no handling for."
         }
       }
     }

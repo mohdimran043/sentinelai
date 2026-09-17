@@ -29,12 +29,20 @@ from sentinel_ai.adapters.notifiers.logging import LoggingNotifier
 from sentinel_ai.adapters.notifiers.webhook import WebhookNotifier
 from sentinel_ai.adapters.publishers.rabbitmq import RabbitMQPublisher
 from sentinel_ai.adapters.serialization.event_codec import validate_payload
+from sentinel_ai.adapters.sources.earthcam_source import EarthCamSource
 from sentinel_ai.adapters.sources.file import FileSource
 from sentinel_ai.adapters.sources.rtsp import RtspSource
 from sentinel_ai.adapters.vision.qwen25vl import Qwen25VLDescriber
 from sentinel_ai.api.routes import EngineServiceProtocol
 from sentinel_ai.config import NotifierKind, Settings
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.capabilities import (
+    DEFAULT_CAPABILITIES,
+    CameraCapabilities,
+    Capability,
+    ModelRole,
+    required_roles,
+)
 from sentinel_ai.domain.entities import BBox, Detection, EscalationReason, Event, ThreatScore
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
@@ -85,13 +93,57 @@ def write_cameras(tmp_path: Path, document: object) -> Path:
     return path
 
 
+def _example_cameras() -> list[CameraConfig]:
+    return list(load_cameras(Path(__file__).resolve().parents[1] / "cameras.example.json"))
+
+
 def test_settings_default_camera_file_and_the_example_file_agree() -> None:
     """The shipped example must be loadable by the shipped default reader — a sample
     config that the loader rejects is worse than none."""
-    example = Path(__file__).resolve().parents[1] / "cameras.example.json"
-    cameras = load_cameras(example)
-    assert [camera.camera_id for camera in cameras] == ["avenue_01", "demo_live", "replay_01"]
-    assert cameras[2].profile.cooldown_seconds == 5.0
+    cameras = _example_cameras()
+    assert [camera.camera_id for camera in cameras] == [
+        "avenue_01",
+        "demo_live",
+        "dayroom_01",
+        "replay_01",
+    ]
+    assert cameras[3].profile.cooldown_seconds == 5.0
+
+
+def test_the_example_demonstrates_every_behaviour_policy_it_documents() -> None:
+    """The example's own comment says it shows the *shape* of the policy objects. A
+    policy the loader silently ignored would make that comment a lie, and the shape is
+    the only thing somebody copying this file is copying."""
+    by_id = {camera.camera_id: camera for camera in _example_cameras()}
+
+    zone_policy = by_id["avenue_01"].zone_policy
+    assert zone_policy is not None
+    assert [zone.name for zone in zone_policy.zones] == ["stairwell"]
+    assert [line.name for line in zone_policy.lines] == ["atrium threshold"]
+    # Fractions of the frame, never pixels — the property the comment claims and the
+    # one that survives a camera renegotiating its resolution mid-stream.
+    assert all(0.0 <= value <= 1.0 for point in zone_policy.zones[0].polygon for value in point)
+
+    dayroom = by_id["dayroom_01"]
+    assert dayroom.fall_policy is not None
+    assert dayroom.fall_policy.min_descent_rate == 1.2
+    assert dayroom.abandonment_policy is not None
+    assert dayroom.abandonment_policy.attend_radius == 1.5
+
+
+def test_the_example_does_not_quietly_enable_biometrics() -> None:
+    """Enabling `person_authorization` anywhere makes an encryption key mandatory and
+    starts comparing faces. Copying an example config must not make that decision for
+    somebody, and the file says so in its own comment — this is the assertion behind it."""
+    for camera in _example_cameras():
+        assert not camera.capabilities.enabled(Capability.PERSON_AUTHORIZATION)
+    roles: set[ModelRole] = set()
+    for camera in _example_cameras():
+        roles |= required_roles(camera.capabilities)
+    assert ModelRole.FACE not in roles
+    # And the converse, so this does not pass by the capability having been renamed:
+    # the example *does* ask for a pose model, because one camera enables falls.
+    assert ModelRole.POSE in roles
 
 
 class TestCameraConfig:
@@ -257,8 +309,43 @@ class TestSourceSelection:
                 "url": url,
                 "reconnect_initial_seconds": 2.0,
                 "reconnect_max_seconds": 45.0,
+                # Passed through from `SENTINEL_DECODE_HWACCEL`, and `None` here is the
+                # default the performance measurements were taken under. Asserted rather
+                # than ignored: a source built without it would silently software-decode
+                # on a deployment that had asked for hardware.
+                "hwaccel_device": None,
+                # 0 is "every frame", which is what this did before the cap existed.
+                # Asserted rather than ignored: a source built without it would quietly
+                # ignore `SENTINEL_SOURCE_MAX_FPS` on the deployment that set it.
+                "max_fps": 0.0,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_an_earthcam_page_builds_an_earthcam_source(self) -> None:
+        """Before the scheme check, deliberately. An EarthCam camera is configured as the
+        https:// page a person would open in a browser, which would otherwise fall
+        through to `FileSource` and be opened as a path that does not exist.
+
+        Async because the source starts its reconnect task in `__init__`, exactly as
+        `RtspSource` does — `build_source`'s docstring says it needs a running loop.
+        """
+        config = CameraConfig(
+            "linkou",
+            "Linkou",
+            "https://www.earthcam.com/world/taiwan/newtaipeicity/linkoudistrict/",
+            _profile("linkou"),
+        )
+        source = build_source(config, Settings())
+        try:
+            assert isinstance(source, EarthCamSource)
+        finally:
+            await source.close()
+
+    def test_an_ordinary_https_url_is_still_a_file_path(self) -> None:
+        """The EarthCam branch must not swallow every https:// URL — only earthcam.com."""
+        config = CameraConfig("cam-1", "Cam 1", "https://example.com/clip.mp4", _profile("cam-1"))
+        assert isinstance(build_source(config, Settings(source_realtime=False)), FileSource)
 
     def test_anything_else_is_taken_as_a_file_path(self) -> None:
         config = CameraConfig("cam-1", "Cam 1", str(ASSET), _profile("cam-1"))
@@ -571,6 +658,155 @@ class StubbornBrokerLink(BrokerLink):
         self._release.set()
 
 
+class TestCapabilityDrivenModelLoading:
+    """§13: a capability nobody enabled must not cause a model to be built.
+
+    These assert against `build_models` itself rather than against a composed engine,
+    because the property is about what is *constructed* — a test that only checked
+    behaviour would pass just as happily against a process that loaded a 2.7 GiB VLM
+    and then never called it, which is the exact outcome §13 exists to prevent.
+    """
+
+    def test_triggers_only_cameras_never_build_a_vlm(self) -> None:
+        roles = required_roles(CameraCapabilities.of(Capability.ANOMALY_DETECTION))
+        models = main.build_models(Settings(device="cpu"), roles)
+        assert models.vlm is None
+        assert models.vlm_key is None
+        assert models.detector is not None
+
+    def test_a_vlm_that_was_not_built_is_absent_from_the_registry_and_health(self) -> None:
+        """Not merely unused — unregistered.
+
+        A model in the registry is a model `ResidentSet` will keep resident and
+        `/health` will report, so leaving one there "harmlessly" would still cost the
+        VRAM and would still tell an operator the engine is running something it is
+        not.
+        """
+        roles = required_roles(CameraCapabilities.of(Capability.ANOMALY_DETECTION))
+        models = main.build_models(Settings(device="cpu"), roles)
+        assert [spec.model_key for spec in models.registry.specs()] == [
+            Settings().detector_model_id
+        ]
+        assert Settings().vlm_model_id not in models.registry.health()
+
+    def test_scene_description_builds_both_roles(self) -> None:
+        roles = required_roles(CameraCapabilities.of(Capability.SCENE_DESCRIPTION))
+        models = main.build_models(Settings(device="cpu"), roles)
+        assert models.vlm is not None
+        assert models.detector is not None
+
+    def test_no_capabilities_anywhere_builds_nothing_at_all(self) -> None:
+        models = main.build_models(Settings(device="cpu"), required_roles())
+        assert models.detector is None
+        assert models.vlm is None
+        assert models.registry.specs() == ()
+
+    def test_required_keys_omits_the_roles_that_were_not_built(self) -> None:
+        """`EngineService` makes these resident at startup; a `None` among them would
+        ask the registry for a model nobody registered and fail a legal configuration
+        at boot."""
+        roles = required_roles(CameraCapabilities.of(Capability.ANOMALY_DETECTION))
+        models = main.build_models(Settings(device="cpu"), roles)
+        assert models.required_keys() == (Settings().detector_model_id,)
+        assert main.build_models(Settings(device="cpu"), required_roles()).required_keys() == ()
+
+
+class TestCapabilitiesReachTheRunningCamera:
+    def test_capabilities_survive_composition_and_reach_the_api(self, tmp_path: Path) -> None:
+        """The zone argument, for capabilities: a value that stops at `CameraConfig`
+        configures nothing an operator can see. `GET /cameras` is built from
+        `CameraRunner.telemetry()`, so the set has to travel the whole way."""
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+        )
+        triggers_only = CameraCapabilities.of(Capability.ANOMALY_DETECTION)
+        cameras = (
+            CameraConfig("cam-1", "One", str(ASSET), _profile("cam-1")),
+            CameraConfig("cam-2", "Two", str(ASSET), _profile("cam-2"), capabilities=triggers_only),
+        )
+        composition = compose(
+            settings,
+            cameras,
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        by_id = {t.camera_id: t for t in composition.service.cameras()}
+        assert by_id["cam-1"].capabilities == DEFAULT_CAPABILITIES
+        assert by_id["cam-2"].capabilities == triggers_only
+
+    def test_anomaly_detection_off_disables_the_gate_for_that_camera_only(
+        self, tmp_path: Path
+    ) -> None:
+        """`auto_escalation_enabled` is derived, never stored twice.
+
+        The gate is pure and knows nothing about capabilities, so the derivation has
+        to happen in the composition root — and if it does not happen, a camera an
+        operator switched off keeps escalating.
+        """
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+        )
+        cameras = (
+            CameraConfig("on", "On", str(ASSET), _profile("on")),
+            CameraConfig(
+                "off",
+                "Off",
+                str(ASSET),
+                _profile("off"),
+                capabilities=CameraCapabilities.of(Capability.SCENE_DESCRIPTION),
+            ),
+        )
+        composition = compose(
+            settings,
+            cameras,
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        runners = composition.service._cameras
+        assert runners["on"]._profile.auto_escalation_enabled is True
+        assert runners["off"]._profile.auto_escalation_enabled is False
+
+    def test_a_camera_with_no_capabilities_gets_no_detector(self, tmp_path: Path) -> None:
+        """Per camera, not per process. The shared detector exists because `cam-1`
+        needs one; handing it to `cam-2` as well would make a camera an operator
+        switched off pay for a forward pass per frame to produce detections nothing
+        reads."""
+        settings = Settings(
+            source_realtime=False,
+            event_spool_dir=str(tmp_path / "spool"),
+            clip_temp_dir=str(tmp_path / "clips"),
+        )
+        cameras = (
+            CameraConfig("cam-1", "One", str(ASSET), _profile("cam-1")),
+            CameraConfig(
+                "cam-2",
+                "Two",
+                str(ASSET),
+                _profile("cam-2"),
+                capabilities=CameraCapabilities.none(),
+            ),
+        )
+        composition = compose(
+            settings,
+            cameras,
+            fake_models(),
+            main.build_publisher(settings),
+            None,
+            main.build_dead_letter(settings),
+        )
+        runners = composition.service._cameras
+        assert runners["cam-1"]._detector is not None
+        assert runners["cam-2"]._detector is None
+
+
 class TestCompose:
     def test_every_configured_camera_becomes_a_runner(self, tmp_path: Path) -> None:
         composition, _ = composed(tmp_path)
@@ -711,6 +947,7 @@ class TestCompose:
                 "cam-1",
                 label="Camera One",
                 zone=None,
+                capabilities=DEFAULT_CAPABILITIES,
                 notify_on=frozenset(ConcernKind),
                 notify_min_confidence=Confidence.LIKELY,
                 clip_preroll_seconds=clip_preroll_seconds,

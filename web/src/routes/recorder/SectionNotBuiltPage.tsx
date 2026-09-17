@@ -2,7 +2,7 @@ import { Navigate, useParams } from 'react-router-dom'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Absent } from '@/components/ui/Absent'
 import { Pill } from '@/components/ui/Pill'
-import { findRecorderSection } from '@/routes/recorder/sections'
+import { RECORDER_LANDING_PATH, findRecorderSection } from '@/routes/recorder/sections'
 
 /**
  * The screen behind a recorder section this console has not built yet.
@@ -17,10 +17,16 @@ export function SectionNotBuiltPage() {
   const { section: sectionPath } = useParams()
   const section = sectionPath === undefined ? undefined : findRecorderSection(sectionPath)
 
-  // A section this console has never heard of. Send the operator somewhere real
-  // rather than rendering an empty frame. Sections that ARE built never reach
-  // this component: React Router ranks their static route above `:section`.
-  if (section === undefined) return <Navigate to="/recorder/alerts" replace />
+  // A section this console has never heard of — a stale bookmark, or one of the
+  // sections that has since been removed. Send the operator somewhere real rather
+  // than rendering an empty frame. Sections that ARE built never reach this
+  // component: React Router ranks their static route above `:section`.
+  //
+  // The target must be a section that still exists, and it is the same one
+  // `/recorder` itself redirects to. Pointing at a removed section instead — this
+  // said `/recorder/alerts` until the engine's alert queue superseded it — sends
+  // the operator to a URL that lands back here and redirects again, forever.
+  if (section === undefined) return <Navigate to={`/recorder/${RECORDER_LANDING_PATH}`} replace />
 
   return (
     <>

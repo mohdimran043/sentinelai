@@ -14,7 +14,20 @@ dependencies = [
 [project.optional-dependencies]
 runtime = [
     "fastapi>=0.115",
+    # Required by the face-enrolment endpoint, which takes a photograph as multipart
+    # form data. FastAPI raises at *route-registration* time without it, not on first
+    # request, so a missing pin here takes the whole app down rather than one endpoint.
+    "python-multipart>=0.0.9",
+    # `POST /authorized-persons/{id}/faces` decodes the uploaded photograph with it.
+    # Already present transitively via insightface; pinned because this engine now
+    # imports it directly and a transitive dependency is not a promise.
+    "pillow>=10.0",
     "uvicorn[standard]>=0.31",
+    # The EarthCam resolver (`adapters/sources/earthcam.py`) fetches a public camera
+    # page and the playlist it points at, in one session so the page's cookies reach the
+    # media requests. Runtime, not dev: a camera configured as a page URL cannot start
+    # without it.
+    "httpx>=0.27",
     "av>=13.0",
     "numpy>=1.26,<2.2",
     "aio-pika>=9.4",
@@ -33,6 +46,30 @@ gpu = [
     "accelerate>=1.0",
     "bitsandbytes>=0.43",
     "qwen-vl-utils>=0.0.8",
+]
+# The face pipeline (spec §8-§12), separate from `gpu` because it is a different
+# runtime and a different decision. InsightFace runs under ONNX Runtime rather than
+# torch, and person authorization is the one capability that is about people rather
+# than compute — a site that never enables it should not be made to install it.
+face = [
+    "insightface>=0.7",
+    "onnxruntime>=1.19",
+]
+# Swaps the CPU-only ONNX Runtime above for the CUDA build. Measured on an RTX 4090:
+# one 1080p frame holding six faces takes 15 ms with this installed and 125 ms without,
+# so a site running face cameras at any real frame rate needs it. Separate because it
+# is the one dependency here that will not install on a box with no NVIDIA driver.
+face-gpu = [
+    "insightface>=0.7",
+    "onnxruntime-gpu>=1.19",
+]
+# Reproducing the accuracy numbers, not running the engine. `sentinel_ai/validation/`
+# scores the fall machine against URFall and the face pipeline against LFW and FairFace;
+# these are the readers for those datasets and nothing else imports them.
+validation = [
+    "datasets>=2.20",
+    "pyarrow>=15.0",
+    "pillow>=10.0",
 ]
 dev = [
     "pytest>=8.3",
@@ -85,6 +122,19 @@ files = ["sentinel_ai", "tests"]
 [[tool.mypy.overrides]]
 module = [
     "torch.*",
+    # Pillow ships no py.typed marker. It arrived transitively (insightface depends on
+    # it) and `qwen25vl.py` has always imported it lazily inside a method; it only
+    # became visible to mypy once something installed it into this environment.
+    "PIL.*",
+    # insightface and onnxruntime are the face pipeline (spec §8-§12) and neither
+    # ships types. Same treatment as every other untyped model library here.
+    "insightface.*",
+    "onnxruntime.*",
+    # The validation harness's two dataset readers (`sentinel_ai/validation/`). Neither
+    # is a runtime dependency — they are how the accuracy numbers in docs/performance.md
+    # are reproduced — and neither ships types.
+    "datasets.*",
+    "pyarrow.*",
     "supervision.*",
     "av.*",
     "bitsandbytes.*",
@@ -126,8 +176,22 @@ testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA GPU and downloaded model weights (deselect with -m 'not gpu')",
     "integration: requires docker-compose core services running",
+    "network: reaches a third-party public site (deselect with -m 'not network')",
 ]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Narrow, third-party-only exemption. starlette 1.6's `testclient` module
+    # imports `anyio.abc.BlockingPortal` at module scope, and anyio 4.15
+    # deprecated that alias. It fires at *collection* time, inside a dependency
+    # we do not call directly, so no amount of care in this tree can avoid it and
+    # `error` turns it into an uncollectable test module. Matched by message and
+    # by its exact message, not by category alone, so it cannot mask any other
+    # DeprecationWarning this suite is meant to fail on. (No module qualifier:
+    # the warning's stacklevel attributes it to whichever module touched the
+    # alias, which is starlette here and could be another dependency tomorrow —
+    # pinning the module would make the ignore silently stop applying.)
+    "ignore:The anyio\\.abc\\.BlockingPortal alias is deprecated:DeprecationWarning",
+]
 # Here rather than as a `-W error` flag on the command line, because a flag is only
 # enforced by whoever remembers to type it. This is the policy that justifies the
 # `httpx2` dependency and the `supervision>=0.24,<0.28` pin, both of which exist

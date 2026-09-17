@@ -16,6 +16,11 @@ from sentinel_ai.adapters.config.camera_file import (
     CameraConfig,
     CameraEdit,
 )
+from sentinel_ai.domain.alert import Alert, AlertState
+from sentinel_ai.domain.capabilities import CameraCapabilities, Capability
+from sentinel_ai.domain.entities import EscalationReason, Severity
+from sentinel_ai.domain.identity import PersonStatus
+from sentinel_ai.domain.policy.priority import EventPriority
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.domain.zone import Zone, ZoneKind
 from sentinel_ai.orchestrator.event_history import CameraEventHistory, RecentEvent
@@ -86,13 +91,60 @@ class CameraStatus(BaseModel):
             "see what the engine is actually using."
         )
     )
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the engine is watching this camera at all. `false` is a camera an "
+            "operator deliberately stopped: the record is still in `cameras.json`, it "
+            "still has a label, a zone and a capability set, and no source connection "
+            "is open. Distinct from a camera with no capabilities, which still pulls "
+            "and decodes every frame. **The counters on a disabled camera are frozen "
+            "at the moment it was stopped, not zeroed** — except after a restart, when "
+            "they are genuinely zero because nothing has been watched this run."
+        ),
+    )
     frames_seen: int
     frames_dropped: int
     detections_run: int
     escalations: int
     escalations_dropped: int
     discontinuities: int
-    last_frame_at: float | None
+    falls_suspected: int = Field(
+        default=0,
+        description=(
+            "How many fall signatures have completed on this camera since the engine "
+            "started. Always 0 on a camera without the `fall_detection` capability, "
+            "and 0 is not the same claim as absent — it means the machine ran and saw "
+            "nothing. Cumulative and monotonic within one process run; it resets on "
+            "restart, like every other counter here. **Not a count of falls**: it is a "
+            "count of times a geometry state machine's signature completed and a "
+            "vision-language model was asked to confirm. See the camera's events for "
+            "what the model then said."
+        ),
+    )
+    last_frame_at: float | None = Field(
+        description=(
+            "When the last frame arrived, on **this camera's own source timeline** — "
+            "`time.monotonic()` for a live RTSP camera, seconds-from-start-of-file for "
+            "a replayed one. It is what correlates telemetry with a clip's pts, and it "
+            "is **not** a wall-clock time: it resets on restart and two cameras do not "
+            "share an origin. Never render it as an age — use `last_frame_epoch`."
+        )
+    )
+    last_frame_epoch: float | None = Field(
+        default=None,
+        description=(
+            "When this camera was last **observed** to have delivered a frame, in Unix "
+            "epoch seconds. This is the field a liveness indicator reads.\n\n"
+            "Separate from `last_frame_at` because that one cannot answer the question: "
+            "reading a source timeline as an epoch put every camera at '20712d ago' and "
+            "reported '0 of 3 delivering' while all three were. Observational — it is "
+            "stamped when a read notices the source timeline has advanced — so it is as "
+            "fresh as the last time somebody asked, which for a polling console is "
+            "every few seconds. Null when this camera has not been seen to deliver "
+            "anything yet."
+        ),
+    )
     last_escalation_at: float | None
     zone: Zone | None = Field(
         default=None,
@@ -108,6 +160,18 @@ class CameraStatus(BaseModel):
             "The coarse grouping `zone` falls into, derived from it and never stored "
             "separately, so the two cannot disagree. Null exactly when `zone` is null."
         ),
+    )
+    capabilities: list[Capability] = Field(
+        description=(
+            "Which AI capabilities are running on this camera, as the engine has them "
+            "— always the full list, never a diff, and sorted so two reads of the same "
+            "record compare equal. `[]` is a stored choice, not an unset field: the "
+            "camera is watched and decoded, and nothing is run on it. **Render this as "
+            "what the engine is doing, not as what the file asked for** — it is read "
+            "back off the running camera, which is what makes a capability checkbox "
+            "honest rather than decorative. A capability absent here is one no model "
+            "was loaded for."
+        )
     )
     notify_on: list[ConcernKind] = Field(
         description=(
@@ -145,9 +209,15 @@ class CameraStatus(BaseModel):
     )
 
     @classmethod
-    def from_telemetry(cls, telemetry: CameraTelemetry) -> CameraStatus:
+    def from_telemetry(
+        cls, telemetry: CameraTelemetry, *, last_frame_epoch: float | None = None
+    ) -> CameraStatus:
         return cls(
+            last_frame_epoch=last_frame_epoch,
             label=telemetry.label,
+            enabled=telemetry.enabled,
+            capabilities=[Capability(name) for name in telemetry.capabilities.names()],
+            falls_suspected=telemetry.falls_suspected,
             zone=telemetry.zone,
             # Derived here rather than carried, so no configuration can make the fine
             # and coarse groupings contradict each other on the wire.
@@ -197,6 +267,12 @@ _NULL_IS_NOT_AN_INSTRUCTION: Final = {
         "'label' must be a non-empty string; omit the field to leave the label "
         "unchanged. A camera always has a label — an unset one falls back to its id "
         "at load, which is not the same as no label."
+    ),
+    "capabilities": (
+        "'capabilities' must be an array of capability names; send [] to run nothing "
+        "on this camera, or omit the field to leave it unchanged. Null would have to "
+        "mean one of those two, and guessing which is how a camera someone switched "
+        "off starts running models again."
     ),
     "notify_on": (
         "'notify_on' must be an array of concern kinds; send [] to stop this camera "
@@ -258,6 +334,26 @@ class CameraEditRequest(BaseModel):
             "remove it. A value outside the enum is a 422 — the same fail-loud "
             "`load_cameras` applies at startup, because a typo'd zone is a camera "
             "the operator meant to group and silently did not."
+        ),
+    )
+    capabilities: list[Capability] | None = Field(
+        default=None,
+        description=(
+            "Which AI capabilities run on this camera, replacing whatever is "
+            "configured now — a whole new list, not an addition to the old one. "
+            "**`[]` means run nothing on this camera**, which is a real instruction "
+            "and not an empty edit: the camera stays watched and decoded, and no "
+            "model is run against it. Omit the field to leave the capabilities alone; "
+            "`null` is rejected, because `[]` already says the only thing it could "
+            "mean.\n\n"
+            "**A capability can only be enabled if this process already loaded the "
+            "model it needs.** Which models exist is decided once, at startup, from "
+            "the union over every configured camera (see `GET /cameras`), because "
+            "loading a 3B vision model is a multi-second download-and-place that "
+            "cannot happen under an HTTP request without stalling every camera "
+            "sharing the GPU. Enabling one whose model is absent is a 409 naming the "
+            "restart, never a 200 that quietly did nothing — the same fail-loud this "
+            "endpoint applies to `url`. Disabling is always allowed."
         ),
     )
     notify_on: list[ConcernKind] | None = Field(
@@ -359,6 +455,11 @@ class CameraEditRequest(BaseModel):
         return CameraEdit(
             label=self.label if "label" in mentioned and self.label is not None else UNSET,
             zone=self.zone if "zone" in mentioned else UNSET,
+            capabilities=(
+                CameraCapabilities.of(*self.capabilities)
+                if "capabilities" in mentioned and self.capabilities is not None
+                else UNSET
+            ),
             notify_on=(
                 frozenset(self.notify_on)
                 if "notify_on" in mentioned and self.notify_on is not None
@@ -393,6 +494,14 @@ class CameraEditResponse(BaseModel):
     zone: Zone | None = Field(description="The stored zone, or null when the camera is ungrouped.")
     zone_kind: ZoneKind | None = Field(
         description="Derived from `zone`, exactly as on `CameraStatus`. Null when `zone` is."
+    )
+    capabilities: list[Capability] = Field(
+        description=(
+            "The capabilities now stored for this camera, sorted — always the full "
+            "list, never a diff. `[]` means nothing runs on this camera. Identical in "
+            "meaning to `CameraStatus.capabilities`, so a console can compare what it "
+            "wrote against what it later reads there."
+        )
     )
     notify_on: list[ConcernKind] = Field(
         description=(
@@ -458,12 +567,435 @@ class CameraEditResponse(BaseModel):
             # Sorted for the same reason the file's copy is: `notify_on` is a
             # frozenset, whose iteration order varies with the process's hash seed,
             # and a console diffing two reads should not see a change that is not one.
+            capabilities=[Capability(name) for name in config.capabilities.names()],
             notify_on=sorted(config.notify_on),
             notify_min_confidence=config.notify_min_confidence,
             clip_preroll_seconds=config.clip_preroll_seconds,
             clip_postroll_seconds=config.clip_postroll_seconds,
             summary_interval_seconds=config.summary_interval_seconds,
         )
+
+
+class EnrolledFaceEntry(BaseModel):
+    """One reference face on a person's record.
+
+    Metadata only — the picture is fetched one at a time from its own endpoint. A list
+    that inlined the images would move every enrolled person's biometric data across the
+    network to draw a table of names, which is the opposite of §12's "do not expose
+    biometric information unnecessarily".
+    """
+
+    face_id: UUID
+    enrolled_at: float | None = Field(
+        default=None,
+        description=(
+            "Unix epoch seconds, or null for a face enrolled before this was recorded. "
+            "Null means unknown, never 1970."
+        ),
+    )
+    has_image: bool = Field(
+        description=(
+            "Whether a reference photograph was kept. False is a real answer, not a "
+            "loading state: enrolment can keep the embedding and no picture."
+        )
+    )
+
+
+class FacesResponse(BaseModel):
+    faces: list[EnrolledFaceEntry]
+
+
+class CameraCreateRequest(BaseModel):
+    """A new camera, as the console describes one.
+
+    `url` is here and is absent from `CameraEditRequest`, and that asymmetry is the
+    design: changing a running camera's source means tearing down its runner, its
+    pre-roll and any clip mid-recording, while adding one destroys nothing.
+
+    `profile` is absent from both. The escalation policy has live state — cooldowns, a
+    part-filled token bucket — so a new camera starts on the defaults and tuning it is
+    still `cameras.json` and a restart.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    camera_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+    url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)] = (
+        Field(
+            description=(
+                "An rtsp(s) URL, an earthcam.com **page** URL, or a local file path. "
+                "Which source gets built is decided from this and nothing else."
+            )
+        )
+    )
+    label: Annotated[str, StringConstraints(strip_whitespace=True, max_length=120)] = ""
+    zone: Zone | None = Field(
+        default=None,
+        description="The group this camera belongs to. Null leaves it ungrouped.",
+    )
+    capabilities: list[Capability] | None = Field(
+        default=None,
+        description=(
+            "Null takes the engine's defaults. A capability whose model this process "
+            "never loaded is refused with a 409 naming the restart — which models exist "
+            "is decided at startup."
+        ),
+    )
+
+
+class ProbeRequest(BaseModel):
+    """Look at a stream before committing to it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)]
+
+
+class ProbeResponse(BaseModel):
+    """What one look at a stream found.
+
+    `ok` false is a normal answer, not an error status: the caller is rendering a
+    preview either way, and a 4xx would make "this URL is wrong" indistinguishable from
+    "the request was malformed".
+    """
+
+    ok: bool
+    detail: str
+    source_kind: str = Field(
+        description="`earthcam`, `rtsp` or `file` — which source the engine would build."
+    )
+    title: str = ""
+    width: int = 0
+    height: int = 0
+    codec: str = ""
+    fps: float = 0.0
+    thumbnail: str | None = Field(
+        default=None,
+        description=(
+            "One decoded frame as a `data:image/jpeg;base64,…` URL, or null. The point "
+            "of a preview: a stream that opens and decodes green looks identical to a "
+            "working one in every other field here."
+        ),
+    )
+
+
+class PersonEntry(BaseModel):
+    """One enrolled person, as a console lists them (spec §23).
+
+    **Carries no biometric data.** No embedding, no vector, no image — those live in
+    the encrypted store and never travel on this API. What a console shows is a name, a
+    status and where somebody is authorised, and that is deliberately all it can show:
+    §12 asks that biometric information is not exposed unnecessarily, and the necessary
+    amount here is none.
+
+    `reference_faces` is a count rather than the faces themselves, for the same reason.
+    The faces have their own endpoint, and their photographs one each — see
+    `EnrolledFaceEntry`.
+    It is worth showing because §10 asks for multiple references per person and "1" is
+    usually the reason somebody is not being recognised.
+    """
+
+    person_id: UUID
+    display_name: str
+    status: PersonStatus
+    external_reference: str | None = None
+    camera_ids: list[str] = Field(
+        description=(
+            "Cameras this person is authorised on. **Empty means none, not all** — a "
+            "person enrolled with no cameras assigned is authorised nowhere until "
+            "somebody says where. The opposite default would make forgetting to set "
+            "this a silent grant."
+        )
+    )
+    zones: list[str] = Field(description="Zone names authorised, as an alternative to cameras.")
+    expires_at: float | None = Field(
+        default=None,
+        description=(
+            "Unix epoch seconds after which this authorisation lapses, or null for no "
+            "expiry. §10's temporary authorisation — without it every temporary grant "
+            "becomes a permanent one somebody forgot to revoke."
+        ),
+    )
+    reference_faces: int = Field(
+        description=(
+            "How many reference faces are enrolled. A count, never the faces. One is "
+            "usually the reason somebody is not being recognised from an angle."
+        )
+    )
+    notes: str = ""
+
+
+class PeopleResponse(BaseModel):
+    people: list[PersonEntry]
+
+
+class PersonRequest(BaseModel):
+    """Create or replace an authorised person. Carries no biometric data either —
+    faces are enrolled separately, against an existing person."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    ]
+    status: PersonStatus = PersonStatus.ACTIVE
+    external_reference: str | None = Field(
+        default=None,
+        max_length=120,
+        description=(
+            "A site's own identifier — staff number, badge id. Opaque here and never "
+            "used for matching; it exists so an operator can reconcile this record "
+            "with whatever system actually governs employment."
+        ),
+    )
+    camera_ids: list[str] = Field(
+        default_factory=list,
+        description="Cameras to authorise on. Empty authorises nowhere.",
+    )
+    zones: list[str] = Field(default_factory=list)
+    expires_at: float | None = None
+    notes: str = Field(default="", max_length=2000)
+
+
+class AlertEntry(BaseModel):
+    """One ongoing situation an operator is asked to act on (spec §17).
+
+    **Not an event.** An event is what happened; an alert is an *episode* that events
+    accumulate into. Measured on real footage, forty-five seconds of one corridor
+    produced eleven events and would produce eleven rows — `occurrences` is what turns
+    that back into one row saying how many times it happened.
+    """
+
+    alert_id: UUID
+    camera_id: str
+    camera_label: str
+    zone: Zone | None = Field(
+        default=None, description="Where the camera watches, or null when ungrouped."
+    )
+    reason: EscalationReason = Field(
+        description="What kind of situation this is. The same vocabulary as an event's."
+    )
+    subject: str = Field(
+        description=(
+            "Which tracked identity this episode is about, as a comma-separated list "
+            'of track ids, or `""` for a camera-level finding with nobody to '
+            "attribute it to (camera tampering). Two events with the same camera, "
+            "reason and subject are the same episode; a different subject is a "
+            "different person and a different alert."
+        )
+    )
+    state: AlertState = Field(
+        description=(
+            "`active` — nobody has looked. `acknowledged` — a person has seen it and "
+            "is dealing with it. `resolved` — a person has said it is finished. "
+            "**Nothing here changes on its own:** no alert ages out, because an alert "
+            "that expired quietly would leave no trace that nobody ever went to look."
+        )
+    )
+    severity: Severity = Field(
+        description=(
+            "The worse of what the model saw and what the reason structurally implies, "
+            "and it **rises across an episode and never falls** — one calm frame must "
+            "not drop an escalating situation down the list."
+        )
+    )
+    priority: EventPriority = Field(
+        description=(
+            "How urgently this should be served, known from the reason alone before "
+            "any model has looked. Distinct from `severity`: severity is how bad the "
+            "scene appears, priority is how bad it would be to get this one wrong."
+        )
+    )
+    first_seen: float
+    last_seen: float = Field(
+        description="Unix epoch seconds, like `occurred_at` — sortable across cameras."
+    )
+    occurrences: int = Field(
+        description=(
+            "How many events have folded into this episode. Always exact, even once "
+            "`event_ids` stops being complete."
+        )
+    )
+    description: str = Field(
+        description=(
+            "The most recent contributing event's description. Most recent rather than "
+            "first because an episode develops — what is happening now is more use to "
+            "somebody deciding whether to go than what was happening a minute ago."
+        )
+    )
+    event_ids: list[UUID] = Field(
+        description=(
+            "The **first** contributing events, bounded. First rather than latest "
+            "because an investigator works backwards from the start of an episode, and "
+            "the oldest event is the one whose clip shows how it began."
+        )
+    )
+    clip_uri: str | None = Field(
+        default=None,
+        description=(
+            "The first contributing clip that finished, for the same reason. Null when "
+            "no clip has finished yet, which is normal early in an episode — clips "
+            "complete after their event is assembled. A storage URI, not a URL: it is "
+            "here so an operator can say which object an alert refers to. To *watch* "
+            "it, GET /alerts/{alert_id}/clip, which is the only route by which this "
+            "engine will serve a recording."
+        ),
+    )
+    notify_clip_uri: str | None = Field(
+        default=None,
+        description=(
+            "The same recording trimmed to SENTINEL_NOTIFY_CLIP_SECONDS, when the "
+            "writer made one — what a notification carries, and what "
+            "GET /alerts/{alert_id}/clip returns by default. Null is ordinary: the "
+            "engine may be configured to make no short copy, and the trim can fail "
+            "without costing the full clip. Null here while `clip_uri` is set means "
+            "the short request falls back to the full recording, never to nothing."
+        ),
+    )
+    acknowledged_by: str | None = None
+    acknowledged_at: float | None = None
+
+    @classmethod
+    def from_alert(cls, alert: Alert) -> AlertEntry:
+        return cls(
+            alert_id=alert.alert_id,
+            camera_id=alert.key.camera_id,
+            camera_label=alert.camera_label,
+            zone=alert.zone,
+            reason=alert.key.reason,
+            subject=alert.key.subject,
+            state=alert.state,
+            severity=alert.severity,
+            priority=alert.priority,
+            first_seen=alert.first_seen,
+            last_seen=alert.last_seen,
+            occurrences=alert.occurrences,
+            description=alert.description,
+            event_ids=list(alert.event_ids),
+            clip_uri=alert.clip_uri,
+            notify_clip_uri=alert.notify_clip_uri,
+            acknowledged_by=alert.acknowledged_by,
+            acknowledged_at=alert.acknowledged_at,
+        )
+
+
+class AlertsResponse(BaseModel):
+    alerts: list[AlertEntry] = Field(
+        description=(
+            "Worst first, then most recent first. Ordered by the engine rather than "
+            "left to the client so that every reader agrees about what is at the top "
+            "of the list — §27's requirement that the critical thing is visible "
+            "immediately is a property of this ordering."
+        )
+    )
+    open_count: int = Field(
+        description="How many are not yet resolved — the number worth putting on a badge."
+    )
+
+
+class CameraEnabledRequest(BaseModel):
+    """Which way to move the switch.
+
+    A body rather than two verbs (`/enable`, `/disable`) so the request is idempotent
+    in the literal sense: it states the state it wants, not the transition, and sending
+    it twice asks for the same thing twice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(description="`true` to start watching this camera, `false` to stop.")
+
+
+class SettingEntryModel(BaseModel):
+    """One configuration value, as the running process holds it."""
+
+    name: str = Field(description="The environment variable an operator would set.")
+    value: str = Field(
+        description=(
+            "The effective value, rendered for reading. For a credential this is "
+            "`(set)` or `(unset)` and never the value — see `config_report.SECRET_FIELDS`."
+        )
+    )
+    is_default: bool = Field(
+        description="Whether this is the value the engine ships with. False means this deployment moved it."
+    )
+    secret: bool
+    group: str
+
+
+class SettingsResponse(BaseModel):
+    """What this engine is configured to do.
+
+    Read-only, and it is worth saying why: almost nothing here can change without a
+    restart — which models to load, how much VRAM to budget, where the broker is — and
+    an endpoint that accepted a write would have to either lie about taking effect or
+    restart the engine under an operator who asked for a settings change. The two
+    things that *are* live are already editable where they belong, per camera.
+    """
+
+    settings: list[SettingEntryModel]
+    changed: int = Field(
+        description="How many settings this deployment has moved off their default. The number worth reading first."
+    )
+
+
+class CameraStorageModel(BaseModel):
+    camera_id: str
+    clips: int
+    bytes_used: int
+
+
+class StorageResponse(BaseModel):
+    """What the clip bucket holds."""
+
+    bucket: str
+    reachable: bool = Field(
+        description=(
+            "False when the object store could not be listed. Every count is then zero "
+            "and means nothing — a console must say so rather than draw an empty "
+            "bucket, which reads as evidence having been deleted."
+        )
+    )
+    clips: int = Field(description="Recordings, counting a clip and its short copy as one.")
+    objects: int = Field(description="Objects, which is what the store bills for — roughly twice `clips`.")
+    bytes_used: int
+    retention_days: int = Field(
+        description="How long a clip survives, enforced by the object store's own lifecycle rule. `0` means nothing expires."
+    )
+    per_camera: list[CameraStorageModel]
+
+
+class ClipRecordModel(BaseModel):
+    event_id: UUID
+    size_bytes: int
+    modified_at: float = Field(
+        description=(
+            "Unix epoch seconds, from the object store's record of when the upload "
+            "finished — **later than the incident** by the post-roll plus the upload. "
+            "Sort by it; do not present it as the time something happened."
+        )
+    )
+    has_short_copy: bool
+
+
+class ClipsResponse(BaseModel):
+    camera_id: str
+    clips: list[ClipRecordModel]
+
+
+class AcknowledgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    by: str = Field(
+        min_length=1,
+        max_length=120,
+        description=(
+            "Who is acknowledging. **This engine has no authentication**, so this is a "
+            "self-declared label and not an identity — it records what somebody typed, "
+            "which is worth having and is not an audit trail. See "
+            "`docs/operations.md`."
+        ),
+    )
 
 
 LatestDescriptionState = Literal["none", "available", "unavailable"]

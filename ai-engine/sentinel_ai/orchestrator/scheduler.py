@@ -84,11 +84,21 @@ from dataclasses import dataclass, replace
 from uuid import UUID
 
 from sentinel_ai.domain.camera_profile import CameraProfile
-from sentinel_ai.domain.entities import EscalationReason, Event, SceneState, ThreatScore
+from sentinel_ai.domain.entities import (
+    EscalationReason,
+    Event,
+    SceneState,
+    Severity,
+    ThreatScore,
+)
+from sentinel_ai.domain.policy.alerting import severity_rank
 from sentinel_ai.domain.policy.notification import concerns_to_notify
+from sentinel_ai.domain.policy.priority import priority_of, rank
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareAssessment
 from sentinel_ai.domain.zone import Zone
 from sentinel_ai.orchestrator.admission import AdmissionGate
+from sentinel_ai.orchestrator.alerts import AlertRegister
+from sentinel_ai.orchestrator.escalation_queue import PriorityWorkQueue
 from sentinel_ai.orchestrator.event_history import (
     RECENT_EVENTS_PER_CAMERA,
     CameraEventHistory,
@@ -154,12 +164,57 @@ class EscalationRequest:
     muted. Both are wrong, and neither is visible without a test that looks for it.
     """
 
+    subject_track_ids: tuple[int, ...] = ()
+    """Whose behaviour this escalation is about, when a detector knew.
+
+    Carried from `BehaviourCandidate.track_ids` and empty for the six automatic
+    triggers, which describe a scene rather than a subject. Ends up on
+    `Event.subject_track_ids`, where it is what `AlertKey` deduplicates on — see that
+    field for why keying on the scene's tracks instead did not work.
+    """
+
+    describe: bool = True
+    """Whether this camera asked for a vision-language description (spec §13).
+
+    False is not a failure and not an error: it is a camera configured for
+    `anomaly_detection` without `scene_description`, which is the cheap tier that
+    makes many cameras affordable on one GPU. The escalation still becomes a
+    published `Event` — the fact that a track count spiked is information on its own
+    — it simply carries a metadata-derived description and never reaches the model.
+
+    Defaulted to `True`, unlike every other field here, because this one has a
+    genuinely safe default and the alternative is worse: a construction site that
+    forgot it would silently stop describing a camera an operator never reconfigured.
+    The failure modes are asymmetric in a way the welfare fields' are not — there,
+    either default is capable of being wrong in a direction nobody asked for; here,
+    "describe unless told otherwise" is exactly the pre-capabilities behaviour every
+    existing caller means.
+    """
+
 
 _UNAVAILABLE_THREAT_VALUE = 0.5
 """A conservative mid-range placeholder: severity truly is unknown without a
 description, and 0.5 neither over- nor under-states it for downstream triage."""
 
 _UNAVAILABLE_ACTION = "Review the clip when available."
+
+_SKIPPED_ACTION = "Review the clip; scene description is not enabled on this camera."
+
+DESCRIPTION_SKIPPED_METADATA_KEY = "description_skipped"
+"""`Event.metadata` key naming *why* a description is absent, when the reason is
+configuration rather than failure.
+
+`description_unavailable` is a bool, and it has always meant one thing: the model was
+asked and did not answer. A camera with `scene_description` switched off produces an
+event with no description either, but for the opposite reason — nothing went wrong,
+and rendering it as a model failure would teach an operator to ignore a flag that
+otherwise means a real fault. Rather than widen the bool into a tri-state (a required
+schema field, so widening it is a breaking change for every consumer already reading
+it), the distinction rides in `metadata`, which is free-form `dict[str, str]` in the
+published schema and already exists for exactly this: operational detail about one
+event. Absent means the ordinary reading of `description_unavailable` applies.
+"""
+
 
 _OOM_TYPE_NAMES = frozenset({"OutOfMemoryError", "CudaOutOfMemoryError", "OutOfMemory"})
 """Class names that mean "the accelerator ran out of memory".
@@ -191,6 +246,30 @@ def _labels_and_tracks(scene: SceneState) -> tuple[tuple[str, ...], tuple[int, .
     return labels, track_ids
 
 
+def _basis_for(request: EscalationRequest, welfare: WelfareAssessment) -> WelfareAssessment:
+    """Stamp the assessment with what it actually rests on (ADR 10, spec §7).
+
+    A welfare opinion reached from a single still frame and one reached from a frame
+    *plus* a multi-second geometry state machine that watched someone go down and stay
+    down are different amounts of evidence, and ADR 10's closing paragraph is explicit
+    about the consequence: a second source "gets its own `basis` value rather than
+    silently widening what this one means". This is the one place that promise is kept.
+
+    The condition is the escalation reason, because that is the only thing here that
+    knows a temporal machine was involved — `FALL_SUSPECTED` is raised by
+    `domain/behaviour/fall.py` and by nothing else (`pipeline/runner.py`).
+
+    An assessment with no concerns is left alone. `single_frame_vlm` is the default and
+    an empty assessment is omitted from the published event entirely, so stamping one
+    would be recording corroboration of a concern that does not exist — and would put a
+    `temporal_pose_vlm` marker on payloads where the model declined to agree, which is
+    the opposite of what the value is for.
+    """
+    if request.reason is not EscalationReason.FALL_SUSPECTED or not welfare.concerns:
+        return welfare
+    return replace(welfare, basis="temporal_pose_vlm")
+
+
 def _metadata_description(request: EscalationRequest) -> str:
     """Fallback description built from cheap signals alone — no VLM call required."""
     labels, _ = _labels_and_tracks(request.scene)
@@ -201,21 +280,39 @@ def _metadata_description(request: EscalationRequest) -> str:
 class VlmScheduler:
     def __init__(
         self,
-        vlm: VisionLanguageModel,
+        vlm: VisionLanguageModel | None,
         publisher: EventPublisher,
         admission: AdmissionGate,
         *,
         resident_set: ResidentSet,
-        vlm_model_key: str,
+        vlm_model_key: str | None,
         dead_letter: FailedEventSink,
         notifications: NotificationDispatcher,
+        alerts: AlertRegister | None = None,
+        notify_clip_min_severity: Severity = Severity.HIGH,
         maxsize: int,
         timeout_seconds: float,
         clock: Callable[[], float],
         wall_clock: Callable[[], float] = time.time,
         recent_events_per_camera: int = RECENT_EVENTS_PER_CAMERA,
     ) -> None:
+        # `None` when no configured camera enabled `scene_description`, so the
+        # composition root never built a VLM at all (spec §13). Every escalation then
+        # takes the skipped-description path below. Optional here rather than a null
+        # object because a null `VisionLanguageModel` would still be *registered*,
+        # still appear in `/health`, and still have to answer `describe()` with
+        # something — three lies to avoid one `if`.
         self._vlm = vlm
+        if (vlm is None) != (vlm_model_key is None):
+            # The two travel together or not at all: a key with no runtime makes
+            # `_ensure_vlm_resident` ask the registry for a model nobody registered,
+            # and a runtime with no key makes it impossible to keep resident. Either
+            # way the failure surfaces much later, as a describe that mysteriously
+            # degrades, so it is caught at construction instead.
+            raise ValueError(
+                "vlm and vlm_model_key must both be set or both be None; got "
+                f"vlm={'set' if vlm is not None else 'None'}, vlm_model_key={vlm_model_key!r}"
+            )
         self._publisher = publisher
         self._admission = admission
         self._resident_set = resident_set
@@ -231,6 +328,15 @@ class VlmScheduler:
         # was worth notifying about, which is the one failure a welfare system may
         # not have.
         self._notifications = notifications
+        # Optional, unlike `dead_letter` and `notifications`, because an alert register
+        # is a *view* rather than a guarantee: an engine without one still publishes
+        # every event, still spools, still notifies. What it loses is the operator's
+        # triage list, and a composition that wants only the event stream (the
+        # benchmark harness, most tests) should not have to construct one.
+        self._alerts = alerts
+        # The band at or above which a notification carries the short clip rather than
+        # the evidence one. See `_clip_for_note`.
+        self._notify_clip_min_severity = notify_clip_min_severity
         self._timeout_seconds = timeout_seconds
         self._clock = clock
         # Injected rather than taken from `time` directly so no test needs a real
@@ -244,7 +350,11 @@ class VlmScheduler:
         # publisher because it must capture events the publisher never sees: a
         # dead-lettered one, and one a cancelled shutdown abandoned.
         self._recent = RecentEventLog(recent_events_per_camera)
-        self._queue: asyncio.Queue[EscalationRequest] = asyncio.Queue(maxsize=maxsize)
+        # Priority-ordered rather than FIFO, and evicting the least urgent rather
+        # than the newest — see `orchestrator/escalation_queue.py` for both
+        # arguments. A suspected fall queued behind four periodic summaries is
+        # thirteen seconds at the measured describe latency.
+        self._queue: PriorityWorkQueue[EscalationRequest] = PriorityWorkQueue(maxsize=maxsize)
         self._dropped = 0
         self._publish_failures = 0
         self._abandoned = 0
@@ -260,13 +370,16 @@ class VlmScheduler:
         Deliberately not a coroutine: the camera pipeline must never await the VLM,
         and a `def` makes that unrepresentable rather than merely discouraged.
         """
-        try:
-            self._queue.put_nowait(request)
-        except asyncio.QueueFull:
+        accepted, evicted = self._queue.submit(request, rank(priority_of(request.reason)))
+        if evicted is not None:
             self._dropped += 1
-            logger.warning("vlm queue full: dropping escalation for camera %s", request.camera_id)
-            return False
-        return True
+            logger.warning(
+                "vlm queue full: dropped %s escalation for camera %s to make room for %s",
+                evicted.reason.value,
+                evicted.camera_id,
+                request.reason.value,
+            )
+        return accepted
 
     async def run(self) -> None:
         """The single worker loop. Cancel to stop."""
@@ -324,11 +437,8 @@ class VlmScheduler:
         if self._in_flight is not None:
             pending.append(self._in_flight)
             self._in_flight = None
-        while True:
-            try:
-                pending.append(self._queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
+        for drained in self._queue.drain_pending():
+            pending.append(drained)
             self._queue.task_done()
 
         for request in pending:
@@ -425,6 +535,16 @@ class VlmScheduler:
             event = await self._describe(request)
             event = await self._attach_clip(event, request)
             await self._publish(event)
+            # After the publish, before the notify, and deliberately between them.
+            # After, because §9's rule is that an event is never lost to an
+            # infrastructure failure and the register is not that record — folding into
+            # an alert before the event is safely away would put triage ahead of
+            # durability. Before the notify, because a notification carries a human-
+            # facing summary and the alert is what an operator will open from it.
+            #
+            # `absorb` is pure bookkeeping over a pure rule and cannot block, so it
+            # cannot hold the admission slot the `finally` below releases.
+            self._record_alert(event, request)
             # Spec's order: describe -> clip finalised -> publish -> notify. Last,
             # and only after `_attach_clip`, so the note carries the clip uri the
             # responder will want; and non-blocking, so the endpoint on the other
@@ -447,6 +567,50 @@ class VlmScheduler:
         except Exception as error:
             self._publish_failures += 1
             await self._dead_letter.store(event, error)
+
+    def _record_alert(self, event: Event, request: EscalationRequest) -> None:
+        """Fold this event into the operator's alert list, if there is one.
+
+        Never raises. The register is a view over events that have already been
+        published, so a failure here costs a row in a console — losing the escalation
+        over it would trade the durable thing for the convenient one. The same
+        reasoning `Notifier` documents, one step earlier in the sequence.
+        """
+        if self._alerts is None:
+            return
+        try:
+            self._alerts.absorb(
+                event,
+                camera_label=request.camera_label,
+                zone=request.zone,
+                # `occurred_at` rather than the scheduler's own clock: the merge window
+                # has to be measured on the same timeline the alert's `first_seen` and
+                # `last_seen` are reported on, or a replayed camera would open a new
+                # episode for every event.
+                now=event.occurred_at,
+                # The short clip the notification would carry, offered to the console
+                # too. Read off the handle rather than the event because the event does
+                # not carry it: `_attach_clip` puts only the full clip on the event, and
+                # this is the same recording trimmed. `None` whenever no clip was
+                # recorded, the writer makes no short copy, or the trim failed.
+                notify_clip_uri=(request.clip.notify_uri if request.clip is not None else None),
+            )
+        except Exception:
+            logger.exception(
+                "could not record an alert for camera %s event %s; the event was still published",
+                event.camera_id,
+                event.event_id,
+            )
+
+    @property
+    def alerts(self) -> AlertRegister | None:
+        """The register this scheduler folds events into, for the API to read.
+
+        Reached through the scheduler rather than held separately by `EngineService`
+        for `notifications`' reason: it guarantees the thing being read is the same
+        object the events are going into.
+        """
+        return self._alerts
 
     def _notify(self, event: Event, request: EscalationRequest) -> None:
         """Route this event's welfare concerns to a human, if any of them qualify.
@@ -487,9 +651,26 @@ class VlmScheduler:
                 # naming a kind the operator muted would leak exactly what
                 # `notify_on` exists to suppress.
                 concerns=concerns,
-                clip_uri=event.clip_uri,
+                # The short clip when this note is urgent enough to be read on a
+                # phone, the full one otherwise. `notify_uri` is `None` unless the
+                # writer made one, so the fallback is the ordinary case rather than an
+                # error path — see `ClipHandle.notify_uri`.
+                clip_uri=self._clip_for_note(request, event),
             )
         )
+
+    def _clip_for_note(self, request: EscalationRequest, event: Event) -> str | None:
+        """Which clip a notification carries.
+
+        Only above the threshold, and only if a short one exists. Below it the full clip
+        is the better link: nobody is running anywhere, and the extra seconds of context
+        are worth more than the shorter download.
+        """
+        if event.clip_uri is None or request.clip is None:
+            return event.clip_uri
+        if severity_rank(event.threat.severity) < severity_rank(self._notify_clip_min_severity):
+            return event.clip_uri
+        return request.clip.notify_uri or event.clip_uri
 
     async def _ensure_vlm_resident(self) -> None:
         """Reload an evicted VLM, and freshen its idle clock so it is not evicted again
@@ -509,6 +690,8 @@ class VlmScheduler:
         raised, so it cannot wedge the gate or cost the event — `describe()` then fails
         on its own load-state guard and §9's fallback publishes as usual.
         """
+        if self._vlm_model_key is None:
+            return
         try:
             await self._resident_set.ensure((self._vlm_model_key,), self._clock())
         except Exception as error:
@@ -518,9 +701,31 @@ class VlmScheduler:
                 error,
             )
 
+    def _require_vlm(self) -> tuple[VisionLanguageModel, str]:
+        """The VLM and its model key, on the paths that only run once one exists.
+
+        `self._vlm` and `self._vlm_model_key` are optional together (see `__init__`),
+        and `_describe` returns the skipped-description event before reaching anything
+        below. That makes every caller of this method unreachable with no VLM — but
+        "unreachable" is a claim about today's call graph, and a future path into the
+        describe machinery that forgot the guard would otherwise fail with an
+        `AttributeError` on `None` several frames deep.
+
+        Raising here instead keeps that failure legible *and* keeps it inside
+        `_describe`'s `except Exception` — so even the bug degrades to §9's published
+        fallback event rather than losing the escalation.
+        """
+        if self._vlm is None or self._vlm_model_key is None:
+            raise RuntimeError(
+                "the describe path was reached with no vision-language model loaded; "
+                "no configured camera enabled scene_description"
+            )
+        return self._vlm, self._vlm_model_key
+
     async def _run_vlm(self, vlm_request: VisionRequest) -> SceneDescription:
+        vlm, _ = self._require_vlm()
         async with asyncio.timeout(self._timeout_seconds):
-            return await self._vlm.describe(vlm_request)
+            return await vlm.describe(vlm_request)
 
     async def _describe_surviving_one_oom(self, vlm_request: VisionRequest) -> SceneDescription:
         """Spec §9's VLM-OOM row: evict, retry once, mark unhealthy, carry on.
@@ -553,6 +758,7 @@ class VlmScheduler:
         the next escalation's `_ensure_vlm_resident()` will try to load it again, and
         succeeds if whatever else was on the card has gone. Detection never stopped.
         """
+        _, model_key = self._require_vlm()
         try:
             return await self._run_vlm(vlm_request)
         except Exception as error:
@@ -560,21 +766,21 @@ class VlmScheduler:
                 raise
             logger.warning(
                 "vlm %s ran out of memory; evicting and retrying once: %s",
-                self._vlm_model_key,
+                model_key,
                 error,
             )
-        await self._resident_set.evict(self._vlm_model_key)
+        await self._resident_set.evict(model_key)
         try:
-            await self._resident_set.ensure((self._vlm_model_key,), self._clock())
+            await self._resident_set.ensure((model_key,), self._clock())
             return await self._run_vlm(vlm_request)
         except Exception as retry_error:
             detail = f"out of memory on two consecutive describes: {retry_error}"
-            logger.error("vlm %s %s", self._vlm_model_key, detail)
+            logger.error("vlm %s %s", model_key, detail)
             # Evict *before* marking: `shutdown()` sets the runtime back to UNLOADED,
             # so the other order would erase the very state this is recording.
             with contextlib.suppress(Exception):
-                await self._resident_set.evict(self._vlm_model_key)
-            self._resident_set.mark_unhealthy(self._vlm_model_key, detail)
+                await self._resident_set.evict(model_key)
+            self._resident_set.mark_unhealthy(model_key, detail)
             raise
 
     def _to_epoch(self, camera_id: str, source_timestamp: float) -> float:
@@ -641,6 +847,7 @@ class VlmScheduler:
         suggested_action: str,
         description_unavailable: bool,
         welfare: WelfareAssessment,
+        metadata: dict[str, str] | None = None,
     ) -> Event:
         """The one place in the system that constructs an `Event` (S14).
 
@@ -679,8 +886,13 @@ class VlmScheduler:
             suggested_action=suggested_action,
             labels=labels,
             track_ids=track_ids,
+            subject_track_ids=request.subject_track_ids,
             description_unavailable=description_unavailable,
             welfare=welfare,
+            # `Event.metadata` defaults via `field(default_factory=dict)`; passing
+            # `{}` rather than `None` keeps every existing caller's event byte-identical
+            # to what it was before this parameter existed.
+            metadata=dict(metadata) if metadata else {},
         )
         self._recent.record(event)
         return event
@@ -699,7 +911,37 @@ class VlmScheduler:
             welfare=WelfareAssessment.none(),
         )
 
+    def _skipped_event(self, request: EscalationRequest) -> Event:
+        """The event for an escalation this camera never wanted described (spec §13).
+
+        Shaped exactly like `_unavailable_event` — same metadata-derived description,
+        same conservative mid-range threat — because from a consumer's point of view
+        the description really is absent and `description_unavailable` really is true.
+        What differs is *why*, and that rides in `metadata` under
+        `DESCRIPTION_SKIPPED_METADATA_KEY` so a console can say "description is off for
+        this camera" instead of "the model failed", and so an operator never learns to
+        ignore a flag that otherwise means a genuine fault. See that constant for why
+        the distinction is not a third state on the bool.
+
+        No welfare opinion, for `_unavailable_event`'s reason and more strongly: no
+        model looked at this frame at all.
+        """
+        return self._assemble(
+            request,
+            threat=ThreatScore.from_value(_UNAVAILABLE_THREAT_VALUE),
+            description=_metadata_description(request),
+            suggested_action=_SKIPPED_ACTION,
+            description_unavailable=True,
+            welfare=WelfareAssessment.none(),
+            metadata={DESCRIPTION_SKIPPED_METADATA_KEY: "scene_description_disabled"},
+        )
+
     async def _describe(self, request: EscalationRequest) -> Event:
+        # Two ways to arrive here with nothing to ask: this camera did not enable
+        # `scene_description`, or no camera did and the process never built a VLM.
+        # Both are configuration, not failure, and both produce the same event.
+        if not request.describe or self._vlm is None:
+            return self._skipped_event(request)
         vlm_request = VisionRequest(
             keyframe=request.keyframe,
             scene=request.scene,
@@ -734,7 +976,7 @@ class VlmScheduler:
             # T3: the VLM's own opinion, carried across rather than dropped — see
             # `_assemble`'s docstring for why `welfare` has no default that would let
             # this be forgotten silently.
-            welfare=description.welfare,
+            welfare=_basis_for(request, description.welfare),
         )
 
     async def _attach_clip(self, event: Event, request: EscalationRequest) -> Event:

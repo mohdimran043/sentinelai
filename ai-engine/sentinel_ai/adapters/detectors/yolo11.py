@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
+from sentinel_ai.adapters.vram import measure_model_vram_mib, sample_pools
 from sentinel_ai.domain.entities import BBox, Detection
 from sentinel_ai.ports.detector import ObjectDetector
 from sentinel_ai.ports.frame_source import FrameData
@@ -126,6 +127,8 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
         self._state = LifecycleState.UNLOADED
         self._health_detail = ""
         self._vram_mib = 0
+        self._vram_baseline_mib = 0
+        self._allocated_baseline_mib = 0
         self._lock = asyncio.Lock()
         """Serialises `predict()` across every camera sharing this detector.
 
@@ -152,6 +155,10 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
 
     async def initialize(self) -> None:
         self._state = LifecycleState.DOWNLOADING
+        # Sampled before anything is placed, so `warmup()` can report *this* model's
+        # footprint rather than the process-wide pool — see `adapters/vram.py` for the
+        # bug that made every model after the first claim its predecessors' memory.
+        self._vram_baseline_mib, self._allocated_baseline_mib = sample_pools(self._device)
         try:
             from ultralytics import YOLO
 
@@ -194,19 +201,14 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
             pixels=np.zeros((self._imgsz, self._imgsz, 3), dtype=np.uint8),
         )
         await self.detect(dummy)
-        import torch
-
-        if torch.cuda.is_available():
-            reserved_mib = torch.cuda.memory_reserved(self._device) // (1024 * 1024)
-            self._vram_mib = int(reserved_mib) + _CUDA_CONTEXT_OVERHEAD_MIB
+        self._vram_mib = measure_model_vram_mib(
+            self._vram_baseline_mib, self._device, self._allocated_baseline_mib
+        )
         self._state = LifecycleState.HEALTHY
 
     async def detect(self, frame: FrameData) -> tuple[Detection, ...]:
         if self._model is None:
             raise RuntimeError("Yolo11Detector.detect called before initialize()")
-        if not isinstance(frame.pixels, np.ndarray):
-            raise TypeError(f"FrameData.pixels must be a numpy array, got {type(frame.pixels)!r}")
-        pixels: npt.NDArray[np.uint8] = frame.pixels
         loop = asyncio.get_running_loop()
         # Held across the offload, not merely around the submission: the shared state
         # this protects lives inside `predict()`, on the executor thread.
@@ -214,9 +216,26 @@ class Yolo11Detector(ObjectDetector, ModelRuntime):
             model = self._model
             if model is None:  # pragma: no cover - a shutdown() that raced the acquire
                 raise RuntimeError("Yolo11Detector.detect called before initialize()")
-            return await loop.run_in_executor(None, self._detect_sync, model, pixels)
+            return await loop.run_in_executor(None, self._detect_sync, model, frame)
 
-    def _detect_sync(self, model: YOLO, pixels: npt.NDArray[np.uint8]) -> tuple[Detection, ...]:
+    def _detect_sync(self, model: YOLO, frame: FrameData) -> tuple[Detection, ...]:
+        """Resolve the frame's pixels and run the forward pass, both on this thread.
+
+        Resolving *here* rather than in `detect()` is deliberate and was measured. The
+        detector is the first consumer of a frame in `CameraRunner._process_frame`, so
+        it is the one that pays `DeferredPixels`' colour-space conversion — and doing
+        that in `detect()` would pay it on the event loop. At twenty cameras this
+        process uses 113% of a *single* core on a 24-core box, which makes the loop the
+        saturated resource: a millisecond of numpy on it is a millisecond no other
+        camera gets, while 23 cores sit idle. Here it lands on one of them.
+
+        Every later consumer — motion, pose, faces, the VLM keyframe — reads the value
+        this call cached, so none of them pays it again or pays it on the loop.
+        """
+        resolved = frame.pixel_array()
+        if not isinstance(resolved, np.ndarray):
+            raise TypeError(f"FrameData.pixels must be a numpy array, got {type(resolved)!r}")
+        pixels: npt.NDArray[np.uint8] = resolved
         results = model.predict(
             source=pixels,
             conf=self._conf,

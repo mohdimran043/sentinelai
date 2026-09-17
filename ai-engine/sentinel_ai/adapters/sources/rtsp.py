@@ -58,10 +58,18 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
+from typing import Any
 
 import av
 
-from sentinel_ai.ports.frame_source import EncodedPacket, FrameData, FrameSource
+from sentinel_ai.adapters.sources.hwaccel import build_hwaccel
+from sentinel_ai.ports.frame_source import (
+    DeferredPixels,
+    EncodedPacket,
+    FrameData,
+    FrameSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,10 +178,20 @@ class RtspSource(FrameSource):
         reconnect_initial_seconds: float,
         reconnect_max_seconds: float,
         clock: Callable[[], float] = time.monotonic,
+        hwaccel_device: str | None = None,
+        max_fps: float = 0.0,
     ) -> None:
         self._camera_id = camera_id
+        # 0 means "every frame", which is what every deployment did before this existed.
+        self._min_frame_interval = 1.0 / max_fps if max_fps > 0 else 0.0
+        self._last_emit = 0.0
         self._url = url
         self._clock = clock
+        # Resolved before the reconnect loop starts, so an unavailable device type is a
+        # startup error rather than an endlessly-retried connection failure — the
+        # backoff loop would otherwise treat "this FFmpeg has no CUDA" as a flaky
+        # network and hide it behind exponential retries forever.
+        self._hwaccel = build_hwaccel(hwaccel_device)
         self._frame_index = 0
         self._closed = False
         self._frame_queue: asyncio.Queue[FrameData | _CloseSentinel] = asyncio.Queue(
@@ -213,11 +231,7 @@ class RtspSource(FrameSource):
         feed — the stream "ending" is itself a connectivity failure the
         `_ReconnectLoop` must retry, not a terminal condition).
         """
-        options = {
-            "rtsp_transport": "tcp",
-            "stimeout": _RTSP_SOCKET_TIMEOUT_MICROSECONDS,
-        }
-        container = av.open(self._url, options=options)
+        container = self._open_container()
         try:
             stream = container.streams.video[0]
             # SDP-negotiated SPS/PPS (spec: see `_annexb_keyframe_bytes`'s docstring for
@@ -246,20 +260,64 @@ class RtspSource(FrameSource):
                     )
                     asyncio.run_coroutine_threadsafe(self._packet_queue.put(encoded), loop).result()
                 for decoded in packet.decode():
-                    pixels = decoded.to_ndarray(format="bgr24")
+                    # Emit at most `max_fps`. The codec forces us to *decode* every
+                    # frame — an inter-coded frame is meaningless without its
+                    # references — but nothing forces us to hand every one to the
+                    # pipeline. A 30 fps camera feeding a pipeline that processes five
+                    # frames a second spends the other twenty-five waking the event
+                    # loop to overwrite a mailbox slot, and that loop is the resource
+                    # this engine is short of (ADR 17).
+                    #
+                    # Measured on three 1080p cameras: 90 slot writes a second, of which
+                    # about 85% were discarded before anything looked at them.
+                    if self._min_frame_interval > 0.0:
+                        now = self._clock()
+                        if now - self._last_emit < self._min_frame_interval:
+                            continue
+                        self._last_emit = now
+                    # Deferred, for `FileSource._drain`'s reason and more sharply here:
+                    # a live camera cannot be slowed down, so every frame the consumer
+                    # is too busy for is decoded and dropped, and converting it first
+                    # is a third of the cost of decoding it for nothing at all.
                     frame = FrameData(
                         camera_id=self._camera_id,
                         frame_index=self._frame_index,
                         timestamp=arrival,
-                        width=pixels.shape[1],
-                        height=pixels.shape[0],
-                        pixels=pixels,
+                        width=decoded.width,
+                        height=decoded.height,
+                        pixels=DeferredPixels(partial(decoded.to_ndarray, format="bgr24")),
                     )
                     asyncio.run_coroutine_threadsafe(self._frame_queue.put(frame), loop).result()
                     self._frame_index += 1
-            raise ConnectionError(f"RTSP stream ended: {self._url}")
+            raise ConnectionError(f"stream ended: {self._stream_label()}")
         finally:
             container.close()
+
+    # -- what a subclass changes ------------------------------------------------------
+    #
+    # `EarthCamSource` is this source with a different way of naming the thing to open:
+    # a signed HTTPS playlist that has to be resolved afresh each time, rather than a
+    # fixed RTSP URL. Everything else it needs — the reconnect loop, the demux fan-out
+    # into frames and packets, the discontinuity signal on reconnect, the queues, the
+    # shutdown — is identical, and duplicating it to change one call would mean two
+    # copies of the trickiest loop in the codebase.
+
+    def _open_container(self) -> Any:
+        """Open the stream. Runs on the worker thread, inside `_pump_stream`."""
+        options = {
+            "rtsp_transport": "tcp",
+            "stimeout": _RTSP_SOCKET_TIMEOUT_MICROSECONDS,
+        }
+        return (
+            av.open(self._url, options=options, hwaccel=self._hwaccel)
+            if self._hwaccel is not None
+            else av.open(self._url, options=options)
+        )
+
+    def _stream_label(self) -> str:
+        """How this source names itself in an error. Never a signed URL — see
+        `EarthCamSource`, which overrides this to keep a token out of a traceback."""
+        return self._url
 
     def __aiter__(self) -> AsyncIterator[FrameData]:
         async def frames() -> AsyncIterator[FrameData]:

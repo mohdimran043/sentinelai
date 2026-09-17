@@ -79,13 +79,24 @@ import logging
 import math
 import os
 import stat
-from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from sentinel_ai.domain.behaviour.abandonment import AbandonmentPolicy
+from sentinel_ai.domain.behaviour.fall import FallPolicy
+from sentinel_ai.domain.behaviour.tamper import TamperPolicy
+from sentinel_ai.domain.behaviour.zones import (
+    CrossingDirection,
+    CrossingLine,
+    RestrictedZone,
+    ZonePolicy,
+)
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.capabilities import DEFAULT_CAPABILITIES, CameraCapabilities, Capability
+from sentinel_ai.domain.policy.authorization import AuthorizationPolicy
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
 
@@ -101,6 +112,7 @@ __all__ = [
     "CameraFileStore",
     "Unset",
     "edited_document",
+    "enabled_document",
     "load_cameras",
     "parse_cameras",
 ]
@@ -110,6 +122,7 @@ _PROFILE_FIELDS = frozenset(field.name for field in fields(CameraProfile)) - {"c
 EDITABLE_FIELDS: Final = (
     "label",
     "zone",
+    "capabilities",
     "notify_on",
     "notify_min_confidence",
     "clip_preroll_seconds",
@@ -161,6 +174,24 @@ class CameraConfig:
     statement about a deployment rather than a broken one. A zone that is *present and
     unknown* is a different thing — see `_zone_from`."""
 
+    enabled: bool = True
+    """Whether the engine builds a `CameraRunner` for this camera at all.
+
+    `False` is a camera an operator deliberately stopped: the record stays here, whole,
+    and nothing watches the source. It is **not** a way of saying "watch it but run
+    nothing on it" — that is `capabilities: []`, and the difference is the source
+    connection. A disabled camera opens no socket, decodes nothing and costs nothing;
+    a camera with no capabilities still pulls and decodes every frame.
+
+    Absent means enabled, so every camera file written before this field existed keeps
+    describing exactly what it used to.
+
+    Not in `EDITABLE_FIELDS`. Everything on that list is metadata a running camera can
+    absorb between frames; this one starts or stops the runner, which is a lifecycle
+    change with its own path (`CameraFileStore.set_enabled`) precisely so it can never
+    be confused for one.
+    """
+
     notify_on: frozenset[ConcernKind] = frozenset(ConcernKind)
     """Which welfare concern kinds this camera notifies a human about. Not read
     here — a later task's routing reads it — this module only loads and
@@ -207,6 +238,60 @@ class CameraConfig:
     set and reverting it to `None` restores the profile's own. Do not fold them
     together; that would take away the one thing this duplication buys."""
 
+    fall_policy: FallPolicy = field(default_factory=FallPolicy)
+    """Thresholds for this camera's fall detection (spec §7, §12).
+
+    Read only when `capabilities` includes `fall_detection`; carried regardless, so a
+    camera can be configured ahead of being switched on. `default_factory` rather than
+    a bare `FallPolicy()` default for `Event.welfare`'s reason — a bare default is
+    evaluated once at class-definition time and shared by every record that does not
+    set its own. `FallPolicy` is frozen so aliasing would not corrupt anything today,
+    but the factory is the correct mechanism rather than a shortcut that happens to
+    work.
+
+    Per camera because the thresholds are genuinely per camera: a corridor watched
+    head-on and a dayroom watched from a high corner disagree about what a descent
+    looks like, and §12 forbids hard-coding any of it."""
+
+    abandonment_policy: AbandonmentPolicy = field(default_factory=AbandonmentPolicy)
+    """Thresholds for this camera's abandoned-object detection. Read only when
+    `capabilities` includes `abandoned_object`; `default_factory` for `fall_policy`'s
+    reason."""
+
+    tamper_policy: TamperPolicy = field(default_factory=TamperPolicy)
+    """Thresholds for this camera's tamper detection. Read only when `capabilities`
+    includes `camera_tamper`."""
+
+    zone_policy: ZonePolicy = field(default_factory=ZonePolicy)
+    """The restricted areas and virtual boundaries drawn on this camera, in normalised
+    frame coordinates. Read only when `capabilities` includes `zone_monitoring`.
+
+    Empty by default, and an empty policy is one the composition root drops rather than
+    attaches: a camera with the capability on and no geometry drawn would otherwise be
+    a checkbox that does nothing. See `ZonePolicy.is_empty`."""
+
+    authorization_policy: AuthorizationPolicy = field(default_factory=AuthorizationPolicy)
+    """Thresholds for this camera's person authorisation (§10, §11, §12).
+
+    Read only when `capabilities` includes `person_authorization`. Per camera because
+    the numbers genuinely are: a camera two metres from a doorway sees faces four times
+    the size of one across a lobby, so `min_box_pixels` cannot be one site-wide value.
+    §12 forbids hard-coding any of it."""
+
+    capabilities: CameraCapabilities = DEFAULT_CAPABILITIES
+    """Which AI capabilities run on this camera (spec §13).
+
+    Absent means `DEFAULT_CAPABILITIES` — scene description plus the automatic
+    triggers, which is exactly what every camera did before this field existed, so
+    upgrading an engine changes no behaviour. An explicit `[]` is the opposite and
+    is a real instruction: watch this camera, run nothing on it. That absent-versus-
+    empty distinction is `notify_on`'s exactly, and it has to survive the same round
+    trip through the PATCH body and back into the file — see `_capabilities_from`.
+
+    Read by `main.build_models`, which loads only the model roles the union of every
+    camera's capabilities actually requires, and by `main.compose`, which derives
+    `CameraProfile.auto_escalation_enabled` from it rather than letting the two disagree."""
+
 
 class _Unset(Enum):
     """Single-member enum rather than `object()`: mypy narrows `X | Unset` on an
@@ -242,6 +327,13 @@ class CameraEdit:
 
     label: str | Unset = UNSET
     zone: Zone | Unset | None = UNSET
+    capabilities: CameraCapabilities | Unset = UNSET
+    """The whole replacement set, or `UNSET` to leave it alone.
+
+    Not nullable, for `notify_on`'s reason exactly: `CameraCapabilities.none()` is
+    already the "run nothing on this camera" instruction, so `null` would be a third
+    meaning the field has no room for.
+    """
     notify_on: frozenset[ConcernKind] | Unset = UNSET
     notify_min_confidence: Confidence | Unset = UNSET
     clip_preroll_seconds: float | Unset | None = UNSET
@@ -280,6 +372,22 @@ def _profile_from(camera_id: str, raw: Mapping[str, Any]) -> CameraProfile:
         # CameraProfile.__post_init__ enforces its own invariants; surfacing them as
         # a CameraConfigError keeps every startup configuration failure one type.
         raise CameraConfigError(f"camera {camera_id!r}: invalid profile: {exc}") from exc
+
+
+def _enabled_from(camera_id: str, raw: Any) -> bool:
+    """Absent means enabled, and anything that is not a bool is refused.
+
+    Strict rather than truthy: `"false"` and `0` are exactly the values somebody writes
+    meaning "off", and Python would read both as on. A camera an operator believes they
+    stopped, quietly watching, is the one failure this field must not have.
+    """
+    if raw is None:
+        return True
+    if not isinstance(raw, bool):
+        raise CameraConfigError(
+            f"camera {camera_id!r} 'enabled' must be true or false, not {raw!r}"
+        )
+    return raw
 
 
 def _zone_from(camera_id: str, raw: Any) -> Zone | None:
@@ -361,6 +469,232 @@ def _notify_min_confidence_from(camera_id: str, raw: Any) -> Confidence:
             f"valid values are {[confidence.value for confidence in Confidence]}, or omit "
             f"the field to default to {Confidence.LIKELY.value!r}"
         ) from None
+
+
+def _capabilities_from(camera_id: str, raw: Any) -> CameraCapabilities:
+    """Absent means the default set; present-but-unknown means the file is wrong.
+
+    `_notify_on_from`'s shape exactly, and for a sharper reason. A mistyped concern
+    kind narrows which notifications go out from a camera that is still being
+    watched; a mistyped capability leaves an operator believing a capability is
+    running on a camera where nothing was ever switched on. Both fail loud, and this
+    one has the stronger case for it.
+
+    `[]` is not absent: it is the explicit "run nothing here" instruction, and
+    collapsing it into the default would silently re-enable monitoring on a camera
+    someone deliberately quieted — the same absent-versus-empty trap `notify_on`
+    documents, with the polarity that matters more.
+    """
+    if raw is None:
+        return DEFAULT_CAPABILITIES
+    if not isinstance(raw, list):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'capabilities' must be an array of strings or absent, "
+            f"got {type(raw).__name__}"
+        )
+    for item in raw:
+        if not isinstance(item, str):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: 'capabilities' entries must be strings, got "
+                f"{item!r} ({type(item).__name__})"
+            )
+    try:
+        return CameraCapabilities.from_names(raw)
+    except ValueError as exc:
+        # `CameraCapabilities.from_names` raises a bare ValueError naming the valid
+        # vocabulary; re-raising as CameraConfigError keeps every startup
+        # configuration failure one type, as `_profile_from` does for CameraProfile.
+        raise CameraConfigError(f"camera {camera_id!r}: {exc}") from exc
+
+
+_FALL_POLICY_FIELDS = frozenset(f.name for f in fields(FallPolicy))
+_ABANDONMENT_POLICY_FIELDS = frozenset(f.name for f in fields(AbandonmentPolicy))
+_TAMPER_POLICY_FIELDS = frozenset(f.name for f in fields(TamperPolicy))
+_AUTHORIZATION_POLICY_FIELDS = frozenset(f.name for f in fields(AuthorizationPolicy))
+
+
+def _policy_from[PolicyT](
+    camera_id: str,
+    key: str,
+    raw: Any,
+    *,
+    factory: Callable[..., PolicyT],
+    valid_fields: frozenset[str],
+) -> PolicyT:
+    """A flat threshold object, validated against its own dataclass field names.
+
+    `_profile_from`'s shape exactly, generalised over the three behaviour policies that
+    are plain bags of numbers (`fall_policy`, `abandonment_policy`, `tamper_policy`).
+    `zone_policy` is not one of them — it carries nested geometry and has its own
+    parser below.
+
+    A typo'd threshold name that was silently ignored would leave an operator believing
+    they had tuned a camera that is still running the defaults, and here the defaults
+    decide whether anyone is told a person is on the floor. So unknown fields, wrong
+    types and out-of-range values all fail at startup rather than at the first incident.
+    """
+    if raw is None:
+        return factory()
+    if not isinstance(raw, dict):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: {key!r} must be an object or absent, got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - valid_fields)
+    if unknown:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: unknown {key} field(s) {unknown}; "
+            f"valid fields are {sorted(valid_fields)}"
+        )
+    try:
+        return factory(**raw)
+    except (TypeError, ValueError) as exc:
+        raise CameraConfigError(f"camera {camera_id!r}: invalid {key}: {exc}") from exc
+
+
+def _point_from(camera_id: str, where: str, raw: Any) -> tuple[float, float]:
+    """One `[x, y]` pair of frame fractions.
+
+    Fractions rather than pixels so a zone survives an RTSP resolution renegotiation —
+    see `domain/behaviour/zones.py`. `bool` is rejected for `_optional_seconds_from`'s
+    reason: `isinstance(True, int)` is `True`, so `[true, 0.5]` would otherwise parse
+    as the perfectly plausible point `(1.0, 0.5)`.
+    """
+    if not isinstance(raw, list | tuple) or len(raw) != 2:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: {where} must be a two-element [x, y] array of "
+            f"frame fractions, got {raw!r}"
+        )
+    values: list[float] = []
+    for value in raw:
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: {where} coordinates must be numbers, got {value!r}"
+            )
+        if not math.isfinite(value):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: {where} coordinates must be finite, got {value!r}"
+            )
+        values.append(float(value))
+    return (values[0], values[1])
+
+
+def _zone_policy_from(camera_id: str, raw: Any) -> ZonePolicy:
+    """The restricted areas and tripwires drawn on one camera.
+
+    Nested, unlike the other three policies, so it gets its own parser rather than a
+    generic one. Every error names the camera and the zone, because an operator reading
+    a startup failure has a file with several cameras in it and needs to know which
+    polygon they mistyped.
+    """
+    if raw is None:
+        return ZonePolicy()
+    if not isinstance(raw, dict):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'zone_policy' must be an object or absent, "
+            f"got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - {"zones", "lines", "min_frames_inside"})
+    if unknown:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: unknown zone_policy field(s) {unknown}; "
+            f"valid fields are ['lines', 'min_frames_inside', 'zones']"
+        )
+
+    zones: list[RestrictedZone] = []
+    for index, entry in enumerate(raw.get("zones") or []):
+        if not isinstance(entry, dict):
+            raise CameraConfigError(f"camera {camera_id!r}: zones[{index}] must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: zones[{index}] needs a string 'name' — it is "
+                f"what an operator reads in the alert"
+            )
+        polygon_raw = entry.get("polygon")
+        if not isinstance(polygon_raw, list):
+            raise CameraConfigError(
+                f"camera {camera_id!r}: zone {name!r} needs a 'polygon' array of [x, y] points"
+            )
+        polygon = tuple(
+            _point_from(camera_id, f"zone {name!r} polygon point {point_index}", point)
+            for point_index, point in enumerate(polygon_raw)
+        )
+        try:
+            zones.append(RestrictedZone(name=name, polygon=polygon))
+        except ValueError as exc:
+            raise CameraConfigError(f"camera {camera_id!r}: {exc}") from exc
+
+    lines: list[CrossingLine] = []
+    for index, entry in enumerate(raw.get("lines") or []):
+        if not isinstance(entry, dict):
+            raise CameraConfigError(f"camera {camera_id!r}: lines[{index}] must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str):
+            raise CameraConfigError(f"camera {camera_id!r}: lines[{index}] needs a string 'name'")
+        direction_raw = entry.get("direction", CrossingDirection.BOTH.value)
+        try:
+            direction = CrossingDirection(direction_raw)
+        except ValueError:
+            raise CameraConfigError(
+                f"camera {camera_id!r}: line {name!r} has unknown direction "
+                f"{direction_raw!r}; valid values are "
+                f"{[member.value for member in CrossingDirection]}"
+            ) from None
+        try:
+            lines.append(
+                CrossingLine(
+                    name=name,
+                    start=_point_from(camera_id, f"line {name!r} start", entry.get("start")),
+                    end=_point_from(camera_id, f"line {name!r} end", entry.get("end")),
+                    direction=direction,
+                )
+            )
+        except ValueError as exc:
+            raise CameraConfigError(f"camera {camera_id!r}: {exc}") from exc
+
+    minimum = raw.get("min_frames_inside", 3)
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: zone_policy.min_frames_inside must be an integer, "
+            f"got {minimum!r}"
+        )
+    try:
+        return ZonePolicy(zones=tuple(zones), lines=tuple(lines), min_frames_inside=minimum)
+    except ValueError as exc:
+        raise CameraConfigError(f"camera {camera_id!r}: invalid zone_policy: {exc}") from exc
+
+
+def _fall_policy_from(camera_id: str, raw: Any) -> FallPolicy:
+    """Per-camera fall thresholds, validated against `FallPolicy`'s own field names.
+
+    `_profile_from`'s shape exactly, and for its reason: a typo'd threshold name that
+    was silently ignored would leave an operator believing they had tuned a camera
+    that is still running the defaults — and here the defaults decide whether anyone
+    is told that a person is on the floor.
+
+    Absent means every default. Present-but-misspelled, or present-and-out-of-range,
+    fails at startup rather than at the first fall.
+    """
+    if raw is None:
+        return FallPolicy()
+    if not isinstance(raw, dict):
+        raise CameraConfigError(
+            f"camera {camera_id!r}: 'fall_policy' must be an object or absent, "
+            f"got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - _FALL_POLICY_FIELDS)
+    if unknown:
+        raise CameraConfigError(
+            f"camera {camera_id!r}: unknown fall_policy field(s) {unknown}; "
+            f"valid fields are {sorted(_FALL_POLICY_FIELDS)}"
+        )
+    try:
+        return FallPolicy(**raw)
+    except (TypeError, ValueError) as exc:
+        # `FallPolicy.__post_init__` enforces its own invariants (the aspect and torso
+        # bands must not overlap, every duration must be positive); surfacing them as
+        # a `CameraConfigError` keeps every startup configuration failure one type.
+        raise CameraConfigError(f"camera {camera_id!r}: invalid fall_policy: {exc}") from exc
 
 
 def _optional_seconds_from(
@@ -456,6 +790,7 @@ def parse_cameras(document: Any, origin: str) -> tuple[CameraConfig, ...]:
                 url=url,
                 profile=_profile_from(camera_id, raw_profile),
                 zone=_zone_from(camera_id, entry.get("zone")),
+                enabled=_enabled_from(camera_id, entry.get("enabled")),
                 notify_on=_notify_on_from(camera_id, entry.get("notify_on")),
                 notify_min_confidence=_notify_min_confidence_from(
                     camera_id, entry.get("notify_min_confidence")
@@ -481,6 +816,36 @@ def parse_cameras(document: Any, origin: str) -> tuple[CameraConfig, ...]:
                     minimum=0.0,
                     inclusive=False,
                 ),
+                capabilities=_capabilities_from(camera_id, entry.get("capabilities")),
+                fall_policy=_policy_from(
+                    camera_id,
+                    "fall_policy",
+                    entry.get("fall_policy"),
+                    factory=FallPolicy,
+                    valid_fields=_FALL_POLICY_FIELDS,
+                ),
+                abandonment_policy=_policy_from(
+                    camera_id,
+                    "abandonment_policy",
+                    entry.get("abandonment_policy"),
+                    factory=AbandonmentPolicy,
+                    valid_fields=_ABANDONMENT_POLICY_FIELDS,
+                ),
+                tamper_policy=_policy_from(
+                    camera_id,
+                    "tamper_policy",
+                    entry.get("tamper_policy"),
+                    factory=TamperPolicy,
+                    valid_fields=_TAMPER_POLICY_FIELDS,
+                ),
+                zone_policy=_zone_policy_from(camera_id, entry.get("zone_policy")),
+                authorization_policy=_policy_from(
+                    camera_id,
+                    "authorization_policy",
+                    entry.get("authorization_policy"),
+                    factory=AuthorizationPolicy,
+                    valid_fields=_AUTHORIZATION_POLICY_FIELDS,
+                ),
             )
         )
     return tuple(configs)
@@ -504,6 +869,122 @@ def load_cameras(path: Path) -> tuple[CameraConfig, ...]:
 
 
 # -- writing ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CameraCreate:
+    """A new camera, as an operator describes one.
+
+    `url` is here and is *not* on `CameraEdit`, and the asymmetry is the point.
+    Changing a running camera's source means tearing down its `CameraRunner`, its
+    pre-roll ring and any clip mid-recording — which is why `PATCH` refuses it. Adding
+    one destroys nothing: there is no runner yet, so the whole objection disappears.
+
+    `profile` is deliberately absent. The escalation policy has live state — cooldowns, a
+    token bucket part-way through refilling — and a new camera starts on the defaults;
+    tuning it is `cameras.json` and a restart, exactly as it was.
+    """
+
+    camera_id: str
+    url: str
+    label: str = ""
+    zone: Zone | None = None
+    capabilities: CameraCapabilities | None = None
+
+    def __post_init__(self) -> None:
+        if not self.camera_id.strip():
+            raise CameraConfigError("a camera needs an id")
+        if not self.url.strip():
+            raise CameraConfigError(f"camera {self.camera_id!r}: a camera needs a url")
+
+
+def created_document(document: Any, create: CameraCreate, origin: str) -> Any:
+    """The whole document with one camera appended.
+
+    Same contract as `edited_document`: everything this version has no model of is
+    copied through untouched, and the new entry is *appended* so an operator's ordering
+    survives.
+
+    A duplicate id raises rather than replacing. Two cameras with one id is a file whose
+    second entry silently wins at startup, and an operator who meant to edit has a PATCH
+    for that.
+    """
+    if not isinstance(document, dict) or not isinstance(document.get("cameras"), list):
+        raise CameraConfigError(f"{origin} must be an object with a 'cameras' array")
+
+    entries = list(document["cameras"])
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("id")) == create.camera_id:
+            raise CameraConfigError(
+                f"{origin} already has a camera called {create.camera_id!r}; "
+                "edit it rather than adding it twice"
+            )
+
+    fresh: dict[str, Any] = {"id": create.camera_id, "url": create.url}
+    if create.label:
+        fresh["label"] = create.label
+    if create.zone is not None:
+        fresh["zone"] = create.zone.value
+    if create.capabilities is not None:
+        fresh["capabilities"] = sorted(
+            capability.value for capability in Capability if create.capabilities.enabled(capability)
+        )
+    return {**document, "cameras": [*entries, fresh]}
+
+
+def removed_document(document: Any, camera_id: str, origin: str) -> Any:
+    """The whole document with one camera dropped.
+
+    An unknown id raises, for `edited_document`'s reason: the engine knowing about a
+    camera the file does not means somebody edited the file, and quietly succeeding
+    would report a deletion that deleted nothing.
+    """
+    if not isinstance(document, dict) or not isinstance(document.get("cameras"), list):
+        raise CameraConfigError(f"{origin} must be an object with a 'cameras' array")
+
+    entries = list(document["cameras"])
+    remaining = [
+        entry
+        for entry in entries
+        if not (isinstance(entry, dict) and str(entry.get("id")) == camera_id)
+    ]
+    if len(remaining) == len(entries):
+        raise CameraConfigError(f"{origin} has no camera called {camera_id!r}")
+    return {**document, "cameras": remaining}
+
+
+def enabled_document(document: Any, camera_id: str, enabled: bool, origin: str) -> Any:
+    """The whole document with one camera's `enabled` flag set.
+
+    Separate from `edited_document` rather than a field on `CameraEdit`, because the two
+    are different kinds of change and sharing a path would blur that. Everything
+    `edited_document` writes is metadata a running camera absorbs between frames; this
+    decides whether the camera runs at all. Keeping them apart means the metadata path
+    can never start or stop anything, and this one can never touch policy.
+
+    Written explicitly even when it matches the default, for `zone`'s reason: a visible
+    `"enabled": true` records that somebody turned this back on, where a deleted key
+    says only that nobody ever touched it.
+    """
+    if not isinstance(document, dict) or not isinstance(document.get("cameras"), list):
+        raise CameraConfigError(f"{origin} must be an object with a 'cameras' array")
+
+    updated: list[Any] = []
+    found = False
+    for entry in document["cameras"]:
+        if not isinstance(entry, dict) or entry.get("id") != camera_id:
+            updated.append(entry)
+            continue
+        found = True
+        updated.append({**entry, "enabled": enabled})
+
+    if not found:
+        raise CameraConfigError(
+            f"{origin} has no camera {camera_id!r} — the file has been edited since the "
+            f"engine started, so this change was not applied; reconcile the file and "
+            f"restart rather than letting the console overwrite it"
+        )
+    return {**document, "cameras": updated}
 
 
 def edited_document(document: Any, camera_id: str, edit: CameraEdit, origin: str) -> Any:
@@ -546,6 +1027,10 @@ def edited_document(document: Any, camera_id: str, edit: CameraEdit, origin: str
             # records that someone chose this, where a deleted key looks like a
             # camera nobody has got round to grouping yet.
             changed["zone"] = None if edit.zone is None else edit.zone.value
+        if edit.capabilities is not UNSET:
+            # `names()` is already sorted, for the same stable-diff reason
+            # `notify_on` sorts below.
+            changed["capabilities"] = edit.capabilities.names()
         if edit.notify_on is not UNSET:
             # Sorted, not just listed: `frozenset` iterates in an order that
             # depends on the process's string hash seed, so writing it raw would
@@ -630,6 +1115,47 @@ class CameraFileStore:
             record = next(camera for camera in cameras if camera.camera_id == camera_id)
             self._write(candidate)
             return record
+
+    async def set_enabled(self, camera_id: str, enabled: bool) -> CameraConfig:
+        """Start or stop watching a camera, persistently. Returns the record as stored.
+
+        `apply`'s order — read, transform, re-parse the whole document, then write — so
+        a file this build could not load back is refused before it reaches the disk.
+        """
+        async with self._lock:
+            origin = str(self._path)
+            document = _read_document(self._path)
+            candidate = enabled_document(document, camera_id, enabled, origin)
+            cameras = parse_cameras(candidate, origin)
+            record = next(camera for camera in cameras if camera.camera_id == camera_id)
+            self._write(candidate)
+            return record
+
+    async def create(self, create: CameraCreate) -> CameraConfig:
+        """Persist a new camera and return it as the file now holds it.
+
+        `apply`'s order exactly — read, build, **re-parse the whole document**, then
+        write — so a camera whose url or capabilities the loader would reject is
+        refused before anything reaches the disk rather than after.
+        """
+        async with self._lock:
+            origin = str(self._path)
+            document = _read_document(self._path)
+            candidate = created_document(document, create, origin)
+            cameras = parse_cameras(candidate, origin)
+            record = next(camera for camera in cameras if camera.camera_id == create.camera_id)
+            self._write(candidate)
+            return record
+
+    async def remove(self, camera_id: str) -> None:
+        """Drop a camera from the file. Re-parsed before writing, like every other path
+        here, so removing one cannot leave a document the next startup refuses."""
+        async with self._lock:
+            origin = str(self._path)
+            document = _read_document(self._path)
+            candidate = removed_document(document, camera_id, origin)
+            parse_cameras(candidate, origin)
+            self._write(candidate)
 
     def _write(self, document: Any) -> None:
         """Write-then-rename, `fsync`ed at both ends.

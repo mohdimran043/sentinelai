@@ -4,6 +4,321 @@
  */
 
 export interface paths {
+    "/alerts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The operator's alert list — episodes, not events (volatile)
+         * @description Every alert this process is holding, worst first then most recent first.
+         *
+         *     **An alert is not an event.** An event is what happened; an alert is an *episode*
+         *     that events accumulate into, with an occurrence count. Measured on real footage,
+         *     forty-five seconds of one corridor produced eleven events — and would produce
+         *     eleven rows without this. §17 requires that twenty seconds of the same person is
+         *     one alert saying it happened seventeen times.
+         *
+         *     **Volatile, and more sharply so than the event ring.** This register lives in
+         *     engine memory and a restart empties it. The durable record is the anomaly event
+         *     published to RabbitMQ; alert persistence belongs to the Phase 1C store, which is
+         *     not built. The consequence worth stating plainly: **an acknowledgement does not
+         *     survive a restart.** An operator who acknowledged twenty alerts and then saw the
+         *     engine restart is looking at twenty unacknowledged alerts again.
+         *
+         *     Ordering is the engine's, not the client's, so that every reader agrees about what
+         *     is at the top — §27's "the critical thing must be visible immediately" is a
+         *     property of that ordering rather than of whoever asked.
+         */
+        get: operations["list_alerts_alerts_get"];
+        put?: never;
+        post?: never;
+        /**
+         * Clear the whole alert list
+         * @description Empty the register, and write that emptiness down.
+         *
+         *     **Throws away triage state, not evidence.** Every event behind these alerts is
+         *     already published to the broker and is still there; what goes is the record of which
+         *     ones a human had looked at. That is a real loss and the console asks twice before
+         *     calling this.
+         *
+         *     Flushed before answering, like acknowledging and resolving: a 200 that did not
+         *     survive a restart would be the same lie in the other direction.
+         */
+        delete: operations["clear_alerts_alerts_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alerts/{alert_id}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record that a person has seen this alert
+         * @description Move an alert to `acknowledged`.
+         *
+         *     The state that matters most on a wall of alerts, because it is the only one that
+         *     distinguishes "nobody has looked" from "somebody is handling it".
+         *
+         *     **`by` is a self-declared label, not an identity.** This engine has no
+         *     authentication, so an acknowledgement records what somebody typed. That is worth
+         *     having and it is not an audit trail; see `docs/operations.md`.
+         *
+         *     A subsequent recurrence keeps the alert acknowledged rather than re-raising it —
+         *     a person already knows, and putting it back in front of them for something they
+         *     are in the middle of dealing with is how an operator learns to ignore the list.
+         */
+        post: operations["acknowledge_alert_alerts__alert_id__acknowledge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alerts/{alert_id}/clip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Watch the recording behind one alert
+         * @description The evidence clip, as bytes a browser can play.
+         *
+         *     **This is the only route that serves a recording**, and the alert id is the whole of
+         *     the authorisation. The object it reads is looked up from the alert, never taken from
+         *     the request, so no caller can name an object the engine did not itself attach to an
+         *     alert — and `MinioClipReader` re-checks the bucket rather than trusting that.
+         *
+         *     `short=true`, the default, returns the notification-length copy
+         *     (`SENTINEL_NOTIFY_CLIP_SECONDS`, three by default) — the length that is watched
+         *     rather than scrolled past when an operator is triaging a wall of rows. It falls back
+         *     to the full recording when no short copy was made, because "here is a longer answer"
+         *     beats "there is nothing here" for somebody asking what happened. `short=false`
+         *     always returns the full clip: pre-roll, the event, post-roll.
+         *
+         *     `Cache-Control: private, max-age=60` rather than `no-store`. A clip is fixed once
+         *     written, so re-fetching it on every render is waste — but it is footage of people,
+         *     so it is never a shared-cache entry and never long-lived.
+         */
+        get: operations["read_alert_clip_alerts__alert_id__clip_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alerts/{alert_id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record that a person has finished with this alert
+         * @description Move an alert to `resolved`.
+         *
+         *     Idempotent: two operators closing the same row is an ordinary race, not a mistake
+         *     either of them made.
+         *
+         *     A resolved alert stops absorbing recurrences — a person said it was finished, and
+         *     quietly reopening it would erase that judgement. The same situation happening again
+         *     opens a new alert, which is the truthful reading.
+         *
+         *     **Nothing resolves itself.** There is no timeout and no auto-close anywhere in this
+         *     subsystem, because an alert that expired quietly would leave no trace that nobody
+         *     ever went to look.
+         */
+        post: operations["resolve_alert_alerts__alert_id__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/authorized-persons": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Everyone enrolled — names and permissions, never biometric data
+         * @description The enrolled roster (spec §23).
+         *
+         *     **Carries no biometric data.** No embeddings, no vectors, no reference images —
+         *     those live in the encrypted store and never travel on this API. §12 asks that
+         *     biometric information is not exposed unnecessarily, and for a roster listing the
+         *     necessary amount is none. `reference_faces` is a count, because §10 asks for
+         *     multiple references per person and "1" is usually the reason somebody is not being
+         *     recognised from an angle.
+         *
+         *     An engine with no camera enabling `person_authorization` answers an empty list
+         *     rather than an error: nobody is enrolled, which is true.
+         */
+        get: operations["list_people_authorized_persons_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/authorized-persons/{person_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Create or replace an authorised person
+         * @description Enrol somebody, or change what they are authorised for.
+         *
+         *     Carries no faces — those are enrolled separately, against an existing person, so
+         *     that creating a record and handing over biometric data are two deliberate acts
+         *     rather than one.
+         *
+         *     **`camera_ids: []` authorises nowhere.** The opposite default would make forgetting
+         *     to set it a silent grant everywhere, which for an access rule is the failure worth
+         *     designing against.
+         *
+         *     `PUT` rather than `POST` because the id is the caller's to choose and the operation
+         *     is idempotent: replaying it produces the same record rather than a second person.
+         */
+        put: operations["upsert_person_authorized_persons__person_id__put"];
+        post?: never;
+        /**
+         * Delete a person and every face enrolled for them
+         * @description Remove somebody and **all** of their biometric data (spec §12).
+         *
+         *     Not a soft delete. A record that removed the name while leaving the vectors would
+         *     keep exactly the part that identifies somebody, which is the opposite of what a
+         *     deletion request means.
+         *
+         *     Distinct from disabling: `PUT` with `status: disabled` revokes access while keeping
+         *     the record, which is what an investigation of a past incident needs. This is what a
+         *     person exercising a data right needs. Conflating them means one of those two
+         *     obligations cannot be met.
+         */
+        delete: operations["delete_person_authorized_persons__person_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/authorized-persons/{person_id}/faces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The reference faces on one person's record — metadata, not pictures
+         * @description Which references exist, how old each is, and whether a photograph was kept.
+         *
+         *     Enough to draw the roster and to decide which reference to remove when somebody has
+         *     stopped being recognised — usually the oldest, taken under different lighting.
+         */
+        get: operations["list_faces_authorized_persons__person_id__faces_get"];
+        put?: never;
+        /**
+         * Enrol one reference face from a photograph
+         * @description Turn a photograph into a stored face embedding (spec §9).
+         *
+         *     The flow is detect → quality check → align → embed → encrypt → store, and **the
+         *     photograph is not kept**. What persists is the embedding, sealed with AES-256-GCM.
+         *     §12 asks for embeddings over raw biometric images where possible, and here it is
+         *     entirely possible.
+         *
+         *     The largest face in the image is used, on the assumption that an enrolment
+         *     photograph is *of* somebody rather than a crowd scene. Choosing by detector
+         *     confidence instead would sometimes pick a sharp bystander over a slightly soft
+         *     subject.
+         *
+         *     **Enrol more than one.** §10 asks for multiple references per person, and a single
+         *     face-on office photograph matches a corridor camera at an angle poorly. The usual
+         *     fix for somebody not being recognised is a second reference, not a lower threshold.
+         */
+        post: operations["enroll_face_authorized_persons__person_id__faces_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/authorized-persons/{person_id}/faces/{face_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove one reference face and its photograph
+         * @description Drop one reference — its embedding and its picture together.
+         *
+         *     Finer-grained than deleting the person, and the difference matters: a reference
+         *     taken in bad light makes somebody *harder* to recognise, and the fix is to remove
+         *     that reference, not to un-enrol them and start again.
+         */
+        delete: operations["delete_face_authorized_persons__person_id__faces__face_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/authorized-persons/{person_id}/faces/{face_id}/image": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One reference photograph
+         * @description The face crop stored at enrolment, decrypted for this one request.
+         *
+         *     **Not the photograph that was uploaded.** What is kept is the detector's own face
+         *     box with a margin, at most 320 px on its longest side — enough for a person to
+         *     recognise a person, and deliberately not a copy of whatever else was in the frame
+         *     (§12). See `orchestrator/face_crop.py`.
+         *
+         *     `Cache-Control: no-store`, because a browser cache is a copy of biometric data on
+         *     disk that nothing in this system knows about or can delete when the person is
+         *     deleted.
+         */
+        get: operations["read_face_image_authorized_persons__person_id__faces__face_id__image_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cameras": {
         parameters: {
             query?: never;
@@ -14,7 +329,50 @@ export interface paths {
         /** List Cameras */
         get: operations["list_cameras_cameras_get"];
         put?: never;
-        post?: never;
+        /**
+         * Add a camera and start watching it — no restart
+         * @description Add a camera to `cameras.json` and start it immediately.
+         *
+         *     **The point of the write surface.** Every other endpoint here edits a camera
+         *     somebody already put in the file by hand; this is what lets a console stand one up
+         *     without an operator opening an editor and restarting the engine.
+         *
+         *     Adding takes a `url` where `PATCH` refuses one, and the difference is not arbitrary:
+         *     changing a running camera's source means tearing down its runner, its pre-roll ring
+         *     and any clip mid-recording. A camera that does not exist yet has none of those.
+         */
+        post: operations["create_camera_cameras_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cameras/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Look at a stream before adding it
+         * @description Open a URL once, decode one frame, and report what it found — with a picture.
+         *
+         *     A camera added with a wrong URL fails quietly: it appears in the list and its runner
+         *     retries forever behind exponential backoff, with nothing to see but a `frames_seen`
+         *     that never moves. This is how an operator learns that *before* saving.
+         *
+         *     `ok: false` comes back as a 200. The caller renders the outcome either way, and a
+         *     4xx would conflate "this URL does not play" with "your request was malformed".
+         *
+         *     Behind the same flag as the writes it precedes, because it makes the engine fetch a
+         *     URL the caller chose — exactly the capability that flag exists to gate on an
+         *     unauthenticated port.
+         */
+        post: operations["probe_camera_cameras_probe_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -31,7 +389,15 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Stop a camera and remove it from the file
+         * @description Stop watching, then remove the record — in that order.
+         *
+         *     The opposite order to `create_camera`, for the same underlying rule: never leave
+         *     something running that the file does not describe. Writing first and then failing to
+         *     stop would leave a camera publishing events under an id nothing can look up.
+         */
+        delete: operations["delete_camera_cameras__camera_id__delete"];
         options?: never;
         head?: never;
         /**
@@ -167,6 +533,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cameras/{camera_id}/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The most recent frame from one camera, as a JPEG
+         * @description A picture of what this camera is seeing right now.
+         *
+         *     **Not video, and not a replacement for it.** Live video is mediamtx's job and the
+         *     console plays it straight from there (`src/live/HlsPlayer.tsx`). But only cameras
+         *     *published to* mediamtx have a playlist, and an EarthCam page or a local file does
+         *     not — before this, those cameras showed an empty panel while the engine was
+         *     demonstrably decoding them.
+         *
+         *     So this is the fallback the console uses when there is no playlist: one frame, on
+         *     request, which the engine already had. `Cache-Control: no-store`, because the whole
+         *     value of the thing is that it is current.
+         */
+        get: operations["camera_snapshot_cameras__camera_id__snapshot_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cameras/{camera_id}/telemetry": {
         parameters: {
             query?: never;
@@ -255,6 +651,141 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AcknowledgeRequest */
+        AcknowledgeRequest: {
+            /**
+             * By
+             * @description Who is acknowledging. **This engine has no authentication**, so this is a self-declared label and not an identity — it records what somebody typed, which is worth having and is not an audit trail. See `docs/operations.md`.
+             */
+            by: string;
+        };
+        /**
+         * AlertEntry
+         * @description One ongoing situation an operator is asked to act on (spec §17).
+         *
+         *     **Not an event.** An event is what happened; an alert is an *episode* that events
+         *     accumulate into. Measured on real footage, forty-five seconds of one corridor
+         *     produced eleven events and would produce eleven rows — `occurrences` is what turns
+         *     that back into one row saying how many times it happened.
+         */
+        AlertEntry: {
+            /** Acknowledged At */
+            acknowledged_at?: number | null;
+            /** Acknowledged By */
+            acknowledged_by?: string | null;
+            /**
+             * Alert Id
+             * Format: uuid
+             */
+            alert_id: string;
+            /** Camera Id */
+            camera_id: string;
+            /** Camera Label */
+            camera_label: string;
+            /**
+             * Clip Uri
+             * @description The first contributing clip that finished, for the same reason. Null when no clip has finished yet, which is normal early in an episode — clips complete after their event is assembled. A storage URI, not a URL: it is here so an operator can say which object an alert refers to. To *watch* it, GET /alerts/{alert_id}/clip, which is the only route by which this engine will serve a recording.
+             */
+            clip_uri?: string | null;
+            /**
+             * Description
+             * @description The most recent contributing event's description. Most recent rather than first because an episode develops — what is happening now is more use to somebody deciding whether to go than what was happening a minute ago.
+             */
+            description: string;
+            /**
+             * Event Ids
+             * @description The **first** contributing events, bounded. First rather than latest because an investigator works backwards from the start of an episode, and the oldest event is the one whose clip shows how it began.
+             */
+            event_ids: string[];
+            /** First Seen */
+            first_seen: number;
+            /**
+             * Last Seen
+             * @description Unix epoch seconds, like `occurred_at` — sortable across cameras.
+             */
+            last_seen: number;
+            /**
+             * Notify Clip Uri
+             * @description The same recording trimmed to SENTINEL_NOTIFY_CLIP_SECONDS, when the writer made one — what a notification carries, and what GET /alerts/{alert_id}/clip returns by default. Null is ordinary: the engine may be configured to make no short copy, and the trim can fail without costing the full clip. Null here while `clip_uri` is set means the short request falls back to the full recording, never to nothing.
+             */
+            notify_clip_uri?: string | null;
+            /**
+             * Occurrences
+             * @description How many events have folded into this episode. Always exact, even once `event_ids` stops being complete.
+             */
+            occurrences: number;
+            /** @description How urgently this should be served, known from the reason alone before any model has looked. Distinct from `severity`: severity is how bad the scene appears, priority is how bad it would be to get this one wrong. */
+            priority: components["schemas"]["EventPriority"];
+            /** @description What kind of situation this is. The same vocabulary as an event's. */
+            reason: components["schemas"]["EscalationReason"];
+            /** @description The worse of what the model saw and what the reason structurally implies, and it **rises across an episode and never falls** — one calm frame must not drop an escalating situation down the list. */
+            severity: components["schemas"]["Severity"];
+            /** @description `active` — nobody has looked. `acknowledged` — a person has seen it and is dealing with it. `resolved` — a person has said it is finished. **Nothing here changes on its own:** no alert ages out, because an alert that expired quietly would leave no trace that nobody ever went to look. */
+            state: components["schemas"]["AlertState"];
+            /**
+             * Subject
+             * @description Which tracked identity this episode is about, as a comma-separated list of track ids, or `""` for a camera-level finding with nobody to attribute it to (camera tampering). Two events with the same camera, reason and subject are the same episode; a different subject is a different person and a different alert.
+             */
+            subject: string;
+            /** @description Where the camera watches, or null when ungrouped. */
+            zone?: components["schemas"]["Zone"] | null;
+        };
+        /**
+         * AlertState
+         * @enum {string}
+         */
+        AlertState: "active" | "acknowledged" | "resolved";
+        /** AlertsResponse */
+        AlertsResponse: {
+            /**
+             * Alerts
+             * @description Worst first, then most recent first. Ordered by the engine rather than left to the client so that every reader agrees about what is at the top of the list — §27's requirement that the critical thing is visible immediately is a property of this ordering.
+             */
+            alerts: components["schemas"]["AlertEntry"][];
+            /**
+             * Open Count
+             * @description How many are not yet resolved — the number worth putting on a badge.
+             */
+            open_count: number;
+        };
+        /** Body_enroll_face_authorized_persons__person_id__faces_post */
+        Body_enroll_face_authorized_persons__person_id__faces_post: {
+            /** Image */
+            image: string;
+        };
+        /**
+         * CameraCreateRequest
+         * @description A new camera, as the console describes one.
+         *
+         *     `url` is here and is absent from `CameraEditRequest`, and that asymmetry is the
+         *     design: changing a running camera's source means tearing down its runner, its
+         *     pre-roll and any clip mid-recording, while adding one destroys nothing.
+         *
+         *     `profile` is absent from both. The escalation policy has live state — cooldowns, a
+         *     part-filled token bucket — so a new camera starts on the defaults and tuning it is
+         *     still `cameras.json` and a restart.
+         */
+        CameraCreateRequest: {
+            /** Camera Id */
+            camera_id: string;
+            /**
+             * Capabilities
+             * @description Null takes the engine's defaults. A capability whose model this process never loaded is refused with a 409 naming the restart — which models exist is decided at startup.
+             */
+            capabilities?: components["schemas"]["Capability"][] | null;
+            /**
+             * Label
+             * @default
+             */
+            label: string;
+            /**
+             * Url
+             * @description An rtsp(s) URL, an earthcam.com **page** URL, or a local file path. Which source gets built is decided from this and nothing else.
+             */
+            url: string;
+            /** @description The group this camera belongs to. Null leaves it ungrouped. */
+            zone?: components["schemas"]["Zone"] | null;
+        };
         /**
          * CameraEditRequest
          * @description A partial edit to one camera's record: its label, its zone, and its welfare
@@ -272,6 +803,13 @@ export interface components {
          *     worked, and watching the old stream for a week.
          */
         CameraEditRequest: {
+            /**
+             * Capabilities
+             * @description Which AI capabilities run on this camera, replacing whatever is configured now — a whole new list, not an addition to the old one. **`[]` means run nothing on this camera**, which is a real instruction and not an empty edit: the camera stays watched and decoded, and no model is run against it. Omit the field to leave the capabilities alone; `null` is rejected, because `[]` already says the only thing it could mean.
+             *
+             *     **A capability can only be enabled if this process already loaded the model it needs.** Which models exist is decided once, at startup, from the union over every configured camera (see `GET /cameras`), because loading a 3B vision model is a multi-second download-and-place that cannot happen under an HTTP request without stalling every camera sharing the GPU. Enabling one whose model is absent is a 409 naming the restart, never a 200 that quietly did nothing — the same fail-loud this endpoint applies to `url`. Disabling is always allowed.
+             */
+            capabilities?: components["schemas"]["Capability"][] | null;
             /**
              * Clip Postroll Seconds
              * @description Seconds of video to keep recording after a notified concern's keyframe, for this camera only. `null` reverts it to the engine-wide default; omitting the field leaves it as configured. Must be greater than zero — a clip that ends where it begins is not a shorter clip, it is no clip.
@@ -312,6 +850,11 @@ export interface components {
         CameraEditResponse: {
             /** Camera Id */
             camera_id: string;
+            /**
+             * Capabilities
+             * @description The capabilities now stored for this camera, sorted — always the full list, never a diff. `[]` means nothing runs on this camera. Identical in meaning to `CameraStatus.capabilities`, so a console can compare what it wrote against what it later reads there.
+             */
+            capabilities: components["schemas"]["Capability"][];
             /**
              * Clip Postroll Seconds
              * @description As `clip_preroll_seconds`: the stored override, or null for the default.
@@ -405,6 +948,11 @@ export interface components {
             /** Camera Id */
             camera_id: string;
             /**
+             * Capabilities
+             * @description Which AI capabilities are running on this camera, as the engine has them — always the full list, never a diff, and sorted so two reads of the same record compare equal. `[]` is a stored choice, not an unset field: the camera is watched and decoded, and nothing is run on it. **Render this as what the engine is doing, not as what the file asked for** — it is read back off the running camera, which is what makes a capability checkbox honest rather than decorative. A capability absent here is one no model was loaded for.
+             */
+            capabilities: components["schemas"]["Capability"][];
+            /**
              * Clip Postroll Seconds
              * @description As `clip_preroll_seconds`: the stored override, or null for the default.
              */
@@ -422,6 +970,12 @@ export interface components {
             escalations: number;
             /** Escalations Dropped */
             escalations_dropped: number;
+            /**
+             * Falls Suspected
+             * @description How many fall signatures have completed on this camera since the engine started. Always 0 on a camera without the `fall_detection` capability, and 0 is not the same claim as absent — it means the machine ran and saw nothing. Cumulative and monotonic within one process run; it resets on restart, like every other counter here. **Not a count of falls**: it is a count of times a geometry state machine's signature completed and a vision-language model was asked to confirm. See the camera's events for what the model then said.
+             * @default 0
+             */
+            falls_suspected: number;
             /** Frames Dropped */
             frames_dropped: number;
             /** Frames Seen */
@@ -433,8 +987,18 @@ export interface components {
             label: string;
             /** Last Escalation At */
             last_escalation_at: number | null;
-            /** Last Frame At */
+            /**
+             * Last Frame At
+             * @description When the last frame arrived, on **this camera's own source timeline** — `time.monotonic()` for a live RTSP camera, seconds-from-start-of-file for a replayed one. It is what correlates telemetry with a clip's pts, and it is **not** a wall-clock time: it resets on restart and two cameras do not share an origin. Never render it as an age — use `last_frame_epoch`.
+             */
             last_frame_at: number | null;
+            /**
+             * Last Frame Epoch
+             * @description When this camera was last **observed** to have delivered a frame, in Unix epoch seconds. This is the field a liveness indicator reads.
+             *
+             *     Separate from `last_frame_at` because that one cannot answer the question: reading a source timeline as an epoch put every camera at '20712d ago' and reported '0 of 3 delivering' while all three were. Observational — it is stamped when a read notices the source timeline has advanced — so it is as fresh as the last time somebody asked, which for a polling console is every few seconds. Null when this camera has not been seen to deliver anything yet.
+             */
+            last_frame_epoch?: number | null;
             /** @description The stored confidence threshold. Never null: a camera always has one. */
             notify_min_confidence: components["schemas"]["Confidence"];
             /**
@@ -463,6 +1027,15 @@ export interface components {
             config_writable: boolean;
         };
         /**
+         * Capability
+         * @description What an operator turns on for one camera.
+         *
+         *     `StrEnum` so it serialises as its own wire value with no encoder — the same reason
+         *     `Zone` and `ConcernKind` are.
+         * @enum {string}
+         */
+        Capability: "scene_description" | "anomaly_detection" | "fall_detection" | "abandoned_object" | "camera_tamper" | "person_authorization" | "zone_monitoring";
+        /**
          * ConcernKind
          * @description What the VLM's welfare-focused prompt asks the frame to be checked for.
          * @enum {string}
@@ -484,6 +1057,61 @@ export interface components {
              * Format: uuid
              */
             event_id: string;
+        };
+        /**
+         * EnrolledFaceEntry
+         * @description One reference face on a person's record.
+         *
+         *     Metadata only — the picture is fetched one at a time from its own endpoint. A list
+         *     that inlined the images would move every enrolled person's biometric data across the
+         *     network to draw a table of names, which is the opposite of §12's "do not expose
+         *     biometric information unnecessarily".
+         */
+        EnrolledFaceEntry: {
+            /**
+             * Enrolled At
+             * @description Unix epoch seconds, or null for a face enrolled before this was recorded. Null means unknown, never 1970.
+             */
+            enrolled_at?: number | null;
+            /**
+             * Face Id
+             * Format: uuid
+             */
+            face_id: string;
+            /**
+             * Has Image
+             * @description Whether a reference photograph was kept. False is a real answer, not a loading state: enrolment can keep the embedding and no picture.
+             */
+            has_image: boolean;
+        };
+        /**
+         * EscalationReason
+         * @description Why a frame was escalated to the vision-language model.
+         *
+         *     The seven from spec §4.1, plus `FALL_SUSPECTED` (§7), which is a different kind of
+         *     thing from the rest and is grouped last for that reason. The first six are
+         *     *predicates on one frame* asking "is this scene worth a look"; `USER_REQUESTED` is
+         *     a person asking directly; `FALL_SUSPECTED` is a **temporal state machine** over
+         *     several seconds reporting that a specific signature completed
+         *     (`domain/behaviour/fall.py`).
+         * @enum {string}
+         */
+        EscalationReason: "new_salient_track" | "scene_change" | "dwell_exceeded" | "speed_anomaly" | "track_count_spike" | "periodic_summary" | "user_requested" | "fall_suspected" | "abandoned_object" | "camera_tamper" | "zone_intrusion" | "line_crossing" | "unauthorized_person";
+        /**
+         * EventPriority
+         * @description §16's four bands, as an ordered vocabulary.
+         *
+         *     A `StrEnum` rather than an int so it serialises and reads as itself, with
+         *     `_RANK` below supplying the ordering — the same arrangement `Confidence.meets`
+         *     uses, and for the same reason: `EventPriority.LOW > EventPriority.CRITICAL` is
+         *     `True` by alphabet, which is the exact inversion of what anyone writing it means.
+         * @enum {string}
+         */
+        EventPriority: "critical" | "high" | "medium" | "low";
+        /** FacesResponse */
+        FacesResponse: {
+            /** Faces */
+            faces: components["schemas"]["EnrolledFaceEntry"][];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -507,6 +1135,164 @@ export interface components {
             state: string;
             /** Vram Mib */
             vram_mib: number;
+        };
+        /** PeopleResponse */
+        PeopleResponse: {
+            /** People */
+            people: components["schemas"]["PersonEntry"][];
+        };
+        /**
+         * PersonEntry
+         * @description One enrolled person, as a console lists them (spec §23).
+         *
+         *     **Carries no biometric data.** No embedding, no vector, no image — those live in
+         *     the encrypted store and never travel on this API. What a console shows is a name, a
+         *     status and where somebody is authorised, and that is deliberately all it can show:
+         *     §12 asks that biometric information is not exposed unnecessarily, and the necessary
+         *     amount here is none.
+         *
+         *     `reference_faces` is a count rather than the faces themselves, for the same reason.
+         *     The faces have their own endpoint, and their photographs one each — see
+         *     `EnrolledFaceEntry`.
+         *     It is worth showing because §10 asks for multiple references per person and "1" is
+         *     usually the reason somebody is not being recognised.
+         */
+        PersonEntry: {
+            /**
+             * Camera Ids
+             * @description Cameras this person is authorised on. **Empty means none, not all** — a person enrolled with no cameras assigned is authorised nowhere until somebody says where. The opposite default would make forgetting to set this a silent grant.
+             */
+            camera_ids: string[];
+            /** Display Name */
+            display_name: string;
+            /**
+             * Expires At
+             * @description Unix epoch seconds after which this authorisation lapses, or null for no expiry. §10's temporary authorisation — without it every temporary grant becomes a permanent one somebody forgot to revoke.
+             */
+            expires_at?: number | null;
+            /** External Reference */
+            external_reference?: string | null;
+            /**
+             * Notes
+             * @default
+             */
+            notes: string;
+            /**
+             * Person Id
+             * Format: uuid
+             */
+            person_id: string;
+            /**
+             * Reference Faces
+             * @description How many reference faces are enrolled. A count, never the faces. One is usually the reason somebody is not being recognised from an angle.
+             */
+            reference_faces: number;
+            status: components["schemas"]["PersonStatus"];
+            /**
+             * Zones
+             * @description Zone names authorised, as an alternative to cameras.
+             */
+            zones: string[];
+        };
+        /**
+         * PersonRequest
+         * @description Create or replace an authorised person. Carries no biometric data either —
+         *     faces are enrolled separately, against an existing person.
+         */
+        PersonRequest: {
+            /**
+             * Camera Ids
+             * @description Cameras to authorise on. Empty authorises nowhere.
+             */
+            camera_ids?: string[];
+            /** Display Name */
+            display_name: string;
+            /** Expires At */
+            expires_at?: number | null;
+            /**
+             * External Reference
+             * @description A site's own identifier — staff number, badge id. Opaque here and never used for matching; it exists so an operator can reconcile this record with whatever system actually governs employment.
+             */
+            external_reference?: string | null;
+            /**
+             * Notes
+             * @default
+             */
+            notes: string;
+            /** @default active */
+            status: components["schemas"]["PersonStatus"];
+            /** Zones */
+            zones?: string[];
+        };
+        /**
+         * PersonStatus
+         * @description Whether an enrolled person's authorisation is currently in force.
+         *
+         *     `DISABLED` rather than deletion is the point: §12 requires an audit trail and a
+         *     deletion function, and those are different operations. Disabling revokes access
+         *     while keeping the record of who was authorised and when — which is what an
+         *     investigation of a past incident needs. Deleting removes the biometric data, which
+         *     is what a person exercising a data right needs. Conflating them means one of those
+         *     two obligations cannot be met.
+         * @enum {string}
+         */
+        PersonStatus: "active" | "disabled";
+        /**
+         * ProbeRequest
+         * @description Look at a stream before committing to it.
+         */
+        ProbeRequest: {
+            /** Url */
+            url: string;
+        };
+        /**
+         * ProbeResponse
+         * @description What one look at a stream found.
+         *
+         *     `ok` false is a normal answer, not an error status: the caller is rendering a
+         *     preview either way, and a 4xx would make "this URL is wrong" indistinguishable from
+         *     "the request was malformed".
+         */
+        ProbeResponse: {
+            /**
+             * Codec
+             * @default
+             */
+            codec: string;
+            /** Detail */
+            detail: string;
+            /**
+             * Fps
+             * @default 0
+             */
+            fps: number;
+            /**
+             * Height
+             * @default 0
+             */
+            height: number;
+            /** Ok */
+            ok: boolean;
+            /**
+             * Source Kind
+             * @description `earthcam`, `rtsp` or `file` — which source the engine would build.
+             */
+            source_kind: string;
+            /**
+             * Thumbnail
+             * @description One decoded frame as a `data:image/jpeg;base64,…` URL, or null. The point of a preview: a stream that opens and decodes green looks identical to a working one in every other field here.
+             */
+            thumbnail?: string | null;
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Width
+             * @default 0
+             */
+            width: number;
         };
         /**
          * RecentEventEntry
@@ -588,6 +1374,11 @@ export interface components {
              */
             welfare_concerns: components["schemas"]["WelfareConcernEntry"][];
         };
+        /**
+         * Severity
+         * @enum {string}
+         */
+        Severity: "info" | "low" | "medium" | "high" | "critical";
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -656,6 +1447,462 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_alerts_alerts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertsResponse"];
+                };
+            };
+        };
+    };
+    clear_alerts_alerts_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description How many alerts were dropped. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: number;
+                    };
+                };
+            };
+        };
+    };
+    acknowledge_alert_alerts__alert_id__acknowledge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertEntry"];
+                };
+            };
+            /** @description No alert with this id is held by the running engine. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description This alert is already resolved, so acknowledging it would change nothing — which usually means the operator is acting on a stale list. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_alert_clip_alerts__alert_id__clip_get: {
+        parameters: {
+            query?: {
+                short?: boolean;
+            };
+            header?: never;
+            path: {
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The clip, as MP4. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "video/mp4": unknown;
+                };
+            };
+            /** @description No alert with this id, or no clip to play — nothing was recorded, the clip has passed its retention window, or this engine has no object store configured. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resolve_alert_alerts__alert_id__resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alert_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertEntry"];
+                };
+            };
+            /** @description No alert with this id is held by the running engine. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_people_authorized_persons_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PeopleResponse"];
+                };
+            };
+        };
+    };
+    upsert_person_authorized_persons__person_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonEntry"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_person_authorized_persons__person_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No enrolled person with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_faces_authorized_persons__person_id__faces_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FacesResponse"];
+                };
+            };
+            /** @description No enrolled person with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enroll_face_authorized_persons__person_id__faces_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_enroll_face_authorized_persons__person_id__faces_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonEntry"];
+                };
+            };
+            /** @description No enrolled person with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No usable face was found in the image. The reason is in the detail — an enrolment that silently stored nothing is how somebody becomes unrecognisable with nobody able to say why. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_face_authorized_persons__person_id__faces__face_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+                face_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No such face on that person's record. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    read_face_image_authorized_persons__person_id__faces__face_id__image_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: string;
+                face_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored face crop. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                };
+            };
+            /** @description No such face, or no photograph was kept for it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description No camera on this engine enables person authorization. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_cameras_cameras_get: {
         parameters: {
             query?: never;
@@ -672,6 +1919,141 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CamerasResponse"];
+                };
+            };
+        };
+    };
+    create_camera_cameras_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CameraCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CameraEditResponse"];
+                };
+            };
+            /** @description Camera writes are disabled on this engine. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A camera with this id already exists, or a capability was asked for whose model this process never loaded. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The camera could not be built — the detail says why. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The engine is still starting. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    probe_camera_cameras_probe_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProbeResponse"];
+                };
+            };
+            /** @description Camera writes are disabled on this engine. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_camera_cameras__camera_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                camera_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Camera writes are disabled on this engine. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No camera with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -714,7 +2096,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description `cameras.json` cannot be edited as it currently stands — most often because the file has been changed by hand since the engine started and no longer contains this camera. Nothing was written. */
+            /** @description The edit cannot be taken as things currently stand, and **nothing was written**. Either `cameras.json` no longer admits it — most often because the file has been changed by hand since the engine started and no longer contains this camera — or `capabilities` named one whose model this process did not load, which needs a restart rather than a retry. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -789,6 +2171,44 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["CameraEventsResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    camera_snapshot_cameras__camera_id__snapshot_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                camera_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The latest decoded frame. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                };
+            };
+            /** @description No such camera, or no frame has arrived yet. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

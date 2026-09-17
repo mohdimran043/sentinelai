@@ -5,7 +5,7 @@ decision and the next state, so a caller threads state through frames without
 the gate ever holding mutable state or reading a clock.
 
 Order of evaluation matters and is deliberate:
-  1. vlm_enabled           — a disabled camera short-circuits everything
+  1. auto_escalation_enabled  — a camera that raises nothing by itself stops here
   2. triggers              — is anything worth looking at?
   3. post-call cooldown    — is it simply too soon since the last call?
   4. duplicate suppression — have we already described this exact scene?
@@ -134,9 +134,11 @@ def decide(scene: SceneState, profile: CameraProfile, state: GateState) -> GateO
         dwell_anchors=advance_dwell_anchors(ctx),
     )
 
-    if not profile.vlm_enabled:
+    if not profile.auto_escalation_enabled:
         return GateOutcome(
-            decision=EscalationDecision(should_escalate=False, suppressed_by="vlm_disabled"),
+            decision=EscalationDecision(
+                should_escalate=False, suppressed_by="auto_escalation_disabled"
+            ),
             state=carried,
         )
 

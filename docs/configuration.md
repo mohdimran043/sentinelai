@@ -4,7 +4,7 @@ Two mechanisms, and the split is deliberate:
 
 - **`SENTINEL_*` environment variables** (or a `.env` file in `ai-engine/`) for
   everything that is a process-wide scalar. Defined in
-  `ai-engine/sentinel_ai/config.py` — 40 settings, all listed below.
+  `ai-engine/sentinel_ai/config.py` — 58 settings, all listed below.
 - **`cameras.json`** for the camera list, because a camera is a nested record
   with a nested per-camera profile. Flattening a list of those into environment
   names is a worse interface than one small document you can diff, review and
@@ -83,6 +83,176 @@ from under-reporting is not.
 small dummy frame. On a real 810×1080 frame the VLM's true peak was observed
 938 MiB higher than the warmup figure. `RESERVED` absorbs this today; do not
 tune `RESERVED` to zero.
+
+## Pose (fall detection)
+
+Loaded only when some camera enables `fall_detection`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_POSE_MODEL_ID` | `yolo11n-pose.pt` | The keypoint model. `n`, not the detector's `s`: pose runs on people the detector already found and degrades to box geometry when a skeleton is missing, so its misses are recoverable where the detector's are not. |
+| `SENTINEL_POSE_VRAM_MIB` | `420` | Startup estimate, replaced by the measured figure after warmup. Measured on an RTX 4090: **462 MiB**. |
+| `SENTINEL_POSE_IDLE_UNLOAD_SECONDS` | unset (never) | Unlike the VLM's 600 s. Pose runs on every sampled frame of a fall-detection camera, so it is idle only when those cameras are empty — and evicting it then means the reload lands exactly when someone walks into an empty room. |
+| `SENTINEL_POSE_CONF_THRESHOLD` | `0.4` | Person confidence inside the pose model's own pass. Distinct from `SENTINEL_DETECTOR_CONF_THRESHOLD`. |
+| `SENTINEL_POSE_IMGSZ` | `640` | Inference size. |
+
+## Person authorization (faces)
+
+Loaded only when some camera enables `person_authorization`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_FACE_ENCRYPTION_KEY` | **unset** | Base64 AES key for the biometric store. **No default, and the engine refuses to start without it** when the capability is enabled — a default key is no key. Generate one with `python -m sentinel_ai.adapters.face.encrypted_store`. |
+| `SENTINEL_FACE_STORE_PATH` | `./var/faces/faces.json` | Enrolled people and their sealed embeddings. Treat as a credential store. It holds **no images**. |
+| `SENTINEL_FACE_MODEL_NAME` | `buffalo_l` | InsightFace bundle: SCRFD detection + ArcFace 512-d embedding, under ONNX Runtime rather than torch. Only the detection and recognition modules are loaded — the bundle also ships age and gender estimators, and this system has no use for either. |
+| `SENTINEL_FACE_VRAM_MIB` | `704` | What `plan_residency()` reserves. Measured: 608 MiB standalone, 654 MiB warming beside the detector. **0 on a box with no CUDA provider for ONNX Runtime**, where the pipeline falls back to CPU — which keeps the capability working, at 125 ms per frame instead of 15. Install the `face-gpu` extra if that matters. |
+
+**Rotating the key makes every enrolled face undecryptable**, so everybody must be
+re-enrolled. That is the honest consequence of the data being genuinely encrypted rather
+than obfuscated.
+
+## Alerts
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_ALERT_REGISTER_CAPACITY` | `500` | How many alerts the in-process register holds before evicting the oldest **closed** one. Bounds memory; not a curation limit. |
+| `SENTINEL_ALERT_MERGE_WINDOW_SECONDS` | `120.0` | How long after its last sighting an alert still absorbs a recurrence. The knob that decides whether an operator sees an *incident* or a *category*. |
+| `SENTINEL_ALERT_STORE_PATH` | `./var/alerts/alerts.json` | Where triage state is written, so **an acknowledgement survives a restart**. Set to `null` for the in-memory-only behaviour this had before the store existed. |
+| `SENTINEL_ALERT_FLUSH_INTERVAL_SECONDS` | `5.0` | How long a *machine-driven* change (an alert opening, an occurrence count rising) may sit unwritten. **Does not apply to acknowledging or resolving**, which are flushed before the API answers. |
+
+**The alert store is not the record of what happened.** That is the anomaly event
+published to RabbitMQ. This file records what a human *did about it* — which alerts were
+seen and which were closed — and that exists nowhere else. It is rewritten whole on
+every save, by write-then-rename, so a process killed mid-write leaves either the old
+complete set or the new one.
+
+A file that cannot be parsed, or one written by a build with a different schema version,
+is treated as "no alerts to restore" and logged. Triage state is lost; the engine starts.
+Taking surveillance down over a bookkeeping file would be the worse failure.
+
+## Evidence clips and notification clips
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_CLIP_RETENTION_DAYS` | `1` | How long a clip is kept, as a **bucket lifecycle rule** the object store enforces. `0` disables it and keeps clips forever. |
+| `SENTINEL_NOTIFY_CLIP_SECONDS` | `3.0` | How much footage a *notification* carries, and what the console plays inline on an alert row. `0` disables the short clip entirely: notifications then carry the full recording, and `GET /alerts/{id}/clip` falls back to it. |
+| `SENTINEL_NOTIFY_CLIP_MIN_SEVERITY` | `high` | The severity at or above which a *notification* gets the short clip instead of the full one. Does not gate the console: `GET /alerts/{id}/clip` serves the short copy for any alert that has one, because an operator scanning a list wants three seconds regardless of band. |
+
+**Two clips, because the two readers want opposite things.** The evidence clip keeps the
+pre-roll and the post-roll for somebody who sits down with it later. A notification is
+read on a phone by somebody deciding whether to walk down a corridor, and the useful
+length is however long it takes to see what happened — so above the severity threshold
+the note links a short cut instead. Below it, the full clip goes, because nobody is
+running anywhere and the context is worth more than the shorter download.
+
+The short clip is **cut from the start** of the finished one, so it is the pre-roll: a
+clip that opened on the fall would show a person already on the floor. It is a remux,
+never a re-encode ([ADR 3](decisions.md#3-clips-are-remuxed-never-re-encoded)) — and the
+rule is sharper here, because this copy is the one most notifications are ever actually
+watched as.
+
+Retention is a lifecycle rule rather than a sweeper inside this process, because a
+sweeper deletes nothing while the engine is down — and an engine that was down for a
+week comes back to a week of clips it should have expired. Set `0` where the bucket
+already has a policy of its own; layering a second one on top is how evidence disappears
+a week before anybody expected.
+
+## Keeping the event loop free
+
+Two settings that exist because this engine is one Python process, and the thread it
+runs on is the resource it is short of
+([ADR 17](decisions.md#17-scale-by-processes-not-by-threads)).
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_SOURCE_MAX_FPS` | `0` (every frame) | Cap what a live source hands to the pipeline. Took three 1080p 30 fps cameras from **85% dropped to 0.0%**. |
+| `SENTINEL_VLM_QUANTIZATION` | `nf4` | `none` loads the vision model in fp16: **1.42 s per describe against 1.97 s**, for 7224 MiB instead of 2820. |
+
+**The frame cap is a cap, not an optimisation.** A camera delivers 30 fps; this pipeline
+processes five to ten. The rest existed only to wake the loop and overwrite a mailbox
+slot. The codec still decodes every frame — an inter-coded frame is meaningless without
+its references — so this saves loop time, not decode time. What it costs is stated
+plainly: **it sets the temporal resolution of everything downstream**, including the fall
+machine's descent-rate measurement. Set it near what the pipeline actually achieves;
+never below what a detector needs.
+
+**`nf4` stays the default** because it is what makes the vision model fit beside a
+detector on an 8 GiB card ([ADR 1](decisions.md#1-bitsandbytes-nf4-not-autoawq)). It
+dequantises weights on every forward pass, which is a good trade when VRAM is scarce and
+a poor one when it is not — and a describe holds the GIL in its per-token loop, so its
+duration is time no camera's frame loop runs.
+
+## Camera sources
+
+`url` decides which source is built, and nothing else does:
+
+| `url` looks like | Source | Notes |
+|---|---|---|
+| `rtsp://` or `rtsps://` | `RtspSource` | Reconnects with backoff |
+| a page under `earthcam.com` | `EarthCamSource` | Resolves a fresh signed stream on every connection |
+| anything else | `FileSource` | Read as a path |
+
+### EarthCam pages
+
+Configure the page a person would open in a browser — not an `.m3u8`:
+
+```json
+{
+  "id": "linkou",
+  "label": "Linkou Old Street, Taiwan",
+  "url": "https://www.earthcam.com/world/taiwan/newtaipeicity/linkoudistrict/"
+}
+```
+
+A page carrying several cameras is disambiguated with EarthCam's own `?cam=` parameter,
+exactly as the site does:
+
+```json
+"url": "https://www.earthcam.com/usa/louisiana/neworleans/bourbonstreet/?cam=bourbonstreet"
+```
+
+Naming a camera the page does not have is a startup error listing the ones it does —
+falling back to a different camera would hand somebody a working stream of the wrong
+street.
+
+**Nothing is cached.** The page hands out a playlist URL signed with `?t=…&td=…` that
+expires, so the source fetches the page again before *every* connection attempt. That is
+the entire recovery strategy: a signature that dies mid-stream is repaired by the
+reconnect its own death triggers, on the inherited exponential backoff. A 403 is
+recognised and logged as `EarthCam stream expired; refreshing stream metadata` rather
+than left to look like a camera that went private.
+
+**The signature is never logged.** Every URL that reaches a log goes through
+`redact_url`, and the field holding the token is kept out of the dataclass's `repr`, so
+a traceback cannot leak what the log statements are careful about.
+
+Check one without starting the engine:
+
+```bash
+python -m sentinel_ai.stream_tools resolve --url "<page url>"   # what the page points at
+python -m sentinel_ai.stream_tools test    --url "<page url>"   # …and decode frames from it
+```
+
+Only `earthcam.com` and its subdomains are fetched, checked on the page URL *and* on
+every media URL the page points at. Without that, a camera entry in `cameras.json` would
+be a server-side request forgery primitive.
+
+## Decode
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SENTINEL_DECODE_HWACCEL` | unset | Hardware decode device type — `cuda`, `qsv`, `drm`, `amf`. **Leave it unset unless CPU is the resource you are short of.** |
+
+This was an inert placeholder until it was implemented and measured, and the measurement
+is why it stays off. On an RTX 4090 at 1080p, CUDA decode alone runs at 801 fps and 0.26
+cores against software's 580 fps and 1.00 core — but the frame still has to reach a numpy
+array in host memory, and pulling an NV12 surface off the GPU to convert it there costs
+more than decoding straight to YUV420P: end to end **1.84 cores against 1.60**. It buys
+camera count on a core-starved box and costs throughput everywhere else.
+
+A device type this FFmpeg build cannot open is a **startup error**, not a silent
+fallback. A deployment that asked for hardware decode and quietly got software is one
+whose capacity planning is wrong and whose logs agree with it.
 
 ## Detector tuning
 
@@ -207,6 +377,160 @@ credentials in them.
   it and the camera is ungrouped, which is a legitimate deployment. Give it a
   value the engine does not know and **startup fails**: a typo'd zone is a
   camera the operator meant to group and silently did not.
+- `capabilities` is optional, and constrained to `scene_description` |
+  `anomaly_detection`. See below.
+
+### Per-camera AI capabilities
+
+Which AI runs on one camera. Optional, and its absence means both capabilities —
+exactly what every camera did before the field existed — so an existing
+`cameras.json` keeps loading and behaves identically.
+
+```json
+{
+  "id": "corridor_3",
+  "url": "rtsp://localhost:8554/corridor_3",
+  "capabilities": ["anomaly_detection"]
+}
+```
+
+| Capability | What it turns on | What it costs |
+|---|---|---|
+| `scene_description` | The VLM describes an escalation the gate allowed. | Detector + VLM |
+| `anomaly_detection` | The six automatic escalation triggers. | Detector |
+| `fall_detection` | The temporal fall/collapse state machine (§7). | Detector + pose |
+| `abandoned_object` | A bag a person was with, left behind and still. | Detector |
+| `camera_tamper` | This camera going blind — lens covered, view obstructed, unlit. | **No model** |
+| `zone_monitoring` | Restricted areas entered and virtual boundaries crossed. | Detector |
+| `person_authorization` | Faces checked against the enrolled roster (§8–§12). | Detector + face |
+
+**`camera_tamper` is free.** It reads the luma histogram the motion stage already
+computes, so it can be switched on across an entire site for the cost of one comparison
+per frame. That matters more than it sounds: every *other* detector goes silent when a
+camera is obstructed, and silence is exactly what a healthy camera watching an empty
+corridor looks like.
+
+**`person_authorization` is the one capability that is a decision about people rather
+than about compute.** It is off by default and enabled per camera, and the engine
+**refuses to start** if any camera enables it without `SENTINEL_FACE_ENCRYPTION_KEY`
+set — biometric data is not written in the clear on a fallback path.
+
+`fall_detection` is independent of `anomaly_detection`, deliberately: the triggers ask
+"is this scene worth a look", while fall detection asks one specific question about one
+person over several seconds. A dayroom that should raise a fall but not a track-count
+spike is an ordinary configuration, not a contradiction.
+
+**This is not cosmetic, and it is the lever that makes many cameras affordable.**
+The process loads the union of what every camera asks for, decided *before
+anything is constructed*: a file in which nobody asks for `scene_description`
+never downloads a vision-language model, never gives it VRAM, and never lists it
+in `GET /health`. Skipping is also per camera — a camera with `[]` is handed no
+detector at all, so it costs a decode and nothing else.
+
+An explicit `[]` is a real instruction and is **not** the same as omitting the
+field: the camera is still decoded and its liveness still reported, and no model
+runs against it. Collapsing the two would re-enable monitoring on a camera
+somebody deliberately switched off. A name the engine does not know **fails at
+startup**, for `zone`'s reason and a stronger one — a silently dropped capability
+leaves an operator believing monitoring is running that never was.
+
+Turning a capability off changes behaviour rather than removing information. A
+camera with `anomaly_detection` but not `scene_description` still escalates and
+still publishes events; those events carry a metadata-derived description,
+`description_unavailable: true`, and a `description_skipped` key in `metadata`
+saying the reason was configuration rather than a model failure. A console must
+render those two differently, or an operator learns to ignore a flag that
+otherwise means a real fault.
+
+**Editing at runtime.** `PATCH /cameras/{id}` takes `capabilities` as a whole
+replacement list. Disabling always works. *Enabling* one whose model this process
+did not load is a **409 naming the restart**, not a 200 that quietly did nothing:
+which models exist is fixed at startup, and placing a 3B vision model under an
+HTTP request would stall every camera sharing the GPU. Nothing is written when
+that happens, so the file and the running camera never disagree.
+
+### Per-camera fall thresholds
+
+`fall_policy` on a camera entry, read only when `capabilities` includes
+`fall_detection`. Every field is optional and every one has a default, so a camera that
+omits the object entirely gets the defaults below.
+
+```json
+{
+  "id": "dayroom_1",
+  "url": "rtsp://localhost:8554/dayroom_1",
+  "capabilities": ["anomaly_detection", "fall_detection"],
+  "fall_policy": { "settle_seconds": 4.0, "min_descent_rate": 0.8 }
+}
+```
+
+An unknown field name **fails at startup**, exactly as an unknown `profile` field does,
+and for a sharper reason: a silently-ignored threshold leaves an operator believing they
+tuned a camera that is still running the defaults — and here the defaults decide whether
+anyone is told a person is on the floor.
+
+| Field | Default | Effect |
+|---|---|---|
+| `min_upright_seconds` | `0.4` | How long a person must have been upright before a descent can count. Guards against someone already on the floor when the track begins. |
+| `upright_aspect_max` | `0.75` | Box width/height at or below which a person reads as upright. |
+| `horizontal_aspect_min` | `1.1` | Width/height at or above which they read as horizontal. Must exceed `upright_aspect_max`. |
+| `upright_torso_degrees_max` | `35.0` | Torso angle from vertical below which **pose** says upright. |
+| `horizontal_torso_degrees_min` | `60.0` | Torso angle above which pose says horizontal. Short of 90 on purpose: someone slumped against a wall has not landed flat. |
+| `min_keypoint_confidence` | `0.4` | Per-joint score below which a keypoint is ignored and the frame falls back to box geometry. |
+| `min_descent_rate` | `0.7` | **Body heights per second** of downward movement that separates a fall from sitting down. |
+| `descent_window_seconds` | `2.5` | How long the body has to reach horizontal after the descent began, before the episode is abandoned. |
+| `settle_seconds` | `3.0` | How long they must stay down and still before anything is raised. The clause that separates "fell" from "fell and is not getting up" — and the dominant term in time-to-alert. |
+| `still_radius` | `0.35` | How far the centroid may drift, in body heights, and still count as settled. Movement **restarts** the timer rather than cancelling the episode. |
+
+**Everything is in body heights, never pixels.** A person three metres from the camera
+and the same person twenty metres away fall at wildly different pixel rates, so a `px/s`
+threshold is really a threshold on distance-from-camera — tuned on one camera and wrong
+on the next. The person's own bounding box supplies the unit, so one policy means the
+same thing on a corridor camera and a car-park camera.
+
+**What it detects, and what it does not.** The *transition*: upright, then a rapid
+descent, then horizontal, then still. Someone already lying down when they enter frame
+raises nothing, because there is no transition to observe. That is a real limitation and
+the honest one — this detects falling, not lying. Pose improves the reading and is never
+required; a camera without it runs the same machine on box geometry and records which it
+used.
+
+### Per-camera behaviour thresholds
+
+Three more optional objects per camera, each read only when the matching capability is
+enabled, each validated against its own field names so a typo fails at startup rather
+than at the first incident.
+
+| Object | Read when | Notable fields |
+|---|---|---|
+| `abandonment_policy` | `abandoned_object` | `unattended_seconds` (30.0) — how long the object stands alone before anyone is told. `attend_radius` (1.5) — how close a person must be, **in that person's own heights**, to count as with it. |
+| `tamper_policy` | `camera_tamper` | `concentration_threshold` (0.85) — share of the frame in one luma bin that counts as blank. `obstructed_seconds` (10.0) — how long the collapse must persist. `min_clear_seconds` (30.0) — how long the view must have been varied first, which is what stops a permanently dark camera alarming forever. |
+| `authorization_policy` | `person_authorization` | `match_threshold` (0.42), `min_observations` (4), `min_duration_seconds` (2.0), `min_box_pixels` (48), `min_frontality` (0.35). |
+
+`zone_policy` is the one with nested geometry:
+
+```json
+"zone_policy": {
+  "min_frames_inside": 3,
+  "zones": [
+    { "name": "stairwell", "polygon": [[0.0, 0.3], [0.35, 0.3], [0.35, 1.0], [0.0, 1.0]] }
+  ],
+  "lines": [
+    { "name": "atrium threshold", "start": [0.55, 0.0], "end": [0.55, 1.0], "direction": "both" }
+  ]
+}
+```
+
+**Coordinates are fractions of frame width and height, never pixels.** An RTSP camera
+can renegotiate resolution mid-stream, and a zone drawn against 1920×1080 silently
+becomes a quarter of the intended area at 960×540. A coordinate outside `[0, 1]` is
+rejected at startup — which is what catches a zone drawn in pixels by mistake.
+
+`direction` is `both` | `a_to_b` | `b_to_a`, named by the line's own endpoints because
+"northbound" stops meaning anything the moment somebody re-points the camera.
+
+**Loitering is not in this list** because it already exists: it is the `dwell_exceeded`
+escalation trigger, tuned by `dwell_radius_px` and `dwell_seconds` on the camera profile.
 
 ### The per-camera welfare policy
 
@@ -289,7 +613,7 @@ per-camera ones.
 | Field | Default | Effect |
 |---|---|---|
 | `salient_classes` | person, car, truck, bus, motorcycle, bicycle, backpack, handbag, suitcase | Which detected classes the triggers care about. |
-| `vlm_enabled` | `true` | `false` short-circuits the whole gate for this camera. |
+| `auto_escalation_enabled` | `true` | `false` short-circuits the whole gate for this camera, leaving only `user_requested`. **Derived from `capabilities` at load time — do not set it here.** Formerly `vlm_enabled`, renamed because it never controlled the VLM and, now that the VLM is separately optional, that name was actively misleading. |
 | `min_track_frames` | `8` | Track age before `new_salient_track` fires. |
 | `scene_delta_threshold` | `0.35` | Signature distance counting as a change. Must be in (0, 1]. |
 | `scene_delta_frames` | `5` | Consecutive frames the change must persist for `scene_change`. |

@@ -1,6 +1,5 @@
 import { http, HttpResponse } from 'msw'
 import { RECORDER_BASE_URL } from '@/recorder/config'
-import { maskHandlers } from '@/recorder/mocks/maskHandlers'
 import { alertStreamHandlers } from '@/recorder/mocks/alertStreamHandlers'
 import {
   REAL_ALERTS,
@@ -10,7 +9,6 @@ import {
   REAL_JOURNAL_DAY_HISTORY,
   REAL_JOURNAL_ROOM_4B,
   REAL_MODELS,
-  REAL_NOTIFICATIONS,
   REAL_REPORT,
   REAL_SETTINGS,
   REAL_STATUS,
@@ -24,7 +22,6 @@ import type {
   RecorderJournalDayResponse,
   RecorderJournalResponse,
   RecorderModelsResponse,
-  RecorderNotificationsResponse,
   RecorderSettingsResponse,
   RecorderStatusResponse,
   RecorderUntrackedResponse,
@@ -59,9 +56,6 @@ export const recorderCamerasHandler = (body: RecorderCamerasResponse) =>
 
 export const recorderStatusHandler = (body: RecorderStatusResponse) =>
   http.get(`${RECORDER_BASE_URL}/status`, () => HttpResponse.json(body))
-
-export const recorderNotificationsHandler = (body: RecorderNotificationsResponse) =>
-  http.get(`${RECORDER_BASE_URL}/notifications`, () => HttpResponse.json(body))
 
 /** `GET /api/journal/:cameraId` — succeeds for any camera id by default. */
 export const recorderJournalHandler = (body: RecorderJournalResponse) =>
@@ -153,11 +147,9 @@ export const recorderHandlers = [
   recorderCapabilitiesHandler(REAL_CAPABILITIES),
   recorderCamerasHandler(REAL_CAMERAS),
   recorderStatusHandler(REAL_STATUS),
-  recorderNotificationsHandler(REAL_NOTIFICATIONS),
   recorderSnapshotHandler(),
   recorderJournalHandler(REAL_JOURNAL_ROOM_4B),
   recorderJournalDayHandler(REAL_JOURNAL_DAY_SEALED, REAL_JOURNAL_DAY_HISTORY),
   recorderReportHandler(REAL_REPORT),
-  ...maskHandlers,
   ...alertStreamHandlers,
 ]

@@ -100,7 +100,7 @@ describe('ConfigurePage — recorder unavailable', () => {
     renderWithProviders(<ConfigurePage />)
 
     expect(
-      await screen.findByText(/The recorder is unreachable/i, undefined, { timeout: 5000 }),
+      await screen.findByText(/recorder appliance is not reachable/i, undefined, { timeout: 5000 }),
     ).toBeInTheDocument()
     expect(screen.queryByText('This setting decides nothing today')).not.toBeInTheDocument()
   })

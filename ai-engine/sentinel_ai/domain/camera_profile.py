@@ -54,7 +54,25 @@ class CameraProfile:
     admitted before the previous description exists.
     """
 
-    vlm_enabled: bool = True
+    auto_escalation_enabled: bool = True
+    """Whether the six automatic triggers may raise an escalation on this camera.
+
+    Derived at load time from `Capability.ANOMALY_DETECTION` (see
+    `domain/capabilities.py`); this is the form the pure gate reads, because the gate
+    may not know what a capability is any more than it may read a clock.
+
+    **Formerly `vlm_enabled`, and renamed because that name became false.** It never
+    controlled the vision-language model directly — it short-circuits the whole gate,
+    so nothing is escalated and therefore nothing is described. That was a distinction
+    without a difference while every camera that escalated also described. It stopped
+    being one when `Capability.SCENE_DESCRIPTION` made the VLM separately optional: a
+    camera can now escalate and publish events while never calling a model
+    (`EscalationRequest.describe`), and a field called `vlm_enabled` sitting `True` on
+    exactly that camera would be the most confusing thing in the record.
+
+    `False` still leaves `user_requested` working — `force()` bypasses the gate — so
+    this is "raises nothing by itself", not "cannot be asked".
+    """
 
     def __post_init__(self) -> None:
         self._require(self.min_track_frames >= 1, "min_track_frames must be >= 1")

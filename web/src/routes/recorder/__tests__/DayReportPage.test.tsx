@@ -223,7 +223,7 @@ describe('DayReportPage — recorder unavailable', () => {
 
     // `retry: 1`'s default backoff pushes the query past the default 1s wait.
     expect(
-      await screen.findByText(/The recorder is unreachable/i, undefined, { timeout: 5000 }),
+      await screen.findByText(/recorder appliance is not reachable/i, undefined, { timeout: 5000 }),
     ).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })

@@ -212,13 +212,6 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
     editDraft(patch)
   }
 
-  function toggleKind(kind: ConcernKind, routed: boolean) {
-    const next = new Set(shown.notifyOn)
-    if (routed) next.add(kind)
-    else next.delete(kind)
-    editDraft({ notifyOn: CONCERN_KINDS.filter((candidate) => next.has(candidate)) })
-  }
-
   const invalidLabel = labelError(shown.label)
   const durationErrors = DURATION_FIELDS.map((field) => ({
     field,
@@ -374,31 +367,11 @@ export function CameraRecordPanel({ cameraId, record, writable }: CameraRecordPa
           ))}
         </Select>
 
-        <fieldset className="mt-4 min-w-0 border-0 p-0">
-          <legend className="mb-[5px] text-[13px] text-fg">Notifies on</legend>
-          <WelfareNote />
-          <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
-            {CONCERN_KINDS.map((kind) => (
-              <div key={kind} className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  id={`camera-record-notify-${kind}`}
-                  checked={shown.notifyOn.includes(kind)}
-                  onChange={(event) => toggleKind(kind, event.target.checked)}
-                />
-                <label htmlFor={`camera-record-notify-${kind}`} className="text-[13px] text-fg">
-                  {humanizeEnum(kind)}
-                </label>
-              </div>
-            ))}
-          </div>
-          {shown.notifyOn.length === 0 ? (
-            <p className="muted mt-1" data-testid="camera-record-muted-warning">
-              Nothing checked means this camera notifies nobody. It keeps detecting, keeps
-              recording clips and keeps publishing events — it just stops telling anyone.
-            </p>
-          ) : null}
-        </fieldset>
+        {/* "Notifies on" used to be a fieldset here. It now lives beside the
+            capabilities in `CapabilityPanel`, because the two read as the same thing
+            in two places and the difference between them — what runs, versus what
+            reaches a human — is only visible when they are side by side. The stored
+            value is still shown in the read-only summary above. */}
 
         <Label htmlFor="camera-record-min-confidence">Minimum confidence</Label>
         <Select

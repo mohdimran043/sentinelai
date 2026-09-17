@@ -100,6 +100,11 @@ def encode_event(event: Event) -> dict[str, object]:
         "suggested_action": event.suggested_action,
         "labels": list(event.labels),
         "track_ids": list(event.track_ids),
+        # Omitted rather than sent empty when nothing attributed the event to a
+        # person. The schema treats absence and `[]` alike, but omission keeps every
+        # trigger-raised payload byte-identical to what it was before this field
+        # existed, which is what a Phase 1C consumer diffing two builds will check.
+        **({"subject_track_ids": list(event.subject_track_ids)} if event.subject_track_ids else {}),
         "keyframe_uri": event.keyframe_uri,
         "clip_uri": event.clip_uri,
         "description_unavailable": event.description_unavailable,
@@ -187,6 +192,7 @@ def decode_event(payload: Mapping[str, object]) -> Event:
         suggested_action=data["suggested_action"],
         labels=tuple(data["labels"]),
         track_ids=tuple(int(i) for i in data["track_ids"]),
+        subject_track_ids=tuple(int(i) for i in data.get("subject_track_ids", ())),
         keyframe_uri=data.get("keyframe_uri"),
         clip_uri=data.get("clip_uri"),
         description_unavailable=bool(data["description_unavailable"]),

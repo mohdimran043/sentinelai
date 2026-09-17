@@ -24,7 +24,8 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from sentinel_ai.adapters.config.camera_file import CameraConfig, CameraEdit
+from sentinel_ai.adapters.config.camera_file import CameraConfig, CameraCreate, CameraEdit
+from sentinel_ai.adapters.sources.probe import ProbeResult
 from sentinel_ai.api.app import create_app
 from sentinel_ai.api.sse import (
     SSE_MEDIA_TYPE,
@@ -32,13 +33,20 @@ from sentinel_ai.api.sse import (
     format_comment,
     format_frame,
 )
+from sentinel_ai.domain.alert import Alert
 from sentinel_ai.domain.entities import EscalationReason, Event, ThreatScore
+from sentinel_ai.domain.identity import AuthorizedPerson, EnrolledFace
+from sentinel_ai.orchestrator.alerts import UnknownAlertError
 from sentinel_ai.orchestrator.event_history import (
     CameraEventHistory,
     EventSubscription,
     RecentEventLog,
 )
-from sentinel_ai.orchestrator.service import EngineNotComposedError, UnknownCameraError
+from sentinel_ai.orchestrator.service import (
+    EngineNotComposedError,
+    FaceCapabilityUnavailableError,
+    UnknownCameraError,
+)
 from sentinel_ai.pipeline.runner import CameraTelemetry
 from sentinel_ai.ports.model_runtime import HealthReport
 
@@ -429,6 +437,62 @@ class _StreamingFakeService:
     def close_event_streams(self) -> int:
         self.closed_streams += 1
         return self.log.close_all()
+
+    async def list_people(self) -> tuple[tuple[AuthorizedPerson, int], ...]:
+        return ()
+
+    async def upsert_person(self, person: AuthorizedPerson) -> AuthorizedPerson:
+        raise FaceCapabilityUnavailableError()
+
+    async def delete_person(self, person_id: UUID) -> bool:
+        raise FaceCapabilityUnavailableError()
+
+    async def enroll_face(
+        self, person_id: UUID, image: object, *, original: bytes | None = None
+    ) -> int:
+        raise FaceCapabilityUnavailableError()
+
+    def alerts(self) -> tuple[Alert, ...]:
+        """No register on this fake — these tests are about the SSE stream, and an
+        engine composed without one is a supported configuration."""
+        return ()
+
+    def acknowledge_alert(self, alert_id: UUID, *, by: str, at: float) -> Alert:
+        raise UnknownAlertError(alert_id)
+
+    def resolve_alert(self, alert_id: UUID) -> Alert:
+        raise UnknownAlertError(alert_id)
+
+    async def flush_alerts(self) -> None:
+        """Unreachable here — both callers raise above — but the protocol is satisfied
+        structurally, so a missing member is a type error rather than a 500."""
+
+    def clear_alerts(self) -> int:
+        return 0
+
+    async def snapshot(self, camera_id: str) -> bytes | None:
+        return None
+
+    async def create_camera(self, create: CameraCreate) -> CameraConfig:
+        raise NotImplementedError("this fake does not exercise the create path")
+
+    async def delete_camera(self, camera_id: str) -> None:
+        raise UnknownCameraError(camera_id)
+
+    async def probe_source(self, url: str) -> ProbeResult:
+        return ProbeResult(ok=False, detail="probing is not faked here", source_kind="file")
+
+    async def list_faces(self, person_id: UUID) -> tuple[EnrolledFace, ...]:
+        raise FaceCapabilityUnavailableError()
+
+    async def read_face_image(self, person_id: UUID, face_id: UUID) -> bytes | None:
+        return None
+
+    async def delete_face(self, person_id: UUID, face_id: UUID) -> bool:
+        raise FaceCapabilityUnavailableError()
+
+    def last_frame_epoch(self, camera_id: str) -> float | None:
+        return None
 
     def health(self) -> dict[str, HealthReport]:
         return {}

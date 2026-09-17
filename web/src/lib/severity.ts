@@ -53,7 +53,7 @@ export function toneForModelState(state: string): Tone {
 
 /**
  * `CameraStatus` carries no explicit online/offline flag — only counters and
- * `last_frame_at`. This derives a liveness label from recency, which is the
+ * `last_frame_epoch`. This derives a liveness label from recency, which is the
  * most honest reading of the data actually on the wire. Anything stale reads
  * as "stale" rather than a fabricated "offline", because the engine may simply
  * be running slower than this threshold assumes.
@@ -63,6 +63,12 @@ export const STALE_AFTER_SECONDS = 15
 export type CameraLiveness = 'live' | 'stale' | 'no-data'
 
 export function cameraLiveness(
+  /**
+   * **`CameraStatus.last_frame_epoch`, never `last_frame_at`.** The latter is the
+   * camera's own source timeline — monotonic for a live camera, seconds into the
+   * file for a replayed one — and reading it as an epoch marked every camera
+   * stale and printed "20712d ago" against one delivering normally.
+   */
   lastFrameAtEpochSeconds: number | null,
   nowMs: number = Date.now(),
 ): CameraLiveness {

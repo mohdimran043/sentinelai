@@ -10,6 +10,7 @@ import pytest
 
 from sentinel_ai.adapters.sources.preroll import PreRollBuffer
 from sentinel_ai.domain.camera_profile import CameraProfile
+from sentinel_ai.domain.capabilities import ModelRole
 from sentinel_ai.domain.entities import EscalationReason, SceneState
 from sentinel_ai.domain.welfare import ConcernKind, Confidence, WelfareConcern
 from sentinel_ai.domain.zone import Zone
@@ -85,6 +86,8 @@ def build_service(monkeypatch: pytest.MonkeyPatch) -> tuple[EngineService, FakeP
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=clock,
     )
@@ -399,6 +402,8 @@ async def test_stop_publishes_the_escalation_the_runner_preserves_on_shutdown(
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=clock,
     )
@@ -458,6 +463,8 @@ async def test_start_wires_a_periodic_idle_sweep_that_evicts_the_idle_vlm() -> N
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=ticking_clock,
         idle_sweep_interval_seconds=100.0,
@@ -572,6 +579,8 @@ async def test_an_escalation_after_the_idle_unload_still_gets_a_real_description
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=ticking_clock,
         idle_sweep_interval_seconds=100.0,
@@ -704,13 +713,17 @@ async def test_one_cameras_decode_error_does_not_abort_the_rest_of_shutdown(
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=clock,
     )
 
     await service.start()
     scheduler_task = service._scheduler_task
-    cam_a_task = service._camera_tasks[0]
+    # Keyed by camera id since `remove_camera` needed to stop one without stopping
+    # the rest; "cam-a" is the first camera this fixture builds.
+    cam_a_task = service._camera_tasks["cam-a"]
     await asyncio.wait_for(writer_b.clip_open.wait(), timeout=5.0)
     await asyncio.wait({cam_a_task})
     assert isinstance(cam_a_task.exception(), RuntimeError), (
@@ -795,6 +808,8 @@ async def test_a_drain_that_runs_out_of_budget_dead_letters_instead_of_losing_ev
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=clock,
         shutdown_drain_timeout_seconds=0.0,
@@ -883,6 +898,8 @@ async def test_stop_drains_the_queue_rather_than_cancelling_the_worker_on_top_of
         registry=registry,
         resident_set=resident_set,
         scheduler=scheduler,
+        available_roles=frozenset(ModelRole),
+        detector=None,
         required_model_keys=("yolo11s", "qwen25vl3b"),
         clock=clock,
     )
@@ -965,6 +982,8 @@ class TestStopUnderExternalCancellation:
             registry=registry,
             resident_set=resident_set,
             scheduler=scheduler,
+            available_roles=frozenset(ModelRole),
+            detector=None,
             required_model_keys=("yolo11s", "qwen25vl3b"),
             clock=clock,
         )
@@ -974,7 +993,7 @@ class TestStopUnderExternalCancellation:
         camera = LingeringCameraTask()
         service, _scheduler, _publisher = self._build(FakeVisionLLM(), FakeFailedEventSink())
         camera_task = asyncio.create_task(camera.run())
-        service._camera_tasks = [camera_task]
+        service._camera_tasks = {"cam-1": camera_task}
         await camera.running.wait()
 
         stop_task = asyncio.create_task(service.stop())
@@ -1023,7 +1042,7 @@ class TestStopUnderExternalCancellation:
 
         camera = LingeringCameraTask()
         camera_task = asyncio.create_task(camera.run())
-        service._camera_tasks = [camera_task]
+        service._camera_tasks = {"cam-1": camera_task}
         await camera.running.wait()
 
         stop_task = asyncio.create_task(service.stop())
@@ -1109,7 +1128,7 @@ class TestStopUnderExternalCancellation:
 
         camera = LingeringCameraTask()
         camera_task = asyncio.create_task(camera.run())
-        service._camera_tasks = [camera_task]
+        service._camera_tasks = {"cam-1": camera_task}
         await camera.running.wait()
 
         stop_task = asyncio.create_task(service.stop())
@@ -1174,6 +1193,8 @@ class TestTheNotificationWorkersLifecycle:
             registry=registry,
             resident_set=resident_set,
             scheduler=scheduler,
+            available_roles=frozenset(ModelRole),
+            detector=None,
             required_model_keys=("yolo11s", "qwen25vl3b"),
             clock=clock,
             shutdown_drain_timeout_seconds=drain_timeout,
@@ -1244,3 +1265,84 @@ class TestTheNotificationWorkersLifecycle:
 
         leaked = {task for task in asyncio.all_tasks() - before if not task.done()}
         assert leaked == set(), f"tasks outlived stop(): {leaked}"
+
+
+class TestDisablingACamera:
+    """A camera that is configured and deliberately not running.
+
+    The distinction this exists to preserve: "nobody is watching this on purpose" must
+    be unmistakable from "this has gone quiet", and from "this was deleted".
+    """
+
+    async def test_a_disabled_camera_stays_in_the_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The whole difference from deleting. A camera an operator switched off has to
+        # stay visible, or the only way to notice it is to spot something missing.
+        service, _ = build_service(monkeypatch)
+        await service.disable_camera("cam-1")
+
+        assert [camera.camera_id for camera in service.cameras()] == ["cam-1"]
+        assert service.cameras()[0].enabled is False
+
+    async def test_it_stops_the_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service, _ = build_service(monkeypatch)
+        assert service.is_running("cam-1")
+
+        await service.disable_camera("cam-1")
+
+        assert not service.is_running("cam-1")
+
+    async def test_the_counters_are_frozen_rather_than_zeroed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """"Saw nothing" and "saw this much, then was switched off" are not close, and
+        an operator triaging a wall reads the difference."""
+        service, _ = build_service(monkeypatch)
+        await service.start()
+        await asyncio.sleep(0)
+        before = service.telemetry("cam-1").frames_seen
+
+        await service.disable_camera("cam-1")
+
+        assert service.telemetry("cam-1").frames_seen == before
+        await service.stop()
+
+    async def test_disabling_twice_is_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two operators clicking the same switch is an ordinary race, not a mistake
+        # either of them made.
+        service, _ = build_service(monkeypatch)
+        first = await service.disable_camera("cam-1")
+        second = await service.disable_camera("cam-1")
+
+        assert first == second
+
+    async def test_an_unknown_camera_still_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, _ = build_service(monkeypatch)
+        with pytest.raises(UnknownCameraError):
+            await service.disable_camera("never-existed")
+
+    async def test_telemetry_answers_for_a_disabled_camera(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Or every caller that checks a camera exists — the edit path, the delete path
+        # — would 404 on a camera the operator can plainly see in the list.
+        service, _ = build_service(monkeypatch)
+        await service.disable_camera("cam-1")
+
+        assert service.telemetry("cam-1").camera_id == "cam-1"
+
+    async def test_forgetting_it_leaves_no_duplicate_behind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure this prevents: a re-enabled camera appearing twice, once live and
+        once as the corpse of its previous run."""
+        service, _ = build_service(monkeypatch)
+        await service.disable_camera("cam-1")
+        service.forget_disabled("cam-1")
+
+        assert service.cameras() == ()

@@ -28,8 +28,9 @@ const storedResponse: CameraEditResponse = {
   label: 'East door',
   zone: 'corridor',
   zone_kind: 'common_area',
-  // The welfare notification policy the engine echoes back on every edit, in the
-  // sorted whole-list form it stores.
+  // The capabilities and welfare notification policy the engine echoes back on
+  // every edit, in the sorted whole-list form it stores.
+  capabilities: ['anomaly_detection', 'scene_description'],
   notify_on: [...ALL_KINDS],
   notify_min_confidence: 'likely',
   clip_preroll_seconds: null,
@@ -312,54 +313,6 @@ describe('CameraRecordPanel, editing the welfare policy', () => {
     updateCamera.mockReset()
   })
 
-  it('offers a checkbox per concern kind, checked as stored', () => {
-    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
-
-    expect(screen.getAllByRole('checkbox')).toHaveLength(6)
-    for (const name of ['Collapse', 'Altercation', 'Self harm', 'Medication', 'Distress', 'Other']) {
-      expect(screen.getByRole('checkbox', { name })).toBeChecked()
-    }
-  })
-
-  it('shows a kind the camera does not route as unchecked', () => {
-    renderWithProviders(
-      <CameraRecordPanel
-        cameraId="avenue_01"
-        record={{ ...record, notify_on: ['collapse'] }}
-        writable={true}
-      />,
-    )
-
-    expect(screen.getByRole('checkbox', { name: 'Collapse' })).toBeChecked()
-    expect(screen.getByRole('checkbox', { name: 'Distress' })).not.toBeChecked()
-  })
-
-  it('sends [] when every kind is unchecked, since that is the mute switch', async () => {
-    updateCamera.mockResolvedValue({ ...storedResponse, notify_on: [] })
-    const user = userEvent.setup()
-    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
-
-    for (const box of screen.getAllByRole('checkbox')) {
-      await user.click(box)
-    }
-    await user.click(screen.getByRole('button', { name: /save/i }))
-
-    expect(updateCamera).toHaveBeenCalledWith('avenue_01', { notify_on: [] })
-  })
-
-  it('sends the whole remaining list when one kind is unchecked', async () => {
-    updateCamera.mockResolvedValue(storedResponse)
-    const user = userEvent.setup()
-    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
-
-    await user.click(screen.getByRole('checkbox', { name: 'Medication' }))
-    await user.click(screen.getByRole('button', { name: /save/i }))
-
-    expect(updateCamera).toHaveBeenCalledWith('avenue_01', {
-      notify_on: ['altercation', 'collapse', 'distress', 'other', 'self_harm'],
-    })
-  })
-
   it('omits notify_on entirely when the operator never touches it', async () => {
     updateCamera.mockResolvedValue(storedResponse)
     const user = userEvent.setup()
@@ -493,13 +446,6 @@ describe('CameraRecordPanel, editing the welfare policy', () => {
     expect(warning).toHaveTextContent(/notify_on/i)
   })
 
-  it('says what these fields actually route, so nobody reads them as a detector', () => {
-    renderWithProviders(<CameraRecordPanel cameraId="avenue_01" record={record} writable={true} />)
-
-    const note = screen.getByTestId('camera-record-welfare-note')
-    expect(note).toHaveTextContent(/single frame/i)
-    expect(note).toHaveTextContent(/not a detector/i)
-  })
 })
 
 describe('CameraRecordPanel, failures', () => {

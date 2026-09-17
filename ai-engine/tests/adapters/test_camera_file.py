@@ -35,7 +35,9 @@ from sentinel_ai.adapters.config.camera_file import (
     CameraEdit,
     CameraFileStore,
     edited_document,
+    enabled_document,
     load_cameras,
+    parse_cameras,
 )
 from sentinel_ai.domain.welfare import ConcernKind, Confidence
 from sentinel_ai.domain.zone import Zone
@@ -760,3 +762,67 @@ class TestTheWelfarePolicyIsEditable:
         assert document["cameras"][0]["_note"] == "pushed in with ffmpeg"
         assert document["cameras"][0]["label"] == "Front door"
         assert document["cameras"][1] == {"id": "cam-2", "url": "rtsp://host/two"}
+
+
+class TestEnabledFlag:
+    """`enabled` — configured and deliberately not running.
+
+    Not in `EDITABLE_FIELDS` and not reachable through `edited_document`: everything on
+    that path is metadata a running camera absorbs between frames, and this decides
+    whether the camera runs at all.
+    """
+
+    def test_a_camera_file_written_before_the_field_existed_is_enabled(self) -> None:
+        cameras = parse_cameras({"cameras": [{"id": "a", "url": "rtsp://host/a"}]}, "test")
+        assert cameras[0].enabled is True
+
+    def test_an_explicit_false_is_honoured(self) -> None:
+        cameras = parse_cameras(
+            {"cameras": [{"id": "a", "url": "rtsp://host/a", "enabled": False}]}, "test"
+        )
+        assert cameras[0].enabled is False
+
+    @pytest.mark.parametrize("raw", ["false", "no", 0, 1, "", []])
+    def test_a_non_boolean_is_refused_rather_than_read_as_truthy(self, raw: object) -> None:
+        """`"false"` and `0` are exactly what somebody writes meaning off, and Python
+        reads the first as on. A camera an operator believes they stopped, quietly
+        watching, is the failure this refusal exists to prevent."""
+        with pytest.raises(CameraConfigError, match="enabled"):
+            parse_cameras({"cameras": [{"id": "a", "url": "rtsp://host/a", "enabled": raw}]}, "t")
+
+    def test_setting_the_flag_leaves_every_other_key_alone(self) -> None:
+        document = {
+            "_comment": "hand written",
+            "cameras": [
+                {"id": "a", "url": "rtsp://host/a", "_note": "kept", "label": "A"},
+                {"id": "b", "url": "rtsp://host/b"},
+            ],
+        }
+        changed = enabled_document(document, "a", False, "test")
+
+        assert changed["cameras"][0] == {
+            "id": "a",
+            "url": "rtsp://host/a",
+            "_note": "kept",
+            "label": "A",
+            "enabled": False,
+        }
+        assert changed["cameras"][1] == {"id": "b", "url": "rtsp://host/b"}
+        assert changed["_comment"] == "hand written"
+
+    def test_enabling_writes_the_flag_rather_than_deleting_the_key(self) -> None:
+        """A visible `"enabled": true` records that somebody switched this back on. A
+        deleted key says only that nobody ever touched it."""
+        document = {"cameras": [{"id": "a", "url": "rtsp://host/a", "enabled": False}]}
+        assert enabled_document(document, "a", True, "test")["cameras"][0]["enabled"] is True
+
+    def test_an_id_the_file_does_not_have_is_refused(self) -> None:
+        with pytest.raises(CameraConfigError, match="edited since"):
+            enabled_document({"cameras": []}, "ghost", False, "test")
+
+    def test_the_document_still_parses_after_the_change(self) -> None:
+        # The property every writer here owes: never produce a file the next startup
+        # would refuse to load.
+        document = {"cameras": [{"id": "a", "url": "rtsp://host/a"}]}
+        cameras = parse_cameras(enabled_document(document, "a", False, "test"), "test")
+        assert [(c.camera_id, c.enabled) for c in cameras] == [("a", False)]

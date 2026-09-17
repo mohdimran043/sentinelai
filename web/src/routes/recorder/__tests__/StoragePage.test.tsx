@@ -139,7 +139,7 @@ describe('StoragePage — recorder unavailable', () => {
     renderWithProviders(<StoragePage />)
 
     expect(
-      await screen.findByText(/The recorder is unreachable/i, undefined, { timeout: 5000 }),
+      await screen.findByText(/recorder appliance is not reachable/i, undefined, { timeout: 5000 }),
     ).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })

@@ -164,6 +164,83 @@ after warmup.
   a trailing aside containing braces.
 - Real inference goes behind `@pytest.mark.gpu`.
 
+## Adding a behaviour detector
+
+An escalation trigger (below) is a predicate on **one frame**: is this scene worth a
+look? A behaviour detector is a state machine over **several seconds**: did this
+specific thing happen to this specific person? `domain/behaviour/fall.py` is the worked
+example, and the shape it establishes is the one to copy. `abandonment.py`, `tamper.py`
+and `zones.py` follow it; between them they cover the variations you are likely to hit —
+a two-actor interaction, a detector that needs **no model at all**, and one configured
+with geometry.
+
+### It goes in `domain/`, and that is the whole point
+
+The temptation is to put temporal logic in the pipeline, next to the frames. Resist it.
+A detector written as `(state, observation) -> (state, candidates)` with no clock and no
+pixels is a detector whose "the person stayed down for seven seconds, then moved at
+7.2 s" case is a three-line test that runs in microseconds — and that case is the entire
+feature. The same detector written against a live frame loop is one nobody tests at all.
+
+So:
+
+- state is a frozen dataclass the caller threads, like `GateState`;
+- time arrives as `BehaviourObservation.timestamp`, never from a clock;
+- the function returns the next state *and* what completed on this frame;
+- thresholds live in a frozen policy object that validates itself, so a configuration
+  that cannot mean anything fails at startup rather than never firing.
+
+### Four things the fall detector learned the hard way
+
+1. **Normalise by something the scene supplies.** Every rate in `fall.py` is in body
+   heights per second, taken from the person's own box. A `px/s` threshold is a
+   threshold on distance-from-camera in disguise: tuned on one camera, wrong on the next.
+2. **Report measurements, not a score.** `FallEvidence` carries the descent rate, the
+   settle duration and which signal was used. A single float would be read as a
+   calibrated probability by everything downstream, and nothing here has earned one
+   (ADR 10, ADR 12).
+3. **Deduplicate in the machine, not downstream.** A candidate is raised once per
+   episode. A detector that fired on every frame of an unchanged scene would make
+   whatever consumes it the thing under load.
+4. **Degenerate input must decide nothing.** A zero-height box has no aspect ratio and
+   no unit. Stepping over it entirely — rather than adopting its geometry — is what
+   stopped an early version reporting 13.8 body heights per second for a 2.8
+   body-height fall.
+
+### Wiring it up
+
+- Give it a `Capability` member and a `ModelRole` entry in `domain/capabilities.py`.
+  `test_capabilities.py` fails the build if a member declares no roles, so a capability
+  cannot be added without saying what it costs.
+- If it needs a new model, add a port and an adapter, then a branch in
+  `main.build_models`. **Never build it unconditionally** — see ADR 11.
+- Thread its state and call it from `BehaviourEngine` (`pipeline/behaviour.py`), which
+  owns the per-camera mutable state and nothing else. Give it a rank in `_PRIORITY`:
+  only one escalation per frame is possible, because the keyframe is shared, so two
+  detectors completing on the same frame must have a stated winner rather than
+  whichever the dict happened to yield first.
+- `CameraRunner._process_frame` calls the engine before the gate, and a candidate that
+  fires returns early. Decide deliberately whether that is right for your detector:
+  `fall_suspected` bypasses the gate's governors because the machine already
+  deduplicates to one report per episode; a chattier detector should not.
+- Add its `EscalationReason` to `domain/entities.py` **and** to
+  `contracts/events/anomaly_event.schema.json`, then regenerate the OpenAPI document.
+  The reason enum is on the wire.
+- Decide what it is worth to an operator, in `domain/policy/priority.py`: where the
+  reason sits in `priority_of`, and what `severity_floor` guarantees regardless of what
+  the model says about the frame. The floor is what decides whether it reaches the alert
+  list, because `is_alertable` compares `max(model severity, reason floor)` against a
+  minimum. A reason that falls through to the default floor is not a bug that raises —
+  it is a detection nobody is told about.
+
+### Optional models must stay optional
+
+`fall.py` prefers pose and falls back to bounding-box geometry **per frame**, recording
+which it used. A detector that silently did nothing without its optional model would be
+a capability that appears enabled and detects nothing — exactly what §40 forbids. And a
+failure in an optional model degrades the reading; it never costs the frame or the
+camera.
+
 ## Adding an escalation trigger
 
 The cheapest extension in the codebase, because it is pure.
@@ -295,6 +372,29 @@ Tone mapping lives in exactly two files and must stay there:
 `web/src/lib/severity.ts` (engine) and `web/src/recorder/tone.ts` (recorder).
 Nothing under `src/recorder/` may import from `src/api/`, or the reverse — two
 products, two clients, two type sets.
+
+## Adding a validation dataset
+
+`sentinel_ai/benchmark/` measures what a detector costs. `sentinel_ai/validation/`
+measures whether it is **right**, and every accuracy number in
+[performance.md](performance.md#accuracy--does-it-work-not-what-does-it-cost) comes from
+it. A new detector without one is a detector whose false-positive rate is a guess.
+
+- **The media is fetched, never committed.** A dataset directory holds a `fetch.sh` and
+  a `README.md` naming the authors and the licence; `.gitignore` lets those two through
+  and keeps the rest out. `datasets/urfd/` is the worked example.
+- **Score the shipped configuration**, then vary it with a flag. `validation/falls.py`
+  reports the real `FallPolicy` first and takes `--settle-seconds` to show the trade;
+  `validation/faces.py` reports the shipped `match_threshold` and only prints a tuned
+  one under `--tune`, with a note saying not to report it on the same split.
+- **Compose the real adapters.** `validation/falls.py` calls `observe_falls` — the same
+  function `BehaviourEngine` calls — over the real detector, tracker and pose model. A
+  reimplementation would measure the reimplementation.
+- **Separate "could not see" from "decided no."** `PairScore.similarity` is `None` when
+  no face was found, which is not a low similarity. Folding the two together is how a
+  model that fails on a whole group scores as merely strict.
+- **Say what the number does not cover**, in the run's own output. Both harnesses print
+  their limits, so a figure pasted into a slide carries its caveats with it.
 
 ## Before you commit
 

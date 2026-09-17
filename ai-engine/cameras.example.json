@@ -2,11 +2,31 @@
   "_comment": [
     "Every camera reaches the engine as rtsp://, whatever the upstream is. mediamtx does the",
     "normalising (deploy/compose/mediamtx.yml) so RtspSource is the only network path in the",
-    "engine \u2014 spec \u00a75. Copy this to cameras.json and edit.",
+    "engine — spec §5. Copy this to cameras.json and edit.",
     "",
     "zone is optional and constrained to room | corridor | dayroom. Omit it and the camera is",
     "ungrouped, which is fine. Give it a value the engine does not know and startup fails, on",
-    "purpose: a typo'd zone is a camera the operator meant to group and silently did not."
+    "purpose: a typo'd zone is a camera the operator meant to group and silently did not.",
+    "",
+    "capabilities is optional. Omit it and the camera gets scene_description and",
+    "anomaly_detection, which is what every camera did before the field existed. An explicit []",
+    "is the opposite instruction and is honoured: the camera is decoded and its liveness",
+    "reported, and no model is run against it. Which models the process loads at all is the",
+    "union over every camera here, so a file in which nobody asks for scene_description never",
+    "downloads a vision-language model. The full set is scene_description | anomaly_detection |",
+    "fall_detection | abandoned_object | camera_tamper | zone_monitoring | person_authorization.",
+    "",
+    "Each behaviour capability reads an optional policy object of the same name, validated",
+    "against its own field names — the typo below this comment was caught by that check the",
+    "first time this file was written, which is the point of it. Every distance in them is in",
+    "body heights or as a fraction of the frame, never in pixels, because a pixel threshold is",
+    "a threshold on distance-from-camera in disguise. Full field lists and defaults are in",
+    "docs/configuration.md; the cameras below show the shape, not every field.",
+    "",
+    "person_authorization is off unless a camera asks for it, and asking for it anywhere makes",
+    "SENTINEL_FACE_ENCRYPTION_KEY mandatory — the engine refuses to start without it rather",
+    "than writing biometric data in the clear. No camera here enables it, deliberately: it is a",
+    "decision about people, and copying an example should not make it for you."
   ],
   "cameras": [
     {
@@ -14,14 +34,41 @@
       "label": "Avenue (looped footage)",
       "url": "rtsp://localhost:8554/avenue_01",
       "zone": "corridor",
-      "_note": "Real pedestrians. This is the one that actually exercises detection, tracking and the escalation gate. Push it in with: ffmpeg -re -stream_loop -1 -i datasets/avenue/avenue_01.mp4 -c copy -f rtsp rtsp://localhost:8554/avenue_01"
+      "capabilities": ["scene_description", "anomaly_detection", "zone_monitoring", "camera_tamper"],
+      "zone_policy": {
+        "min_frames_inside": 3,
+        "zones": [
+          { "name": "stairwell", "polygon": [[0.0, 0.35], [0.30, 0.35], [0.30, 1.0], [0.0, 1.0]] }
+        ],
+        "lines": [
+          { "name": "atrium threshold", "start": [0.55, 0.0], "end": [0.55, 1.0], "direction": "both" }
+        ]
+      },
+      "_note": "Real pedestrians. This is the one that actually exercises detection, tracking and the escalation gate, and the zone and line above have both fired on real people in this clip. Coordinates are fractions of frame width and height, not pixels: this stream could renegotiate resolution and the zone would still cover the same part of the scene. camera_tamper is enabled because it costs nothing — it reads the luma histogram the motion stage already computes, and an obstructed camera is silent in every other signal the system has. Push the footage in with: ffmpeg -re -stream_loop -1 -i datasets/avenue/avenue_01.mp4 -c copy -f rtsp rtsp://localhost:8554/avenue_01"
     },
     {
       "id": "demo_live",
       "label": "Public demo stream (live)",
       "url": "rtsp://localhost:8554/demo_live",
       "zone": "dayroom",
-      "_note": "Unified Streaming's public demo, h264 720p25, pulled on demand by mediamtx. Verifies live HLS ingest and reconnect. No people in it, so expect no escalations \u2014 an empty event list here is the gate working, not failing."
+      "capabilities": ["anomaly_detection"],
+      "_note": "Unified Streaming's public demo, h264 720p25, pulled on demand by mediamtx. Verifies live HLS ingest and reconnect. No people in it, so expect no escalations — an empty event list here is the gate working, not failing. Deliberately triggers-only: this is what a camera that costs no VLM time looks like, and it still publishes an event if the scene genuinely changes."
+    },
+    {
+      "id": "dayroom_01",
+      "label": "Dayroom (welfare and falls)",
+      "url": "rtsp://localhost:8554/dayroom_01",
+      "zone": "dayroom",
+      "capabilities": ["scene_description", "anomaly_detection", "fall_detection", "abandoned_object", "camera_tamper"],
+      "fall_policy": {
+        "min_descent_rate": 1.2,
+        "settle_seconds": 3.0
+      },
+      "abandonment_policy": {
+        "attend_radius": 1.5,
+        "unattended_seconds": 30.0
+      },
+      "_note": "What a camera watching people rather than a perimeter looks like. fall_detection is the only capability here that loads a pose model, so enabling it on this camera and not on the corridor is the difference between two models and three. Both numbers are in body heights: min_descent_rate is 1.2 of a person's own bounding-box height per second, and attend_radius is 1.5 of it — not metres, not pixels. Read docs/operations.md on what fall detection has and has not been validated against before relying on it."
     },
     {
       "id": "replay_01",
@@ -31,7 +78,7 @@
         "cooldown_seconds": 5.0,
         "summary_interval_seconds": 45.0
       },
-      "_note": "Not a URL \u2014 anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description. Deliberately has no zone: the field is optional, and this is what an ungrouped camera looks like. Give it one from the console (PATCH /cameras/replay_01) and this file is rewritten in place."
+      "_note": "Not a URL — anything without an rtsp(s) scheme is read as a file path and builds a FileSource. Needs no mediamtx and no network, so it is the quickest way to see the whole pipeline produce a real description. Deliberately has no zone and no capabilities: both fields are optional, and this is what an ungrouped camera on the defaults looks like. Give it a zone from the console (PATCH /cameras/replay_01) and this file is rewritten in place."
     }
   ]
 }

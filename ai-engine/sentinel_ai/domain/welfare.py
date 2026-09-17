@@ -27,13 +27,17 @@ multi-concern welfare signal a later task adds on top of the same VLM call:
   Offering a `CERTAIN` tier would let a caller (or a future maintainer padding
   out an enum "for completeness") claim a certainty the evidence can never
   earn. Leaving it out is the honest option, not a missing one.
-* **`basis` is a mandatory, single-valued marker.** Every `WelfareAssessment`
-  carries `basis: Literal["single_frame_vlm"]`, always that value, so a
-  consumer reading the payload alone — with no side channel, no tribal
-  knowledge of which pipeline produced it — can see where the opinion came
-  from and weigh it accordingly. If a future phase adds a second source
-  (multi-frame reasoning, a purpose-built pose model), it gets its own basis
-  value rather than silently widening what this one means.
+* **`basis` is a mandatory marker naming the evidence behind the opinion.**
+  Every `WelfareAssessment` carries one, so a consumer reading the payload
+  alone — with no side channel, no tribal knowledge of which pipeline produced
+  it — can see where the opinion came from and weigh it accordingly. It began
+  single-valued (`single_frame_vlm`) when that was the only source there was,
+  with the stated rule that a future second source would get **its own value
+  rather than silently widening what the first one means**. That rule has now
+  been exercised: `temporal_pose_vlm` (spec §7) is the same vision-language
+  reading corroborated by a multi-second geometry state machine, and it is a
+  second member precisely so that every opinion already stored under
+  `single_frame_vlm` keeps meaning what it meant when it was written.
 
 This module is a welfare *concern*, not a threat: it exists to get a human to
 look at someone who may need help, not to accuse anyone of wrongdoing. That is
@@ -51,7 +55,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, get_args
 
 
 class ConcernKind(StrEnum):
@@ -136,6 +140,30 @@ class WelfareConcern:
             raise ValueError("evidence must not be empty (or whitespace-only)")
 
 
+AssessmentBasis = Literal["single_frame_vlm", "temporal_pose_vlm"]
+"""What kind of evidence an assessment rests on.
+
+* `single_frame_vlm` — a vision-language model's reading of one still frame, and
+  nothing else. No motion, no history, no second opinion.
+* `temporal_pose_vlm` — that same reading, corroborated by
+  `domain/behaviour/fall.py`'s state machine having watched the person go from
+  upright, through a rapid descent, to horizontal, and stay down. Strictly more
+  evidence than the first.
+
+A `Literal` union rather than a `StrEnum`, unlike every other closed vocabulary in
+this package, because this field is *also* the thing a consumer branches on to decide
+how much to trust the record, and the values are written into the published event
+schema as a plain enum of strings. Keeping it a `Literal` keeps the type and the wire
+form the same object with no encoder in between, which is the property that made the
+original `const` safe to reason about.
+"""
+
+VALID_BASES: frozenset[str] = frozenset(get_args(AssessmentBasis))
+"""The members, as data, for the runtime check below and for the tests that pin this
+against the published schema. Derived from the `Literal` rather than repeated, so a
+member added above cannot be forgotten here."""
+
+
 @dataclass(frozen=True, slots=True)
 class WelfareAssessment:
     """The full set of welfare concerns read from one keyframe.
@@ -150,16 +178,19 @@ class WelfareAssessment:
     """
 
     concerns: tuple[WelfareConcern, ...]
-    basis: Literal["single_frame_vlm"] = "single_frame_vlm"
+    basis: AssessmentBasis = "single_frame_vlm"
+    """Defaulted to the weaker of the two on purpose. An assessment that did not say
+    otherwise was produced by looking at one frame, and a default of the stronger
+    value would let a caller silently claim corroboration it never had."""
 
     def __post_init__(self) -> None:
-        # `Literal["single_frame_vlm"]` is a mypy-only guarantee: nothing stops
+        # The `Literal` is a mypy-only guarantee: nothing stops
         # `WelfareAssessment(concerns=(), basis="anything")` at runtime otherwise.
-        # This type is reconstructed at untrusted-JSON boundaries (the event codec
-        # today; a later task's VLM-response parser), so the check belongs here,
-        # once, rather than relying on every such caller to remember it.
-        if self.basis != "single_frame_vlm":
-            raise ValueError(f"basis must be 'single_frame_vlm', got {self.basis!r}")
+        # This type is reconstructed at untrusted-JSON boundaries (the event codec,
+        # the VLM-response parser), so the check belongs here, once, rather than
+        # relying on every such caller to remember it.
+        if self.basis not in VALID_BASES:
+            raise ValueError(f"basis must be one of {sorted(VALID_BASES)}, got {self.basis!r}")
         best_by_kind: dict[ConcernKind, WelfareConcern] = {}
         for concern in self.concerns:
             existing = best_by_kind.get(concern.kind)
